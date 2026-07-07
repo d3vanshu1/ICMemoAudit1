@@ -1,5 +1,6 @@
 import { api, z, anthropic } from "@superblocksteam/sdk-api";
 import { buildMergedText } from "./build-merged-text.js";
+import { NUMERIC_MODULES } from "./constants.js";
 
 // ---------------------------------------------------------------------------
 // Integration
@@ -279,7 +280,6 @@ export default api({
     const mergePrompt = rawPrompt.replace("{{FINDINGS_REQUIREMENT}}", findingsRule);
 
     // Modules that receive numeric verification as authoritative input
-    const NUMERIC_MODULES = new Set(["model_assumptions_stress", "contradiction_check"]);
 
     // Build numeric report block if applicable
     let numericBlock = "";

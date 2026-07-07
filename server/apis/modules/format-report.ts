@@ -1,4 +1,5 @@
 import { api, z, anthropic } from "@superblocksteam/sdk-api";
+import { NUMERIC_MODULES } from "./constants.js";
 
 // ---------------------------------------------------------------------------
 // Integration
@@ -416,8 +417,7 @@ export default api({
       throw new Error(`Module "${moduleId}" report prompt not configured.`);
     }
 
-    // Numeric report block for model_assumptions_stress and contradiction_check
-    const NUMERIC_MODULES = new Set(["model_assumptions_stress", "contradiction_check"]);
+    // Numeric report block for numeric-eligible modules
     let numericBlock = "";
     if (numericReport && NUMERIC_MODULES.has(moduleId) &&
         (numericReport.figures.length > 0 || numericReport.discrepancies.length > 0)) {

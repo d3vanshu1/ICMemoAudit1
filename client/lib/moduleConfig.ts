@@ -83,6 +83,21 @@ export const MODULES: ModuleDefinition[] = [
 
 export const MODULE_DEFINITIONS = MODULES;
 
+// ---------------------------------------------------------------------------
+// Numeric-eligible modules — mirrors server/apis/modules/constants.ts.
+// IMPORTANT: Keep in sync with that file. These are the modules that receive
+// numeric verification reports as authoritative input during merge & format.
+// ---------------------------------------------------------------------------
+export const NUMERIC_MODULE_IDS = [
+  "model_assumptions_stress",
+  "contradiction_check",
+] as const;
+
+export type NumericModuleId = (typeof NUMERIC_MODULE_IDS)[number];
+
+/** Pre-built Set for O(1) membership checks */
+export const NUMERIC_MODULES = new Set<string>(NUMERIC_MODULE_IDS);
+
 export const MODULE_MAP = Object.fromEntries(
   MODULES.map((m) => [m.id, m]),
 );

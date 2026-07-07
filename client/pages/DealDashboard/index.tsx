@@ -5,7 +5,7 @@ import { useApi } from "@/hooks/useApi.js";
 import { useApiData } from "@/hooks/useApiData.js";
 import { processAllFiles, extractTextFromFile, parseExcelToTables, parseCsvToTable } from "@/lib/pdfProcessor";
 import type { DocumentChunk, ProcessedFileInfo, ExcludedFile, StructuredCell } from "@/lib/pdfProcessor";
-import { MODULE_DEFINITIONS, MODULE_MAP } from "@/lib/moduleConfig";
+import { MODULE_DEFINITIONS, MODULE_MAP, NUMERIC_MODULES } from "@/lib/moduleConfig";
 import { getExtractionsForModule } from "@/lib/chunkRouting";
 import type { TaggedExtraction } from "@/lib/chunkRouting";
 import type { Document, DocumentTag, DocumentSource } from "@/types/document";
@@ -809,7 +809,6 @@ export default function DealDashboardPage() {
               // Pass numericReport on EVERY merge round for numeric modules,
               // so early rounds can cross-reference against verified figures too.
               // The report is small (capped at 30 figures) — negligible token impact.
-              const NUMERIC_MODULES = new Set(["model_assumptions_stress", "contradiction_check"]);
               const mergeNumericReport = (NUMERIC_MODULES.has(moduleId) && numericReport) ? numericReport : undefined;
 
               const merged = await withRetry(
@@ -1117,8 +1116,7 @@ export default function DealDashboardPage() {
         chunkIndex: ext.chunkIndex,
       }));
 
-      // Phase 3: Numeric Verification (model_assumptions_stress and contradiction_check only)
-      const NUMERIC_MODULES = new Set(["model_assumptions_stress", "contradiction_check"]);
+      // Phase 3: Numeric Verification (numeric-eligible modules only)
       let numericReport: { figures: unknown[]; discrepancies: unknown[] } | null = null;
       if (NUMERIC_MODULES.has(moduleId) && docIdsForVerification.current.length > 0 && runId) {
         try {
