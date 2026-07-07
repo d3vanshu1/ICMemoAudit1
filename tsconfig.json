@@ -1,0 +1,26 @@
+{
+  // only for top-level vite.config.ts and eslint.config.js
+  "include": ["*.ts"],
+  "exclude": ["vite.config.ts"],
+  "compilerOptions": {
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "target": "ES2024",
+    "module": "ESNext",
+    "strict": true,
+    "noImplicitOverride": true,
+    "allowJs": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "baseUrl": ".",
+    "noEmit": true
+  },
+  "references": [
+    { "path": "./tsconfig.client.json" },
+    { "path": "./tsconfig.server.json" }
+  ]
+}

@@ -1,0 +1,613 @@
+import { api, z, postgres } from "@superblocksteam/sdk-api";
+
+const IC_DILIGENCE_DB = "ba09e2b9-2715-4460-8131-896f50b0c414";
+
+// ---------------------------------------------------------------------------
+// Schemas
+// ---------------------------------------------------------------------------
+
+const StructuredCellSchema = z.object({
+  r: z.number(),
+  c: z.number(),
+  value: z.union([z.number(), z.string(), z.null()]),
+  type: z.enum(["number", "string", "date", "boolean", "empty"]),
+  formula: z.string().optional(),
+});
+
+const TableDataSchema = z.object({
+  row_headers: z.array(z.string()),
+  col_headers: z.array(z.string()),
+  cells: z.array(StructuredCellSchema),
+});
+
+const DocTableSchema = z.object({
+  id: z.string(),
+  document_id: z.string(),
+  sheet_or_page: z.string(),
+  caption: z.string().nullable(),
+  data: z.any(), // validated below after JSON parse
+});
+
+const FigureSchema = z.object({
+  name: z.string(),
+  recomputed_value: z.union([z.number(), z.string()]),
+  source_doc: z.string(),
+  source_cell: z.string(),
+  formula: z.string().optional(),
+});
+
+const DiscrepancySchema = z.object({
+  description: z.string(),
+  severity: z.enum(["critical", "warning", "info"]),
+  check_type: z.enum(["subtotal_reconciliation", "sign_consistency", "monotonicity", "cross_doc_agreement"]),
+  sources: z.array(z.string()),
+  expected: z.union([z.number(), z.string()]).optional(),
+  actual: z.union([z.number(), z.string()]).optional(),
+});
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+type Cell = {
+  r: number;
+  c: number;
+  value: number | string | null;
+  type: "number" | "string" | "date" | "boolean" | "empty";
+  formula?: string;
+};
+
+type ParsedTable = {
+  id: string;
+  documentId: string;
+  sheetOrPage: string;
+  caption: string;
+  rowHeaders: string[];
+  colHeaders: string[];
+  cells: Cell[];
+  // Derived grid: [row][col] -> Cell | undefined
+  grid: Map<string, Cell>;
+};
+
+type Figure = z.infer<typeof FigureSchema>;
+type Discrepancy = z.infer<typeof DiscrepancySchema>;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const TOLERANCE = 1e-6; // floating-point tolerance for equality
+
+function round(v: number, places = 4): number {
+  return Math.round(v * 10 ** places) / 10 ** places;
+}
+
+function numericCellsInRow(table: ParsedTable, rowIdx: number): Cell[] {
+  return table.cells.filter((c) => c.r === rowIdx && c.type === "number" && c.value !== null);
+}
+
+function numericCellsInCol(table: ParsedTable, colIdx: number): Cell[] {
+  return table.cells.filter((c) => c.c === colIdx && c.type === "number" && c.value !== null);
+}
+
+function cellRef(table: ParsedTable, cell: Cell): string {
+  const row = table.rowHeaders[cell.r] ?? `row${cell.r}`;
+  const col = table.colHeaders[cell.c] ?? `col${cell.c}`;
+  return `[${table.sheetOrPage}] ${row} / ${col}`;
+}
+
+function isSubtotalHeader(header: string): boolean {
+  const h = header.toLowerCase();
+  return (
+    h.includes("total") ||
+    h.includes("subtotal") ||
+    h.includes("sum") ||
+    h.includes("net") ||
+    h.includes("grand") ||
+    h.includes("aggregate") ||
+    h.includes("gross profit") ||
+    h.includes("ebitda") ||
+    h.includes("ebit") ||
+    h.includes("noi")
+  );
+}
+
+function isSensitivityHeader(headers: string[]): boolean {
+  // Sensitivity tables typically have numeric-like headers (% changes or absolute values)
+  let numericHeaders = 0;
+  for (const h of headers) {
+    if (!h) continue;
+    const cleaned = h.replace(/[%x\s]/gi, "");
+    if (!isNaN(Number(cleaned)) && cleaned !== "") numericHeaders++;
+  }
+  return numericHeaders >= Math.min(3, headers.length);
+}
+
+function isCashFlowSheet(caption: string, sheetName: string): boolean {
+  const text = (caption + " " + sheetName).toLowerCase();
+  return (
+    text.includes("cash flow") ||
+    text.includes("cashflow") ||
+    text.includes("ofcf") ||
+    text.includes("fcf") ||
+    text.includes("bridge") ||
+    text.includes("waterfall") ||
+    text.includes("sources and uses")
+  );
+}
+
+function normalizeLabel(label: string): string {
+  return label
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .trim();
+}
+
+function buildGrid(table: ParsedTable): void {
+  for (const cell of table.cells) {
+    table.grid.set(`${cell.r},${cell.c}`, cell);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Check 1: Subtotal reconciliation
+// Scan each row that has a "total" label; sum the preceding numeric rows
+// in the same column and compare.
+// ---------------------------------------------------------------------------
+
+function checkSubtotalReconciliation(
+  table: ParsedTable,
+  figures: Figure[],
+  discrepancies: Discrepancy[]
+): void {
+  const { rowHeaders, colHeaders } = table;
+  if (rowHeaders.length < 2) return;
+
+  // Find total rows
+  const totalRowIndices: number[] = [];
+  for (let ri = 0; ri < rowHeaders.length; ri++) {
+    if (isSubtotalHeader(rowHeaders[ri])) totalRowIndices.push(ri);
+  }
+
+  for (const totalRow of totalRowIndices) {
+    // For each numeric column in the total row
+    const totalCells = numericCellsInRow(table, totalRow);
+
+    for (const totalCell of totalCells) {
+      const reportedTotal = totalCell.value as number;
+      const ci = totalCell.c;
+
+      // Sum preceding rows until the last total row (or start)
+      const prevTotalIdx = [...totalRowIndices].reverse().find((t) => t < totalRow) ?? -1;
+      const startRow = prevTotalIdx + 1;
+
+      const addends: number[] = [];
+      for (let ri = startRow; ri < totalRow; ri++) {
+        const cell = table.grid.get(`${ri},${ci}`);
+        if (cell?.type === "number" && cell.value !== null && !isSubtotalHeader(rowHeaders[ri])) {
+          addends.push(cell.value as number);
+        }
+      }
+
+      if (addends.length < 2) continue; // not enough data to verify
+
+      const recomputed = round(addends.reduce((a, b) => a + b, 0));
+      const reported = round(reportedTotal);
+
+      // Record the figure
+      figures.push({
+        name: `${rowHeaders[totalRow]} (${colHeaders[ci] || `col${ci}`})`,
+        recomputed_value: recomputed,
+        source_doc: table.documentId,
+        source_cell: cellRef(table, totalCell),
+        formula: totalCell.formula,
+      });
+
+      if (Math.abs(recomputed - reported) > TOLERANCE * Math.max(1, Math.abs(reported))) {
+        const pctDiff = reported !== 0 ? ((recomputed - reported) / Math.abs(reported)) * 100 : Infinity;
+        const severity: Discrepancy["severity"] = Math.abs(pctDiff) > 5 ? "critical" : "warning";
+
+        discrepancies.push({
+          description: `Subtotal mismatch in "${table.sheetOrPage}": row "${rowHeaders[totalRow]}", col "${colHeaders[ci] || `col${ci}`}" — reported ${reported.toLocaleString()} but sum of components = ${recomputed.toLocaleString()} (${pctDiff > 0 ? "+" : ""}${round(pctDiff, 2)}%)`,
+          severity,
+          check_type: "subtotal_reconciliation",
+          sources: [`${table.documentId}::${table.sheetOrPage}`],
+          expected: recomputed,
+          actual: reported,
+        });
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Check 2: Sign consistency in cash-flow bridges
+// Detect bridge tables; verify that the sum of all signed components
+// matches the stated ending/net value.
+// ---------------------------------------------------------------------------
+
+function checkSignConsistency(
+  table: ParsedTable,
+  figures: Figure[],
+  discrepancies: Discrepancy[]
+): void {
+  if (!isCashFlowSheet(table.caption, table.sheetOrPage)) return;
+
+  const { rowHeaders, colHeaders } = table;
+
+  // Find columns that look like year/period columns (numeric headers or "FY20xx")
+  const periodCols: number[] = [];
+  for (let ci = 1; ci < colHeaders.length; ci++) {
+    const h = colHeaders[ci];
+    if (/\d{4}|fy|cy|q\d|year|period/i.test(h)) periodCols.push(ci);
+  }
+  if (periodCols.length === 0) {
+    // Fall back: use all numeric-header columns
+    for (let ci = 1; ci < colHeaders.length; ci++) {
+      if (!isNaN(Number(colHeaders[ci].replace(/[%,]/g, "")))) periodCols.push(ci);
+    }
+  }
+  if (periodCols.length === 0) return;
+
+  // For each period column, try to verify a bridge:
+  // Look for a "starting" row, intermediate signed rows, and an "ending" row
+  const startKeywords = /beginning|opening|start|initial|prior/i;
+  const endKeywords = /ending|closing|end|final|net|total|result/i;
+
+  for (const ci of periodCols) {
+    // Find start and end rows
+    let startRowIdx = -1;
+    let endRowIdx = -1;
+
+    for (let ri = 0; ri < rowHeaders.length; ri++) {
+      const h = rowHeaders[ri];
+      if (startKeywords.test(h) && startRowIdx === -1) startRowIdx = ri;
+      if (endKeywords.test(h) && isSubtotalHeader(h)) endRowIdx = ri;
+    }
+
+    if (startRowIdx === -1 || endRowIdx === -1 || endRowIdx <= startRowIdx) continue;
+
+    const startCell = table.grid.get(`${startRowIdx},${ci}`);
+    const endCell = table.grid.get(`${endRowIdx},${ci}`);
+
+    if (!startCell || !endCell || startCell.type !== "number" || endCell.type !== "number") continue;
+    if (startCell.value === null || endCell.value === null) continue;
+
+    // Sum all intermediate rows (excluding start and end total rows)
+    let bridgeSum = startCell.value as number;
+    for (let ri = startRowIdx + 1; ri < endRowIdx; ri++) {
+      const cell = table.grid.get(`${ri},${ci}`);
+      if (cell?.type === "number" && cell.value !== null && !isSubtotalHeader(rowHeaders[ri])) {
+        bridgeSum += cell.value as number;
+      }
+    }
+
+    const reported = round(endCell.value as number);
+    const recomputed = round(bridgeSum);
+
+    figures.push({
+      name: `${table.sheetOrPage} bridge end — ${colHeaders[ci]}`,
+      recomputed_value: recomputed,
+      source_doc: table.documentId,
+      source_cell: cellRef(table, endCell),
+      formula: endCell.formula,
+    });
+
+    if (Math.abs(recomputed - reported) > TOLERANCE * Math.max(1, Math.abs(reported))) {
+      // Determine if this looks like a sign error:
+      // If -reported ≈ recomputed, that's a classic sign flip
+      const signFlipMatch = Math.abs(-recomputed - reported) < TOLERANCE * Math.max(1, Math.abs(reported));
+      const severity: Discrepancy["severity"] = "critical"; // any bridge error is critical
+
+      discrepancies.push({
+        description: `Cash-flow bridge sign/arithmetic error in "${table.sheetOrPage}" (${colHeaders[ci]}): bridge from "${rowHeaders[startRowIdx]}" to "${rowHeaders[endRowIdx]}" — reported ${reported.toLocaleString()}, recomputed ${recomputed.toLocaleString()}${signFlipMatch ? ". This matches a SIGN FLIP (one component has wrong sign)." : ""}`,
+        severity,
+        check_type: "sign_consistency",
+        sources: [`${table.documentId}::${table.sheetOrPage}`],
+        expected: recomputed,
+        actual: reported,
+      });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Check 3: Monotonicity in sensitivity tables
+// Sensitivity tables should trend monotonically as the input changes.
+// ---------------------------------------------------------------------------
+
+function checkMonotonicity(
+  table: ParsedTable,
+  discrepancies: Discrepancy[]
+): void {
+  const { rowHeaders, colHeaders } = table;
+
+  // Check if this looks like a sensitivity table
+  const hasSensKeyword =
+    /sensitiv|scenario|case|stress|upside|downside|base|bull|bear/i.test(
+      table.caption + " " + table.sheetOrPage
+    );
+  const numericColHeaders = isSensitivityHeader(colHeaders.slice(1));
+
+  if (!hasSensKeyword && !numericColHeaders) return;
+
+  // For each row, check if numeric values across columns are monotonically
+  // increasing or decreasing (allowing ±1 violation for rounded values)
+  for (let ri = 0; ri < rowHeaders.length; ri++) {
+    if (isSubtotalHeader(rowHeaders[ri])) continue; // skip total rows
+
+    const rowNums = table.cells
+      .filter((c) => c.r === ri && c.type === "number" && c.value !== null && c.c >= 1)
+      .sort((a, b) => a.c - b.c)
+      .map((c) => c.value as number);
+
+    if (rowNums.length < 3) continue;
+
+    // Count monotonic violations
+    let increases = 0;
+    let decreases = 0;
+    for (let i = 1; i < rowNums.length; i++) {
+      if (rowNums[i] > rowNums[i - 1] + TOLERANCE) increases++;
+      if (rowNums[i] < rowNums[i - 1] - TOLERANCE) decreases++;
+    }
+
+    const isMonotonic = increases === 0 || decreases === 0;
+
+    // Non-monotonic: has both increases and decreases
+    if (!isMonotonic) {
+      // Find the violation index
+      const violationIdx = rowNums.findIndex((v, i) =>
+        i > 0 &&
+        (increases > decreases
+          ? v < rowNums[i - 1] - TOLERANCE
+          : v > rowNums[i - 1] + TOLERANCE)
+      );
+
+      const violationColHeader = violationIdx >= 0
+        ? (colHeaders[violationIdx + 1] ?? `col${violationIdx + 1}`)
+        : "unknown";
+
+      discrepancies.push({
+        description: `Non-monotonic sensitivity table in "${table.sheetOrPage}", row "${rowHeaders[ri]}": values do not trend consistently (${increases > decreases ? "generally increasing" : "generally decreasing"} but reverses at "${violationColHeader}"). Values: [${rowNums.map((v) => round(v, 2)).join(", ")}]`,
+        severity: "warning",
+        check_type: "monotonicity",
+        sources: [`${table.documentId}::${table.sheetOrPage}`],
+      });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Check 4: Cross-document agreement
+// Compare named figures (total revenue, EBITDA, etc.) across tables from
+// different documents and flag disagreements.
+// ---------------------------------------------------------------------------
+
+function checkCrossDocAgreement(
+  tables: ParsedTable[],
+  figures: Figure[],
+  discrepancies: Discrepancy[]
+): void {
+  // Build a map: normalizedFigureName+colLabel -> [{ doc, value, ref }]
+  type FigureOccurrence = { doc: string; value: number; ref: string; tableCaption: string };
+  const figureMap = new Map<string, FigureOccurrence[]>();
+
+  const CROSS_DOC_KEYWORDS =
+    /revenue|arr|mrr|ebitda|ebit|gross profit|net income|net revenue|total revenue|operating income|cash|recurring/i;
+
+  for (const table of tables) {
+    const { rowHeaders, colHeaders } = table;
+    for (let ri = 0; ri < rowHeaders.length; ri++) {
+      const rowLabel = rowHeaders[ri];
+      if (!CROSS_DOC_KEYWORDS.test(rowLabel)) continue;
+
+      for (let ci = 1; ci < colHeaders.length; ci++) {
+        const cell = table.grid.get(`${ri},${ci}`);
+        if (!cell || cell.type !== "number" || cell.value === null) continue;
+
+        const key = `${normalizeLabel(rowLabel)}::${normalizeLabel(colHeaders[ci])}`;
+        if (!figureMap.has(key)) figureMap.set(key, []);
+
+        figureMap.get(key)!.push({
+          doc: table.documentId,
+          value: cell.value as number,
+          ref: cellRef(table, cell),
+          tableCaption: table.caption,
+        });
+      }
+    }
+  }
+
+  // Check for disagreements — compare occurrences from different documents
+  for (const [key, occurrences] of figureMap.entries()) {
+    // Only check figures that appear in at least 2 different documents
+    const byDoc = new Map<string, FigureOccurrence[]>();
+    for (const occ of occurrences) {
+      if (!byDoc.has(occ.doc)) byDoc.set(occ.doc, []);
+      byDoc.get(occ.doc)!.push(occ);
+    }
+
+    if (byDoc.size < 2) continue;
+
+    // Get representative value per document (use the first occurrence)
+    const docValues: Array<{ doc: string; value: number; ref: string; caption: string }> = [];
+    for (const [doc, occs] of byDoc.entries()) {
+      docValues.push({ doc, value: occs[0].value, ref: occs[0].ref, caption: occs[0].tableCaption });
+    }
+
+    // Check if any pair differs by more than 0.5% (relative) or 1.0 (absolute for small numbers)
+    const [a, b] = docValues;
+    const absDiff = Math.abs(a.value - b.value);
+    const relDiff = Math.max(Math.abs(a.value), Math.abs(b.value)) > 1
+      ? absDiff / Math.max(Math.abs(a.value), Math.abs(b.value))
+      : absDiff;
+
+    if (relDiff > 0.005) {
+      const parts = key.split("::");
+      const figureName = parts[0] ?? key;
+      const colLabel = parts[1] ?? "";
+
+      figures.push({
+        name: `${figureName} (${colLabel}) — cross-doc mismatch`,
+        recomputed_value: a.value,
+        source_doc: a.doc,
+        source_cell: a.ref,
+      });
+
+      const severity: Discrepancy["severity"] = relDiff > 0.05 ? "critical" : "warning";
+
+      discrepancies.push({
+        description: `Cross-document figure mismatch for "${figureName}" (${colLabel}): doc "${a.caption}" = ${round(a.value, 2).toLocaleString()} vs doc "${b.caption}" = ${round(b.value, 2).toLocaleString()} (${round(relDiff * 100, 2)}% difference). Documents do not agree on this figure.`,
+        severity,
+        check_type: "cross_doc_agreement",
+        sources: [a.ref, b.ref],
+        expected: a.value,
+        actual: b.value,
+      });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main: run all checks across all tables
+// ---------------------------------------------------------------------------
+
+function runAllChecks(tables: ParsedTable[]): { figures: Figure[]; discrepancies: Discrepancy[] } {
+  const figures: Figure[] = [];
+  const discrepancies: Discrepancy[] = [];
+
+  for (const table of tables) {
+    checkSubtotalReconciliation(table, figures, discrepancies);
+    checkSignConsistency(table, figures, discrepancies);
+    checkMonotonicity(table, discrepancies);
+  }
+
+  checkCrossDocAgreement(tables, figures, discrepancies);
+
+  return { figures, discrepancies };
+}
+
+// ---------------------------------------------------------------------------
+// Parse raw DB rows into internal ParsedTable format
+// ---------------------------------------------------------------------------
+
+function parseTables(rows: z.infer<typeof DocTableSchema>[]): ParsedTable[] {
+  const parsed: ParsedTable[] = [];
+
+  for (const row of rows) {
+    let data: z.infer<typeof TableDataSchema>;
+    try {
+      const raw = typeof row.data === "string" ? JSON.parse(row.data) : row.data;
+      data = TableDataSchema.parse(raw);
+    } catch {
+      continue; // skip malformed table
+    }
+
+    const table: ParsedTable = {
+      id: row.id,
+      documentId: row.document_id,
+      sheetOrPage: row.sheet_or_page,
+      caption: row.caption ?? row.sheet_or_page,
+      rowHeaders: data.row_headers,
+      colHeaders: data.col_headers,
+      cells: data.cells,
+      grid: new Map(),
+    };
+    buildGrid(table);
+    parsed.push(table);
+  }
+
+  return parsed;
+}
+
+// ---------------------------------------------------------------------------
+// API
+// ---------------------------------------------------------------------------
+
+export default api({
+  name: "NumericVerify",
+  description: "Runs deterministic arithmetic verification on doc_tables for a deal run",
+
+  integrations: {
+    db: postgres(IC_DILIGENCE_DB),
+  },
+
+  input: z.object({
+    moduleRunId: z.string().uuid(),
+    documentIds: z.array(z.string()),
+  }),
+
+  output: z.object({
+    numericReportId: z.string().nullable(),
+    figureCount: z.number(),
+    discrepancyCount: z.number(),
+    criticalCount: z.number(),
+    figures: z.array(FigureSchema),
+    discrepancies: z.array(DiscrepancySchema),
+  }),
+
+  async run(ctx, { moduleRunId, documentIds }) {
+    if (documentIds.length === 0) {
+      return {
+        numericReportId: null,
+        figureCount: 0,
+        discrepancyCount: 0,
+        criticalCount: 0,
+        figures: [],
+        discrepancies: [],
+      };
+    }
+
+    // Load doc_tables for this run
+    const rawRows = await ctx.integrations.db.query(
+      `SELECT id, document_id, sheet_or_page, caption, data
+       FROM doc_tables
+       WHERE document_id = ANY($1::uuid[])
+       ORDER BY document_id, sheet_or_page`,
+      DocTableSchema,
+      [documentIds],
+      { label: "Load doc_tables for numeric verification" }
+    );
+
+    if (rawRows.length === 0) {
+      return {
+        numericReportId: null,
+        figureCount: 0,
+        discrepancyCount: 0,
+        criticalCount: 0,
+        figures: [],
+        discrepancies: [],
+      };
+    }
+
+    // Parse into internal format and run all checks
+    const tables = parseTables(rawRows);
+    const { figures, discrepancies } = runAllChecks(tables);
+
+    // Persist to numeric_reports
+    const reportRows = await ctx.integrations.db.query(
+      `INSERT INTO numeric_reports (module_run_id, figures, discrepancies)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      z.object({ id: z.string() }),
+      [
+        moduleRunId,
+        JSON.stringify(figures),
+        JSON.stringify(discrepancies),
+      ],
+      { label: "Save numeric_reports" }
+    );
+
+    const numericReportId = reportRows[0]?.id ?? null;
+    const criticalCount = discrepancies.filter((d) => d.severity === "critical").length;
+
+    return {
+      numericReportId,
+      figureCount: figures.length,
+      discrepancyCount: discrepancies.length,
+      criticalCount,
+      figures,
+      discrepancies,
+    };
+  },
+});

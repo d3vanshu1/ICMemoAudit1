@@ -1,0 +1,1863 @@
+import { useState, useMemo, useCallback, useRef, useEffect } from "react";
+import { useParams, useNavigate } from "react-router";
+import { toast } from "sonner";
+import { useApi } from "@/hooks/useApi.js";
+import { useApiData } from "@/hooks/useApiData.js";
+import { processAllFiles, extractTextFromFile, parseExcelToTables, parseCsvToTable } from "@/lib/pdfProcessor";
+import type { DocumentChunk, ProcessedFileInfo, ExcludedFile, StructuredCell } from "@/lib/pdfProcessor";
+import { MODULE_DEFINITIONS, MODULE_MAP } from "@/lib/moduleConfig";
+import { getExtractionsForModule } from "@/lib/chunkRouting";
+import type { TaggedExtraction } from "@/lib/chunkRouting";
+import type { Document, DocumentTag, DocumentSource } from "@/types/document";
+import type { ModuleRun, ModuleStatus } from "@/types/module";
+import type { AnalysisProgress } from "@/components/ic/modules/ModuleGrid";
+
+import Sidebar from "@/components/ic/layout/Sidebar";
+import DashboardHeader from "@/components/ic/layout/DashboardHeader";
+import StatsRow from "@/components/ic/stats/StatsRow";
+import AlertBanner from "@/components/ic/alerts/AlertBanner";
+import ModuleGrid from "@/components/ic/modules/ModuleGrid";
+import RunAllModal from "@/components/ic/modules/RunAllModal";
+import RerunSuggestionModal from "@/components/ic/modules/RerunSuggestionModal";
+import RunHistory from "@/components/ic/modules/RunHistory";
+import QAPanel from "@/components/ic/qa/QAPanel";
+
+export { DealDashboardPage as Component };
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+type MergeNode = {
+  text: string;
+  executiveHeader: string;
+  findings: Array<{
+    severity: "critical" | "warning" | "info";
+    title: string;
+    detail: string;
+    full_analysis: string;
+    source_docs: string[];
+    claim_ids?: string[];
+  }>;
+};
+
+// Research modules that require web search loops
+const WEB_RESEARCH_MODULES = new Set(["external_risk_overlay", "social_reputation"]);
+
+// Config for web research loops
+const EXTERNAL_RISK_MAX_ITERATIONS = 7;
+const EXTERNAL_RISK_CONFIDENCE_THRESHOLD = 8;
+const EXTERNAL_RISK_CONSECUTIVE_THRESHOLD = 2;
+const SOCIAL_REPUTATION_MAX_ITERATIONS = 9;
+const SOCIAL_REPUTATION_CONFIDENCE_THRESHOLD = 8;
+const SOCIAL_REPUTATION_CONSECUTIVE_THRESHOLD = 2;
+
+// Concurrency for chunk analysis (per module)
+const CHUNK_CONCURRENCY = 5;
+
+/** Combined chunk-processing result with coverage tracking */
+interface CoverageResult {
+  chunks: DocumentChunk[];
+  totalPages: number;
+  filesProcessed: ProcessedFileInfo[];
+  filesExcluded: ExcludedFile[];
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
+export default function DealDashboardPage() {
+  const { dealId } = useParams<{ dealId: string }>();
+  const navigate = useNavigate();
+
+  // --- Live data from database ---
+  const { data: dealData, loading: dealLoading, isError: dealError } = useApiData(
+    "GetDeal",
+    { dealId: dealId ?? "" },
+    { enabled: !!dealId }
+  );
+  const deal = (dealData?.deal as import("@/types/deal").Deal | undefined) ?? null;
+
+  const { data: docsData, refetch: refetchDocs } = useApiData(
+    "ListDocuments",
+    { dealId: dealId ?? "" },
+    { enabled: !!dealId }
+  );
+
+  const { data: moduleData, refetch: refetchModules } = useApiData(
+    "LoadModuleResults",
+    { dealId: dealId ?? "" },
+    { enabled: !!dealId }
+  );
+
+  const [docs, setDocs] = useState<Document[]>([]);
+  const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
+  const [statuses, setStatuses] = useState<Record<string, ModuleStatus>>({});
+  const [runningModules, setRunningModules] = useState<Set<string>>(new Set());
+  const [showRunAll, setShowRunAll] = useState(false);
+  const [historyModule, setHistoryModule] = useState<string | null>(null);
+  const [progressMap, setProgressMap] = useState<Record<string, AnalysisProgress>>({});
+  const [rerunModal, setRerunModal] = useState<{ fileNames: string[]; suggestedIds: string[] } | null>(null);
+  const [useOpus, setUseOpus] = useState(false);
+
+  // Sync DB docs into local state — only on initial load
+  const docsInitialized = useRef(false);
+  useEffect(() => {
+    if (docsData?.documents && !docsInitialized.current) {
+      docsInitialized.current = true;
+      setDocs(docsData.documents.map((d: Record<string, unknown>) => ({
+        id: d.id as string,
+        deal_id: d.deal_id as string,
+        file_name: d.file_name as string,
+        file_type: d.file_type as string,
+        document_tag: (d.document_tag ?? "other") as DocumentTag,
+        document_source: (d.document_source ?? "sellside") as DocumentSource,
+        uploaded_at: d.uploaded_at as string,
+      })));
+    }
+  }, [docsData]);
+
+  // Sync DB module results into local state
+  useEffect(() => {
+    if (moduleData?.modules && moduleData.modules.length > 0) {
+      const loaded: Record<string, ModuleStatus> = {};
+      for (const m of moduleData.modules) {
+        loaded[m.moduleId] = {
+          moduleId: m.moduleId,
+          latestRun: m.latestRun
+            ? {
+                id: m.latestRun.id,
+                deal_id: dealId!,
+                module_id: m.moduleId,
+                status: m.latestRun.status as ModuleRun["status"],
+                triggered_at: m.latestRun.triggeredAt,
+                completed_at: m.latestRun.completedAt,
+                documents_included: [],
+                findings_count: m.latestOutput?.findings?.length ?? 0,
+                critical_count: m.latestOutput?.findings?.filter((f: Record<string, unknown>) => f.severity === "critical").length ?? 0,
+              }
+            : null,
+          latestOutput: m.latestOutput
+            ? {
+                id: crypto.randomUUID(),
+                module_run_id: m.latestRun?.id ?? "",
+                executive_header: m.latestOutput.executiveHeader,
+                findings: m.latestOutput.findings,
+                full_report_markdown: m.latestOutput.fullReport,
+                created_at: m.latestOutput.createdAt,
+              }
+            : null,
+        };
+      }
+      setStatuses((prev) => ({ ...prev, ...loaded }));
+    }
+  }, [moduleData, dealId]);
+
+  // Cached chunks so we only process PDFs once even when multiple modules run
+  const chunksCache = useRef<CoverageResult | null>(null);
+  const chunksCacheKey = useRef<string>("");
+
+  // Tracks document IDs for which structured tables have been saved (keyed by cacheKey)
+  const docTablesCacheKey = useRef<string>("");
+  const docIdsForVerification = useRef<string[]>([]);
+
+  // Coverage manifest — populated after chunk processing, read by all module runs
+  const coverageRef = useRef<{
+    filesProcessed: ProcessedFileInfo[];
+    filesExcluded: ExcludedFile[];
+    chunkCount: number;
+    pagesProcessed: number;
+  } | null>(null);
+
+  // Shared universal extraction cache — extract once, reuse across all modules
+  const universalExtractionsCache = useRef<TaggedExtraction[] | null>(null);
+  const universalExtractionsCacheKey = useRef<string>("");
+
+  const { run: analyzeChunk } = useApi("AnalyzeChunk");
+  const { run: universalExtract } = useApi("UniversalExtract");
+  const { run: mergeFindings } = useApi("MergeFindings");
+  const { run: formatReport } = useApi("FormatReport");
+  const { run: webResearch } = useApi("WebResearch");
+  const { run: saveModuleResultApi } = useApi("SaveModuleResult");
+  const { run: saveDocumentApi } = useApi("SaveDocument");
+  const { run: updateDocumentApi } = useApi("UpdateDocument");
+  const { run: deleteDocumentApi } = useApi("DeleteDocument");
+  const { run: getRunHistoryApi } = useApi("GetRunHistory");
+  const { run: indexDocumentChunks } = useApi("IndexDocumentChunks");
+  const { run: getDocumentTexts } = useApi("GetDocumentTexts");
+
+  // Checkpoint APIs (crash-recovery)
+  const { run: saveExtractionsApi } = useApi("SaveExtractions");
+  const { run: loadExtractionsApi } = useApi("LoadExtractions");
+  const { run: saveMergeCheckpointApi } = useApi("SaveMergeCheckpoint");
+  const { run: loadMergeCheckpointsApi } = useApi("LoadMergeCheckpoints");
+  const { run: updateRunStatusApi } = useApi("UpdateRunStatus");
+  const { run: getRunProgressApi } = useApi("GetRunProgress");
+  const { run: saveRunCoverageApi } = useApi("SaveRunCoverage");
+  const { run: loadRunCoverageApi } = useApi("LoadRunCoverage");
+  const { run: saveDocTablesApi } = useApi("SaveDocTables");
+  const { run: numericVerifyApi } = useApi("NumericVerify");
+
+  const completedModules = useMemo(
+    () =>
+      Object.entries(statuses)
+        .filter(([, s]) => s.latestRun?.status === "completed")
+        .map(([id]) => id),
+    [statuses]
+  );
+
+  const stats = useMemo(() => {
+    const totalFindings = Object.values(statuses).reduce(
+      (sum, s) => sum + (s.latestOutput?.findings.length ?? 0),
+      0
+    );
+    const criticalFindings = Object.values(statuses).reduce(
+      (sum, s) =>
+        sum +
+        (s.latestOutput?.findings.filter((f) => f.severity === "critical").length ?? 0),
+      0
+    );
+    return {
+      documents: docs.length,
+      modulesComplete: completedModules.length,
+      totalModules: MODULE_DEFINITIONS.length,
+      totalFindings,
+      criticalFindings,
+    };
+  }, [docs, statuses, completedModules]);
+
+  // ---------------------------------------------------------------------------
+  // Progress helpers — scoped per module
+  // ---------------------------------------------------------------------------
+
+  const setModuleProgress = useCallback(
+    (moduleId: string, update: Partial<AnalysisProgress>) => {
+      setProgressMap((prev) => ({
+        ...prev,
+        [moduleId]: {
+          message: prev[moduleId]?.message ?? null,
+          detail: prev[moduleId]?.detail ?? null,
+          chunkErrors: prev[moduleId]?.chunkErrors ?? [],
+          ...update,
+        },
+      }));
+    },
+    []
+  );
+
+  const clearModuleProgress = useCallback((moduleId: string) => {
+    setProgressMap((prev) => {
+      const next = { ...prev };
+      delete next[moduleId];
+      return next;
+    });
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Chunk processing — shared across modules
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build text-only chunks from database-stored parsed_text.
+   * Accepts an optional set of file names to skip (already covered by fresh uploads).
+   */
+  const buildChunksFromDbText = useCallback(
+    async (moduleId: string, skipFileNames?: Set<string>): Promise<CoverageResult> => {
+      if (!dealId) return { chunks: [], totalPages: 0, filesProcessed: [], filesExcluded: [] };
+
+      setModuleProgress(moduleId, {
+        message: "Loading stored documents from database…",
+      });
+
+      const result = await getDocumentTexts({ dealId });
+      const dbDocs = result?.documents;
+
+      if (!dbDocs || dbDocs.length === 0) {
+        return { chunks: [], totalPages: 0, filesProcessed: [], filesExcluded: [] };
+      }
+
+      const CHUNK_CHARS = 5000;
+      const chunks: DocumentChunk[] = [];
+      const dbFilesProcessed: ProcessedFileInfo[] = [];
+      const dbFilesExcluded: ExcludedFile[] = [];
+
+      for (const doc of dbDocs) {
+        // Skip if a fresh upload with the same name already exists
+        if (skipFileNames && skipFileNames.has(doc.file_name)) {
+          dbFilesExcluded.push({ fileName: doc.file_name, reason: "superseded", detail: "Replaced by a fresh upload" });
+          continue;
+        }
+
+        const text = doc.parsed_text;
+        if (!text || text.trim().length === 0) {
+          dbFilesExcluded.push({ fileName: doc.file_name, reason: "parse_failure", detail: "Empty or missing parsed text" });
+          continue;
+        }
+
+        if (text.length <= CHUNK_CHARS) {
+          chunks.push({
+            label: doc.file_name,
+            sourceFile: doc.file_name,
+            text,
+            pageImages: [],
+          });
+        } else {
+          // Split into multiple chunks
+          let start = 0;
+          let chunkIdx = 1;
+          while (start < text.length) {
+            const end = Math.min(start + CHUNK_CHARS, text.length);
+            chunks.push({
+              label: `${doc.file_name} (part ${chunkIdx})`,
+              sourceFile: doc.file_name,
+              text: text.slice(start, end),
+              pageImages: [],
+            });
+            start = end;
+            chunkIdx++;
+          }
+        }
+
+        const chunkCountForDoc = text.length <= CHUNK_CHARS ? 1 : Math.ceil(text.length / CHUNK_CHARS);
+        dbFilesProcessed.push({ fileName: doc.file_name, chunkCount: chunkCountForDoc, pageCount: chunkCountForDoc });
+      }
+
+      return { chunks, totalPages: chunks.length, filesProcessed: dbFilesProcessed, filesExcluded: dbFilesExcluded };
+    },
+    [dealId, getDocumentTexts, setModuleProgress]
+  );
+
+  const getOrProcessChunks = useCallback(
+    async (moduleId: string) => {
+      // Build a combined cache key from both sources
+      const uploadKey = uploadedFiles.map((f) => f.name + f.size).join("|");
+      const dbKey = docs.map((d) => d.id).sort().join(",");
+      const cacheKey = `${uploadKey}||${dbKey}`;
+
+      if (chunksCache.current && chunksCacheKey.current === cacheKey) {
+        return chunksCache.current;
+      }
+
+      let uploadedChunks: DocumentChunk[] = [];
+      let uploadFilesProcessed: ProcessedFileInfo[] = [];
+      let uploadFilesExcluded: ExcludedFile[] = [];
+
+      // Process fresh File objects with the full PDF rendering pipeline
+      if (uploadedFiles.length > 0) {
+        setModuleProgress(moduleId, {
+          message: "Processing uploaded documents — rendering pages...",
+        });
+
+        const result = await processAllFiles(uploadedFiles, (info) => {
+          if (info.phase === "rendering" && info.currentPage % 5 === 0) {
+            setModuleProgress(moduleId, {
+              message: `Rendering ${info.file}: page ${info.currentPage}/${info.totalPages}`,
+            });
+          }
+        });
+
+        uploadedChunks = result.chunks;
+        uploadFilesProcessed = result.filesProcessed;
+        uploadFilesExcluded = result.filesExcluded;
+      }
+
+      // Build a set of file names covered by fresh uploads
+      const uploadedFileNames = new Set(uploadedFiles.map((f) => f.name));
+
+      // Fetch DB documents, skipping any that share a name with a fresh upload
+      const dbResult = await buildChunksFromDbText(moduleId, uploadedFileNames);
+
+      // Combine both sources — no cap; process everything
+      const allChunks = [...uploadedChunks, ...dbResult.chunks];
+      const allFilesProcessed = [...uploadFilesProcessed, ...dbResult.filesProcessed];
+      const allFilesExcluded = [...uploadFilesExcluded, ...dbResult.filesExcluded];
+
+      if (allFilesExcluded.length > 0) {
+        const reasons = allFilesExcluded.filter(f => f.reason !== "superseded");
+        if (reasons.length > 0) {
+          toast.warning(
+            `${reasons.length} file(s) excluded from analysis. Check the coverage manifest for details.`
+          );
+        }
+      }
+
+      const totalPages = allFilesProcessed.reduce((sum, f) => sum + f.pageCount, 0);
+      const combined: CoverageResult = { chunks: allChunks, totalPages, filesProcessed: allFilesProcessed, filesExcluded: allFilesExcluded };
+      chunksCache.current = combined;
+      chunksCacheKey.current = cacheKey;
+
+      // Persist coverage manifest ref for downstream module runs
+      coverageRef.current = {
+        filesProcessed: allFilesProcessed,
+        filesExcluded: allFilesExcluded,
+        chunkCount: allChunks.length,
+        pagesProcessed: totalPages,
+      };
+
+      // Extract and save structured tables from Excel/CSV files (async, non-blocking)
+      if (cacheKey !== docTablesCacheKey.current) {
+        docTablesCacheKey.current = cacheKey;
+        const docIdByName: Record<string, string> = {};
+        for (const doc of docs) docIdByName[doc.file_name] = doc.id;
+
+        const tablesPayload: Array<{ documentId: string; sheetOrPage: string; caption: string | null; data: { row_headers: string[]; col_headers: string[]; cells: StructuredCell[] } }> = [];
+        const docsWithTables: string[] = [];
+
+        for (const file of uploadedFiles) {
+          const docId = docIdByName[file.name];
+          if (!docId) continue; // not yet in DB — skip
+          const lower = file.name.toLowerCase();
+          if (lower.endsWith(".xlsx") || lower.endsWith(".xls") || lower.endsWith(".xlsm")) {
+            try {
+              const buf = await file.arrayBuffer();
+              const tables = parseExcelToTables(buf, file.name);
+              for (const t of tables) {
+                tablesPayload.push({
+                  documentId: docId,
+                  sheetOrPage: t.sheetOrPage,
+                  caption: t.caption,
+                  data: { row_headers: t.rowHeaders, col_headers: t.colHeaders, cells: t.cells },
+                });
+              }
+              if (tables.length > 0 && !docsWithTables.includes(docId)) docsWithTables.push(docId);
+            } catch (err) {
+              console.warn(`[doc_tables] Failed to parse ${file.name}:`, err);
+            }
+          } else if (lower.endsWith(".csv")) {
+            try {
+              const buf = await file.arrayBuffer();
+              const csvText = new TextDecoder("utf-8").decode(buf);
+              const t = parseCsvToTable(csvText, file.name);
+              if (t) {
+                tablesPayload.push({
+                  documentId: docId,
+                  sheetOrPage: t.sheetOrPage,
+                  caption: t.caption,
+                  data: { row_headers: t.rowHeaders, col_headers: t.colHeaders, cells: t.cells },
+                });
+                if (!docsWithTables.includes(docId)) docsWithTables.push(docId);
+              }
+            } catch (err) {
+              console.warn(`[doc_tables] Failed to parse ${file.name}:`, err);
+            }
+          }
+        }
+
+        if (tablesPayload.length > 0) {
+          docIdsForVerification.current = docsWithTables;
+          saveDocTablesApi({ tables: tablesPayload }).catch((err: unknown) =>
+            console.error("[doc_tables] Failed to save structured tables:", err)
+          );
+        } else {
+          // Fall back to DB doc IDs for spreadsheet files already in the DB
+          docIdsForVerification.current = docs
+            .filter((d) => /\.(xlsx|xls|xlsm|csv)$/i.test(d.file_name))
+            .map((d) => d.id);
+        }
+      }
+
+      return combined;
+    },
+    [uploadedFiles, docs, setModuleProgress, buildChunksFromDbText, saveDocTablesApi]
+  );
+
+  // ---------------------------------------------------------------------------
+  // Universal extraction — extract all chunks once, reuse across modules
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build a map from sourceFile (filename) → documentTag using the
+   * docs state. Chunks carry sourceFile which matches doc.file_name.
+   */
+  const getDocTagMap = useCallback((): Record<string, DocumentTag> => {
+    const tagMap: Record<string, DocumentTag> = {};
+    for (const doc of docs) {
+      tagMap[doc.file_name] = doc.document_tag;
+    }
+    return tagMap;
+  }, [docs]);
+
+  /**
+   * Simple hash for chunk content — used to detect when a chunk has changed
+   * so cached extractions can be invalidated. Uses djb2 algorithm (fast, no crypto needed).
+   */
+  function computeContentHash(text: string): string {
+    let hash = 5381;
+    for (let i = 0; i < text.length; i++) {
+      hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+    }
+    return hash.toString(36);
+  }
+
+  /**
+   * Run universal extraction on all chunks in parallel.
+   * Results are cached in memory AND persisted to the universal_extractions
+   * table. On subsequent runs with unchanged content, extractions are loaded
+   * from the DB — zero new LLM calls.
+   */
+  const getOrRunUniversalExtractions = useCallback(
+    async (progressLabel: string): Promise<TaggedExtraction[]> => {
+      // Build combined cache key from both fresh uploads and DB docs
+      const uploadKey = uploadedFiles.map((f) => f.name + f.size).join("|");
+      const dbKey = docs.map((d) => d.id).sort().join(",");
+      const cacheKey = `${uploadKey}||${dbKey}`;
+
+      // Return in-memory cached extractions if files haven't changed
+      if (
+        universalExtractionsCache.current &&
+        universalExtractionsCacheKey.current === cacheKey
+      ) {
+        return universalExtractionsCache.current;
+      }
+
+      // Step 1: Get or process raw chunks (PDF rendering etc.)
+      const { chunks } = await getOrProcessChunks(progressLabel);
+      if (chunks.length === 0) return [];
+
+      // Step 2: Load cached extractions from DB
+      const tagMap = getDocTagMap();
+      // Build a lookup: documentId by filename
+      const docIdByName: Record<string, string> = {};
+      for (const doc of docs) {
+        docIdByName[doc.file_name] = doc.id;
+      }
+
+      let cachedByKey: Record<string, { contentHash: string; extraction: TaggedExtraction }> = {};
+      if (dealId) {
+        try {
+          setModuleProgress(progressLabel, {
+            message: "Checking for cached extractions…",
+          });
+          const cached = await loadExtractionsApi({ dealId });
+          for (const row of (cached?.extractions ?? [])) {
+            const key = `${row.documentId}:${row.chunkIndex}`;
+            cachedByKey[key] = {
+              contentHash: row.contentHash,
+              extraction: {
+                label: row.extraction.label,
+                extraction: row.extraction.extraction,
+                chunkIndex: row.extraction.chunkIndex,
+                sourceFile: row.extraction.sourceFile,
+                documentTag: row.extraction.documentTag as DocumentTag,
+              },
+            };
+          }
+        } catch {
+          // Ignore load errors — just re-extract everything
+          cachedByKey = {};
+        }
+      }
+
+      // Step 3: Determine which chunks need extraction vs. can be served from cache
+      const extractions: TaggedExtraction[] = new Array(chunks.length);
+      const chunksToExtract: Array<{ index: number; chunk: DocumentChunk; docId: string; hash: string }> = [];
+
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const docId = docIdByName[chunk.sourceFile] ?? "";
+        const hash = computeContentHash(chunk.text);
+        const cacheHit = cachedByKey[`${docId}:${i}`];
+
+        if (cacheHit && cacheHit.contentHash === hash) {
+          // Cache hit — use stored extraction, apply current tag
+          const tag = tagMap[chunk.sourceFile] ?? "other";
+          extractions[i] = { ...cacheHit.extraction, documentTag: tag };
+        } else {
+          chunksToExtract.push({ index: i, chunk, docId, hash });
+        }
+      }
+
+      const cachedCount = chunks.length - chunksToExtract.length;
+      if (cachedCount > 0) {
+        toast.info(`${cachedCount} chunk(s) loaded from cache — ${chunksToExtract.length} need extraction.`);
+      }
+
+      if (chunksToExtract.length === 0) {
+        const validExtractions = extractions.filter(Boolean);
+        universalExtractionsCache.current = validExtractions;
+        universalExtractionsCacheKey.current = cacheKey;
+        return validExtractions;
+      }
+
+      // Step 4: Run extraction only on chunks that need it
+      const errors: string[] = [];
+      let completed = 0;
+      const totalToExtract = chunksToExtract.length;
+
+      setModuleProgress(progressLabel, {
+        message: `Extracting 0/${totalToExtract} chunks (${cachedCount} cached)…`,
+        detail: { current: 0, total: totalToExtract, phase: "analyzing" },
+      });
+
+      // Accumulate newly extracted results for bulk save
+      const newExtractions: Array<{
+        documentId: string;
+        chunkIndex: number;
+        contentHash: string;
+        extraction: TaggedExtraction;
+      }> = [];
+
+      for (let batchStart = 0; batchStart < chunksToExtract.length; batchStart += CHUNK_CONCURRENCY) {
+        const batchEnd = Math.min(batchStart + CHUNK_CONCURRENCY, chunksToExtract.length);
+        const batch = chunksToExtract.slice(batchStart, batchEnd);
+
+        const batchPromises = batch.map(async ({ index: i, chunk, docId, hash }) => {
+          try {
+            const result = await universalExtract({
+              chunkIndex: i,
+              totalChunks: chunks.length,
+              chunk,
+            });
+            const tag = tagMap[chunk.sourceFile] ?? "other";
+            const tagged: TaggedExtraction = {
+              label: result?.label ?? chunk.label,
+              extraction: result?.extraction ?? "",
+              chunkIndex: result?.chunkIndex ?? i,
+              sourceFile: result?.sourceFile ?? chunk.sourceFile,
+              documentTag: tag,
+            };
+            extractions[i] = tagged;
+
+            // Queue for DB persistence
+            if (docId) {
+              newExtractions.push({ documentId: docId, chunkIndex: i, contentHash: hash, extraction: tagged });
+            }
+          } catch (err) {
+            const msg =
+              err && typeof err === "object" && "message" in err
+                ? String((err as { message: unknown }).message)
+                : String(err);
+            errors.push(`Chunk "${chunk.label}": ${msg}`);
+            const tag = tagMap[chunk.sourceFile] ?? "other";
+            extractions[i] = {
+              label: chunk.label,
+              extraction: `### Universal Extraction from: ${chunk.label}\n\n[Error: ${msg}]`,
+              chunkIndex: i,
+              sourceFile: chunk.sourceFile,
+              documentTag: tag,
+            };
+          } finally {
+            completed++;
+            setModuleProgress(progressLabel, {
+              message: `Extracting ${completed}/${totalToExtract} chunks (${cachedCount} cached)…`,
+              detail: { current: completed, total: totalToExtract, phase: "analyzing" },
+            });
+          }
+        });
+
+        await Promise.all(batchPromises);
+
+        // Save batch to DB immediately after each batch completes
+        if (dealId && newExtractions.length > 0) {
+          const batchToSave = newExtractions.splice(0, newExtractions.length);
+          saveExtractionsApi({
+            dealId,
+            extractions: batchToSave.map((e) => ({
+              documentId: e.documentId,
+              chunkIndex: e.chunkIndex,
+              contentHash: e.contentHash,
+              extraction: {
+                label: e.extraction.label,
+                extraction: e.extraction.extraction,
+                chunkIndex: e.extraction.chunkIndex,
+                sourceFile: e.extraction.sourceFile,
+                documentTag: e.extraction.documentTag,
+              },
+            })),
+          }).catch((err: unknown) =>
+            console.error("Failed to save extraction checkpoint:", err)
+          );
+        }
+      }
+
+      if (errors.length > 0) {
+        toast.warning(
+          `${errors.length} chunk(s) had extraction errors — partial results will be used.`
+        );
+      }
+
+      // Cache the results in memory
+      const validExtractions = extractions.filter(Boolean);
+      universalExtractionsCache.current = validExtractions;
+      universalExtractionsCacheKey.current = cacheKey;
+      return validExtractions;
+    },
+    [uploadedFiles, docs, dealId, getOrProcessChunks, getDocTagMap, universalExtract, setModuleProgress, loadExtractionsApi, saveExtractionsApi]
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tree-reduce merge (shared across all modules)
+  // ---------------------------------------------------------------------------
+
+  const MERGE_CONCURRENCY = 10;
+  const MERGE_GROUP_SIZE = 4;
+  const MAX_RETRIES = 3;
+
+  /** Retry helper — retries on 503/rate-limit/connection errors with exponential backoff */
+  async function withRetry<T>(
+    fn: () => Promise<T>,
+    label: string,
+    retries = MAX_RETRIES
+  ): Promise<T> {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        const msg =
+          err && typeof err === "object" && "message" in err
+            ? String((err as { message: unknown }).message)
+            : String(err);
+        const isRetryable = /503|429|rate.?limit|service.?unavailable|connection.?termination|overloaded/i.test(msg);
+        if (!isRetryable || attempt === retries) {
+          throw err;
+        }
+        const delay = Math.min(2000 * Math.pow(2, attempt - 1), 15000); // 2s, 4s, 8s... max 15s
+        console.warn(`[${label}] Attempt ${attempt}/${retries} failed (${msg}), retrying in ${delay}ms…`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw new Error("Unreachable");
+  }
+
+  const treeMerge = useCallback(
+    async (
+      moduleId: string,
+      extractions: Array<{ label: string; extraction: string; chunkIndex: number }>,
+      moduleRunId?: string,
+      numericReport?: { figures: unknown[]; discrepancies: unknown[] } | null
+    ) => {
+      let nodes: MergeNode[] = extractions.map((e) => ({
+        text: e.extraction,
+        executiveHeader: "",
+        findings: [],
+      }));
+
+      if (nodes.length === 1) {
+        nodes.push({ ...nodes[0] });
+      }
+
+      // Load existing merge checkpoints so we can skip completed nodes
+      let existingCheckpoints: Record<string, MergeNode> = {};
+      if (moduleRunId) {
+        try {
+          const loaded = await loadMergeCheckpointsApi({ moduleRunId });
+          const checkpoints = loaded?.checkpoints ?? [];
+          for (const cp of checkpoints) {
+            // Skip error checkpoints — they need to be re-run
+            if (cp.mergedNode.error) continue;
+            const key = `${cp.treeLevel}:${cp.nodeIndex}`;
+            existingCheckpoints[key] = {
+              text: cp.mergedNode.text ?? "",
+              executiveHeader: cp.mergedNode.executiveHeader ?? "",
+              findings: cp.mergedNode.findings ?? [],
+            };
+          }
+          if (checkpoints.length > 0) {
+            toast.info(`Resuming merge — ${checkpoints.length} node(s) already completed.`);
+          }
+        } catch {
+          existingCheckpoints = {};
+        }
+      }
+
+      const totalMergeRounds = Math.ceil(Math.log(Math.max(nodes.length, 2)) / Math.log(MERGE_GROUP_SIZE));
+      let currentRound = 0;
+
+      while (nodes.length > 1) {
+        currentRound++;
+        const groups: Array<{ idx: number; members: MergeNode[] }> = [];
+        for (let g = 0; g < Math.ceil(nodes.length / MERGE_GROUP_SIZE); g++) {
+          const members = nodes.slice(g * MERGE_GROUP_SIZE, (g + 1) * MERGE_GROUP_SIZE);
+          groups.push({ idx: g, members });
+        }
+
+        // Separate singletons (groups with 1 member) from real groups needing merge
+        const singletons = groups.filter((g) => g.members.length === 1);
+        const realGroups = groups.filter((g) => g.members.length > 1);
+        const nextNodes: MergeNode[] = new Array(groups.length);
+
+        // Pass through singletons immediately
+        for (const s of singletons) {
+          nextNodes[s.idx] = s.members[0];
+        }
+
+        setModuleProgress(moduleId, {
+          message: `Merging findings (round ${currentRound}/${totalMergeRounds}, ${realGroups.length} groups in parallel)…`,
+          detail: {
+            current: currentRound,
+            total: totalMergeRounds + 1,
+            phase: "synthesizing",
+          },
+        });
+
+        // Process real groups in parallel with bounded concurrency
+        let completed = 0;
+        for (let bStart = 0; bStart < realGroups.length; bStart += MERGE_CONCURRENCY) {
+          const batch = realGroups.slice(bStart, bStart + MERGE_CONCURRENCY);
+
+          const batchPromises = batch.map(async (group) => {
+            // Check if this node is already checkpointed
+            const cpKey = `${currentRound}:${group.idx}`;
+            if (existingCheckpoints[cpKey]) {
+              nextNodes[group.idx] = existingCheckpoints[cpKey];
+              completed++;
+              return;
+            }
+
+            try {
+              // Pass numericReport on EVERY merge round for numeric modules,
+              // so early rounds can cross-reference against verified figures too.
+              // The report is small (capped at 30 figures) — negligible token impact.
+              const NUMERIC_MODULES = new Set(["model_assumptions_stress", "contradiction_check"]);
+              const mergeNumericReport = (NUMERIC_MODULES.has(moduleId) && numericReport) ? numericReport : undefined;
+
+              const merged = await withRetry(
+                () => mergeFindings({
+                  moduleId,
+                  batches: group.members.map((m) => m.text),
+                  roundLabel: `Round ${currentRound}, group ${group.idx + 1}/${groups.length}`,
+                  useOpus,
+                  isFinalRound: currentRound === totalMergeRounds,
+                  ...(mergeNumericReport ? { numericReport: mergeNumericReport } : {}),
+                }),
+                `Merge R${currentRound} G${group.idx + 1}`
+              );
+
+              const node: MergeNode = {
+                text: merged?.mergedText ?? "",
+                executiveHeader: merged?.executiveHeader ?? "",
+                findings: merged?.findings ?? [],
+              };
+              nextNodes[group.idx] = node;
+
+              // Persist checkpoint
+              if (moduleRunId) {
+                saveMergeCheckpointApi({
+                  moduleRunId,
+                  treeLevel: currentRound,
+                  nodeIndex: group.idx,
+                  mergedNode: node,
+                }).catch((err: unknown) =>
+                  console.error("Failed to save merge checkpoint:", err)
+                );
+              }
+            } catch (err) {
+              const msg =
+                err && typeof err === "object" && "message" in err
+                  ? String((err as { message: unknown }).message)
+                  : String(err);
+              toast.error(`[${MODULE_MAP[moduleId]?.displayName}] Merge failed: ${msg}`);
+              // Fallback: concatenate all members in the group
+              nextNodes[group.idx] = {
+                text: group.members.map((m) => m.text).join("\n\n---\n\n"),
+                executiveHeader: group.members.find((m) => m.executiveHeader)?.executiveHeader ?? "",
+                findings: group.members.flatMap((m) => m.findings),
+              };
+            } finally {
+              completed++;
+              setModuleProgress(moduleId, {
+                message: `Merging findings (round ${currentRound}/${totalMergeRounds}, ${completed}/${realGroups.length} done)…`,
+                detail: {
+                  current: currentRound,
+                  total: totalMergeRounds + 1,
+                  phase: "synthesizing",
+                },
+              });
+            }
+          });
+
+          await Promise.all(batchPromises);
+        }
+
+        nodes = nextNodes.filter(Boolean);
+      }
+
+      return nodes[0];
+    },
+    [mergeFindings, setModuleProgress, useOpus, loadMergeCheckpointsApi, saveMergeCheckpointApi]
+  );
+
+  // ---------------------------------------------------------------------------
+  // Coverage line builder
+  // ---------------------------------------------------------------------------
+
+  function buildCoverageLine(): string {
+    const cov = coverageRef.current;
+    if (!cov) return "";
+    const incCount = cov.filesProcessed.length;
+    const excCount = cov.filesExcluded.length;
+    const totalDocs = incCount + excCount;
+    let line = `Analyzed ${incCount} of ${totalDocs} documents (${cov.pagesProcessed} pages, ${cov.chunkCount} chunks).`;
+    if (excCount > 0) {
+      const excSummary = cov.filesExcluded
+        .map((f) => `${f.fileName} (${f.reason}${f.detail ? ": " + f.detail : ""})`)
+        .join("; ");
+      line += ` Excluded: ${excSummary}.`;
+    }
+    return line;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Format report (shared across all modules)
+  // ---------------------------------------------------------------------------
+
+  const generateReport = useCallback(
+    async (
+      moduleId: string,
+      finalMerge: MergeNode,
+      totalSteps: number,
+      coverageLine?: string,
+      numericReport?: { figures: unknown[]; discrepancies: unknown[] } | null
+    ) => {
+      setModuleProgress(moduleId, {
+        message: "Formatting final report…",
+        detail: { current: totalSteps, total: totalSteps, phase: "synthesizing" },
+      });
+
+      const report = await withRetry(
+        () => formatReport({
+          moduleId,
+          executiveHeader: finalMerge.executiveHeader,
+          findings: finalMerge.findings,
+          useOpus,
+          coverageLine: coverageLine ?? null,
+          ...(numericReport ? { numericReport } : {}),
+        }),
+        `FormatReport ${moduleId}`
+      );
+
+      return report?.fullReport ?? "";
+    },
+    [formatReport, setModuleProgress, useOpus]
+  );
+
+  // ---------------------------------------------------------------------------
+  // Save module result
+  // ---------------------------------------------------------------------------
+
+  const saveModuleResult = useCallback(
+    async (
+      moduleId: string,
+      result: {
+        executiveHeader: string;
+        findings: MergeNode["findings"];
+        fullReport: string;
+      }
+    ) => {
+      // Update local state immediately for instant UI feedback
+      setStatuses((prev) => ({
+        ...prev,
+        [moduleId]: {
+          moduleId,
+          latestRun: {
+            id: crypto.randomUUID(),
+            deal_id: dealId!,
+            module_id: moduleId,
+            status: "completed",
+            triggered_at: new Date().toISOString(),
+            completed_at: new Date().toISOString(),
+            documents_included: uploadedFiles.length > 0
+              ? uploadedFiles.map((f) => f.name)
+              : docs.map((d) => d.file_name),
+            findings_count: result.findings.length,
+            critical_count: result.findings.filter(
+              (f) => f.severity === "critical"
+            ).length,
+          },
+          latestOutput: {
+            id: crypto.randomUUID(),
+            module_run_id: crypto.randomUUID(),
+            executive_header: result.executiveHeader,
+            findings: result.findings,
+            full_report_markdown: result.fullReport,
+            created_at: new Date().toISOString(),
+          },
+        },
+      }));
+
+      // Persist to database in background
+      if (dealId) {
+        try {
+          await saveModuleResultApi({
+            dealId,
+            moduleId,
+            executiveHeader: result.executiveHeader,
+            findings: result.findings,
+            fullReport: result.fullReport,
+            documentsIncluded: uploadedFiles.length > 0
+              ? uploadedFiles.map((f) => f.name)
+              : docs.map((d) => d.file_name),
+          });
+        } catch (err) {
+          console.error("Failed to persist module result:", err);
+          // Don't toast — local state is already updated, user sees results
+        }
+      }
+    },
+    [dealId, uploadedFiles, docs, saveModuleResultApi]
+  );
+
+  // ---------------------------------------------------------------------------
+  // Standard module pipeline: chunk → analyze → tree-merge → report
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Analyze chunks in parallel with bounded concurrency.
+   * Returns extractions array (in chunk order) and any errors.
+   */
+  const analyzeChunksParallel = useCallback(
+    async (
+      moduleId: string,
+      chunks: Array<{ label: string; sourceFile: string; text: string; pageImages: Array<{ pageNumber: number; text: string; imageBase64: string; mediaType: "image/jpeg" }> }>,
+      progressPrefix = "Analyzing"
+    ) => {
+      const extractions: Array<{ label: string; extraction: string; chunkIndex: number }> = new Array(chunks.length);
+      const errors: string[] = [];
+      let completed = 0;
+
+      setModuleProgress(moduleId, {
+        message: `${progressPrefix} 0/${chunks.length} chunks…`,
+        detail: { current: 0, total: chunks.length, phase: "analyzing" },
+      });
+
+      // Process in batches of CHUNK_CONCURRENCY
+      for (let batchStart = 0; batchStart < chunks.length; batchStart += CHUNK_CONCURRENCY) {
+        const batchEnd = Math.min(batchStart + CHUNK_CONCURRENCY, chunks.length);
+        const batch = chunks.slice(batchStart, batchEnd);
+
+        const batchPromises = batch.map(async (chunk, batchIdx) => {
+          const i = batchStart + batchIdx;
+          try {
+            const result = await analyzeChunk({
+              moduleId,
+              chunkIndex: i,
+              totalChunks: chunks.length,
+              chunk,
+            });
+            extractions[i] = result ?? { label: chunk.label, extraction: "", chunkIndex: i };
+          } catch (err) {
+            const msg =
+              err && typeof err === "object" && "message" in err
+                ? String((err as { message: unknown }).message)
+                : String(err);
+            errors.push(`Chunk "${chunk.label}": ${msg}`);
+            extractions[i] = {
+              label: chunk.label,
+              extraction: `### Extraction from: ${chunk.label}\n\n[Error: ${msg}]`,
+              chunkIndex: i,
+            };
+          } finally {
+            completed++;
+            setModuleProgress(moduleId, {
+              message: `${progressPrefix} ${completed}/${chunks.length} chunks…`,
+              detail: { current: completed, total: chunks.length, phase: "analyzing" },
+            });
+          }
+        });
+
+        await Promise.all(batchPromises);
+      }
+
+      return { extractions, errors };
+    },
+    [analyzeChunk, setModuleProgress]
+  );
+
+  const runStandardModule = useCallback(
+    async (moduleId: string, existingRunId?: string) => {
+      const docsIncluded = uploadedFiles.length > 0
+        ? uploadedFiles.map((f) => f.name)
+        : docs.map((d) => d.file_name);
+
+      // Create or reuse a run record with status "running"
+      let runId = existingRunId;
+      if (!runId && dealId) {
+        try {
+          const res = await updateRunStatusApi({
+            runId: null,
+            dealId,
+            moduleId,
+            status: "running",
+            documentsIncluded: docsIncluded,
+          });
+          runId = res?.runId;
+        } catch {
+          // Non-fatal — continue without checkpointing
+        }
+      }
+
+      // Phase 1: Get or run universal extractions (shared across all modules)
+      const allExtractions = await getOrRunUniversalExtractions(moduleId);
+      if (allExtractions.length === 0) {
+        toast.error("No processable content found. Check your files.");
+        if (runId) updateRunStatusApi({ runId, dealId: dealId!, moduleId, status: "failed" }).catch(() => {});
+        return;
+      }
+
+      // Phase 2: Route — only send relevant chunks to this module
+      const routed = getExtractionsForModule(allExtractions, moduleId);
+      if (routed.length === 0) {
+        toast.warning(
+          `[${MODULE_MAP[moduleId]?.displayName}] No relevant document types found for this module. Tag your documents appropriately or tag as "Other" to include them.`
+        );
+        if (runId) updateRunStatusApi({ runId, dealId: dealId!, moduleId, status: "failed" }).catch(() => {});
+        return;
+      }
+
+      const displayName = MODULE_MAP[moduleId]?.displayName ?? moduleId;
+      setModuleProgress(moduleId, {
+        message: `${routed.length} of ${allExtractions.length} chunks routed to ${displayName}…`,
+      });
+
+      // Convert TaggedExtraction[] to the format treeMerge expects
+      const extractions = routed.map((ext) => ({
+        label: ext.label,
+        extraction: ext.extraction,
+        chunkIndex: ext.chunkIndex,
+      }));
+
+      // Phase 3: Numeric Verification (model_assumptions_stress and contradiction_check only)
+      const NUMERIC_MODULES = new Set(["model_assumptions_stress", "contradiction_check"]);
+      let numericReport: { figures: unknown[]; discrepancies: unknown[] } | null = null;
+      if (NUMERIC_MODULES.has(moduleId) && docIdsForVerification.current.length > 0 && runId) {
+        try {
+          setModuleProgress(moduleId, { message: "Running deterministic numeric verification…" });
+          const verifyResult = await numericVerifyApi({
+            moduleRunId: runId,
+            documentIds: docIdsForVerification.current,
+          });
+          if (verifyResult && (verifyResult.figureCount > 0 || verifyResult.discrepancyCount > 0)) {
+            numericReport = {
+              figures: verifyResult.figures ?? [],
+              discrepancies: verifyResult.discrepancies ?? [],
+            };
+            if (verifyResult.criticalCount > 0) {
+              toast.warning(
+                `Numeric verification: ${verifyResult.criticalCount} critical discrepancy(ies) found — will be reported as findings.`
+              );
+            } else if (verifyResult.discrepancyCount > 0) {
+              toast.info(`Numeric verification: ${verifyResult.discrepancyCount} discrepancy(ies) flagged.`);
+            }
+          }
+        } catch (err) {
+          // Non-fatal — log and continue without numeric report
+          console.warn("[NumericVerify] Verification failed, continuing without:", err);
+        }
+      }
+
+      // Phase 4: Tree-reduce merge (with checkpoint support)
+      const finalMerge = await treeMerge(moduleId, extractions, runId, numericReport);
+
+      // Phase 3.5: Save coverage manifest and build coverage line
+      const coverageLine = buildCoverageLine();
+      if (runId && coverageRef.current) {
+        saveRunCoverageApi({
+          moduleRunId: runId,
+          documentsIncluded: coverageRef.current.filesProcessed,
+          documentsExcluded: coverageRef.current.filesExcluded,
+          chunkCount: coverageRef.current.chunkCount,
+          pagesProcessed: coverageRef.current.pagesProcessed,
+        }).catch((err: unknown) => console.error("Failed to save coverage manifest:", err));
+      }
+
+      // Phase 5: Format report (with coverage line and numeric report)
+      const totalMergeRounds = Math.ceil(Math.log2(Math.max(extractions.length, 2)));
+      const fullReport = await generateReport(moduleId, finalMerge, totalMergeRounds + 1, coverageLine, numericReport);
+
+      await saveModuleResult(moduleId, {
+        executiveHeader: finalMerge.executiveHeader,
+        findings: finalMerge.findings,
+        fullReport,
+      });
+
+      // Mark run completed
+      if (runId) updateRunStatusApi({ runId, dealId: dealId!, moduleId, status: "completed" }).catch(() => {});
+
+      toast.success(`${displayName} complete!`);
+    },
+    [dealId, uploadedFiles, docs, getOrRunUniversalExtractions, treeMerge, generateReport, saveModuleResult, setModuleProgress, updateRunStatusApi, saveRunCoverageApi, numericVerifyApi]
+  );
+
+  // ---------------------------------------------------------------------------
+  // Web research module pipeline:
+  //   chunk → analyze → research loop → combine → tree-merge → report
+  // ---------------------------------------------------------------------------
+
+  const runWebResearchModule = useCallback(
+    async (moduleId: string) => {
+      // Phase 1: Get or reuse universal extractions
+      const allExtractions = await getOrRunUniversalExtractions(moduleId);
+      if (allExtractions.length === 0) {
+        toast.error("No processable content found. Check your files.");
+        return;
+      }
+
+      // Route to relevant chunks for this web research module
+      const routed = getExtractionsForModule(allExtractions, moduleId);
+
+      // Build context summaries for the research agent from routed extractions
+      const dealName = deal?.name ?? "Unknown Company";
+      const dealContext = [
+        `Company: ${dealName}`,
+        deal?.description ? `Description: ${deal.description}` : "",
+        deal?.sector ? `Sector: ${deal.sector}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const docContext = routed
+        .map((ext) => `Document: ${ext.label}\n${ext.extraction}`)
+        .join("\n\n");
+
+      // Phase 2: Web research loop
+      const maxIterations =
+        moduleId === "social_reputation"
+          ? SOCIAL_REPUTATION_MAX_ITERATIONS
+          : EXTERNAL_RISK_MAX_ITERATIONS;
+      const confidenceThreshold =
+        moduleId === "social_reputation"
+          ? SOCIAL_REPUTATION_CONFIDENCE_THRESHOLD
+          : EXTERNAL_RISK_CONFIDENCE_THRESHOLD;
+      const consecutiveThreshold =
+        moduleId === "social_reputation"
+          ? SOCIAL_REPUTATION_CONSECUTIVE_THRESHOLD
+          : EXTERNAL_RISK_CONSECUTIVE_THRESHOLD;
+
+      // Build research categories for social_reputation
+      let researchCategories: string | undefined;
+      if (moduleId === "social_reputation") {
+        const cats = [
+          `GLASSDOOR: Search for "${dealName} Glassdoor reviews". Find overall star rating, review count, CEO approval %, common themes.`,
+          `INDEED: Search for "${dealName} Indeed reviews". Compare to Glassdoor findings.`,
+          `LINKEDIN: Search for "${dealName} LinkedIn company". Note employee count, growth signals, recent hires/departures.`,
+          `X/TWITTER: Search for "${dealName} Twitter". Note follower count, engagement quality, customer interactions.`,
+          `INSTAGRAM: Search for "${dealName} Instagram". Note follower count, posting frequency, content quality.`,
+          `FACEBOOK: Search for "${dealName} Facebook page". Note follower count, page rating, review scores.`,
+          `CUSTOMER REVIEWS: Search for "${dealName} reviews" on Trustpilot, BBB, G2, or industry-specific platforms.`,
+          `REDDIT & FORUMS: Search for "${dealName} Reddit". Look for unfiltered employee and customer sentiment.`,
+          `NEWS: Search for recent news about "${dealName}". Focus on layoffs, lawsuits, executive changes, controversies.`,
+          `C-SUITE: Search for "${dealName} CEO" and "${dealName} leadership team". Find executive backgrounds and reputation.`,
+        ];
+        researchCategories = cats.map((c, i) => `${i + 1}. ${c}`).join("\n");
+      }
+
+      const iterations: Array<{
+        iteration: number;
+        query: string;
+        finding: string;
+        confidence: number;
+        platform?: string;
+      }> = [];
+      let consecutiveHighConfidence = 0;
+
+      setModuleProgress(moduleId, {
+        message: "Starting web research…",
+        detail: { current: 0, total: maxIterations, phase: "researching" },
+      });
+
+      for (let i = 1; i <= maxIterations; i++) {
+        setModuleProgress(moduleId, {
+          message: `Research iteration ${i}/${maxIterations}…`,
+          detail: { current: i, total: maxIterations, phase: "researching" },
+        });
+
+        const previousFindings = iterations
+          .map(
+            (it) =>
+              `Iteration ${it.iteration}: Searched "${it.query}" → ${it.finding} (confidence: ${it.confidence}/10)`
+          )
+          .join("\n");
+
+        const result = await webResearch({
+          moduleId: moduleId as "external_risk_overlay" | "social_reputation",
+          iteration: i,
+          dealContext,
+          docContext,
+          previousFindings,
+          researchCategories: researchCategories ?? "",
+        });
+
+        if (!result) continue;
+        iterations.push(result);
+
+        // Confidence-based early stopping
+        if (result.confidence >= confidenceThreshold) {
+          consecutiveHighConfidence++;
+        } else {
+          consecutiveHighConfidence = 0;
+        }
+
+        if (consecutiveHighConfidence >= consecutiveThreshold) {
+          setModuleProgress(moduleId, {
+            message: `Research complete after ${i} iterations (confidence threshold reached).`,
+          });
+          break;
+        }
+
+        // Diminishing returns early stopping: if last 2 iterations both LOW materiality, stop
+        if (
+          iterations.length >= 3 &&
+          (iterations[iterations.length - 1] as Record<string, unknown>).materiality?.toString().toUpperCase() === "LOW" &&
+          (iterations[iterations.length - 2] as Record<string, unknown>).materiality?.toString().toUpperCase() === "LOW"
+        ) {
+          setModuleProgress(moduleId, {
+            message: `Research complete after ${i} iterations (diminishing returns).`,
+          });
+          break;
+        }
+      }
+
+      // Phase 3: Build research extractions for tree-merge
+      // IMPORTANT: Only research iterations go into the tree-reduce.
+      // Document extractions are passed as reference context, NOT as peer nodes.
+      const researchLabel = moduleId === "social_reputation" ? "Social Research" : "External Research";
+      const researchExtractions = iterations.map((it, idx) => {
+        const itAny = it as Record<string, unknown>;
+        const sources = Array.isArray(itAny.sources) ? itAny.sources : [];
+        const sourcesStr = sources.length ? `\nSources: ${sources.join(", ")}` : "";
+        const categoryStr = itAny.category ? `\nCategory: ${itAny.category}` : "";
+        const materialityStr = itAny.materiality ? `\nMateriality: ${itAny.materiality}` : "";
+        return {
+          label: `[${researchLabel}] Iteration ${it.iteration}: "${it.query}"`,
+          extraction: `### ${researchLabel} Iteration ${it.iteration}\n\nQuery: ${it.query}${categoryStr}${materialityStr}\nFinding: ${it.finding}${sourcesStr}\nConfidence: ${it.confidence}/10`,
+          chunkIndex: idx,
+        };
+      });
+
+      // Build a condensed document context string for the merge prompt
+      const docContextForMerge = routed
+        .map((ext) => `[${ext.label}]: ${ext.extraction.slice(0, 500)}`)
+        .join("\n\n");
+      const docContextPrefix = docContextForMerge
+        ? `## Document Context (REFERENCE ONLY — do not treat as findings)\n\n${docContextForMerge}\n\n---\n\n`
+        : "";
+
+      // Prepend doc context to each research extraction so every merge pair has it
+      const contextualExtractions = researchExtractions.map((ext) => ({
+        ...ext,
+        extraction: docContextPrefix + ext.extraction,
+      }));
+
+      // Phase 4: Tree-reduce merge (only research findings, with doc context as reference)
+      const finalMerge = await treeMerge(moduleId, contextualExtractions);
+
+      // Phase 5: Format report (with coverage line)
+      const coverageLine = buildCoverageLine();
+      const totalMergeRounds = Math.ceil(Math.log2(Math.max(contextualExtractions.length, 2)));
+      const fullReport = await generateReport(moduleId, finalMerge, totalMergeRounds + 1, coverageLine);
+
+      await saveModuleResult(moduleId, {
+        executiveHeader: finalMerge.executiveHeader,
+        findings: finalMerge.findings,
+        fullReport,
+      });
+
+      const displayName = MODULE_MAP[moduleId]?.displayName ?? moduleId;
+      toast.success(`${displayName} complete!`);
+    },
+    [
+      deal,
+      getOrRunUniversalExtractions,
+      webResearch,
+      treeMerge,
+      generateReport,
+      saveModuleResult,
+    ]
+  );
+
+  // ---------------------------------------------------------------------------
+  // Executive Summary pipeline: uses prior module outputs
+  // ---------------------------------------------------------------------------
+
+  const runExecutiveSummary = useCallback(async () => {
+    const moduleId = "executive_summary";
+
+    // Gather completed module outputs (excluding executive_summary itself)
+    const priorModules = Object.entries(statuses).filter(
+      ([id, s]) => id !== "executive_summary" && s.latestRun?.status === "completed" && s.latestOutput
+    );
+
+    if (priorModules.length === 0) {
+      toast.error("Run at least one analysis module before generating the Executive Summary.");
+      return;
+    }
+
+    // Build chunks from prior module outputs
+    const execChunks = priorModules.map(([id, s]) => {
+      const displayName = MODULE_MAP[id]?.displayName ?? id;
+      const output = s.latestOutput!;
+      return {
+        label: displayName,
+        sourceFile: `Module: ${displayName}`,
+        text: `Module: ${displayName}\n\nExecutive Header: ${output.executive_header}\n\nFindings (${output.findings.length}):\n${output.findings
+          .map(
+            (f: { severity: string; title: string; detail: string }, fi: number) =>
+              `${fi + 1}. [${f.severity}] ${f.title}: ${f.detail}`
+          )
+          .join("\n")}\n\nFull Report:\n${output.full_report_markdown}`,
+        pageImages: [] as Array<{ pageNumber: number; text: string; imageBase64: string; mediaType: "image/jpeg" }>,
+      };
+    });
+
+    // Analyze all module outputs in parallel
+    const { extractions } = await analyzeChunksParallel(
+      moduleId,
+      execChunks,
+      "Synthesizing module outputs"
+    );
+
+    // Tree-reduce merge
+    const finalMerge = await treeMerge(moduleId, extractions);
+
+    // Format report (with coverage line if available from prior runs)
+    const coverageLine = buildCoverageLine();
+    const totalMergeRounds = Math.ceil(Math.log2(Math.max(extractions.length, 2)));
+    const fullReport = await generateReport(moduleId, finalMerge, totalMergeRounds + 1, coverageLine || undefined);
+
+    await saveModuleResult(moduleId, {
+      executiveHeader: finalMerge.executiveHeader,
+      findings: finalMerge.findings,
+      fullReport,
+    });
+
+    toast.success("Executive Summary complete!");
+  }, [statuses, analyzeChunksParallel, treeMerge, generateReport, saveModuleResult, setModuleProgress]);
+
+  // ---------------------------------------------------------------------------
+  // Run single module
+  // ---------------------------------------------------------------------------
+
+  const handleRunModule = useCallback(
+    async (moduleId: string, resumeRunId?: string) => {
+      if (runningModules.has(moduleId)) {
+        toast.info("This module is already running.");
+        return;
+      }
+
+      // Executive Summary — special handling
+      if (moduleId === "executive_summary") {
+        const priorCompleted = Object.entries(statuses).filter(
+          ([id, s]) => id !== "executive_summary" && s.latestRun?.status === "completed"
+        );
+        if (priorCompleted.length === 0) {
+          toast.warning("Run at least one other module first before generating the Executive Summary.");
+          return;
+        }
+      } else if (uploadedFiles.length === 0 && docs.length === 0) {
+        toast.warning("Upload at least one document before running analysis.");
+        return;
+      }
+
+      setRunningModules((prev) => new Set(prev).add(moduleId));
+      setProgressMap((prev) => ({
+        ...prev,
+        [moduleId]: { message: "Starting…", detail: null, chunkErrors: [] },
+      }));
+
+      try {
+        if (moduleId === "executive_summary") {
+          await runExecutiveSummary();
+        } else if (WEB_RESEARCH_MODULES.has(moduleId)) {
+          await runWebResearchModule(moduleId);
+        } else {
+          await runStandardModule(moduleId, resumeRunId);
+        }
+      } catch (err) {
+        const message =
+          err && typeof err === "object" && "message" in err
+            ? String((err as { message: unknown }).message)
+            : String(err);
+        const hint = /timeout|timed out|abort|cancel/i.test(message)
+          ? " Try with fewer or smaller files."
+          : "";
+        const displayName = MODULE_MAP[moduleId]?.displayName ?? moduleId;
+        toast.error(`[${displayName}] Analysis failed: ${message}${hint}`);
+      } finally {
+        setRunningModules((prev) => {
+          const next = new Set(prev);
+          next.delete(moduleId);
+          return next;
+        });
+        clearModuleProgress(moduleId);
+      }
+    },
+    [
+      runningModules,
+      uploadedFiles,
+      docs,
+      statuses,
+      runStandardModule,
+      runWebResearchModule,
+      runExecutiveSummary,
+      clearModuleProgress,
+    ]
+  );
+
+  // ---------------------------------------------------------------------------
+  // Run All — launches all modules simultaneously, exec summary last
+  // ---------------------------------------------------------------------------
+
+  const handleRunAll = useCallback(async () => {
+    setShowRunAll(false);
+
+    if (uploadedFiles.length === 0 && docs.length === 0) {
+      toast.warning("Upload at least one document before running analysis.");
+      return;
+    }
+
+    // Launch all non-executive-summary modules simultaneously
+    const modulesToRun = MODULE_DEFINITIONS.filter(
+      (m) => m.id !== "executive_summary" && !runningModules.has(m.id)
+    );
+
+    if (modulesToRun.length === 0) {
+      toast.info("All modules are already running.");
+      return;
+    }
+
+    toast.info(`Launching ${modulesToRun.length} modules simultaneously…`);
+
+    // Run all modules in parallel
+    const promises = modulesToRun.map((m) => handleRunModule(m.id));
+    await Promise.allSettled(promises);
+
+    // After all complete, run Executive Summary automatically
+    // Re-check statuses to see what completed (use a timeout to let state settle)
+    setTimeout(() => {
+      handleRunModule("executive_summary");
+    }, 500);
+  }, [uploadedFiles, docs, runningModules, handleRunModule]);
+
+  // ---------------------------------------------------------------------------
+  // Resume interrupted runs on deal load
+  // ---------------------------------------------------------------------------
+  const resumeChecked = useRef(false);
+  useEffect(() => {
+    if (!dealId || resumeChecked.current || !docsInitialized.current) return;
+    if (docs.length === 0) return; // Wait until docs are loaded
+
+    resumeChecked.current = true;
+
+    (async () => {
+      try {
+        const progress = await getRunProgressApi({ dealId });
+        const runs = progress?.runs ?? [];
+        const inProgressRuns = runs.filter((r) => r.status === "running");
+        if (inProgressRuns.length === 0) return;
+
+        toast.info(`Resuming ${inProgressRuns.length} interrupted run(s)…`);
+        for (const run of inProgressRuns) {
+          // Skip web research and exec summary — those aren't checkpointed yet
+          if (WEB_RESEARCH_MODULES.has(run.moduleId) || run.moduleId === "executive_summary") continue;
+          handleRunModule(run.moduleId, run.runId);
+        }
+      } catch (err) {
+        console.error("Failed to check for interrupted runs:", err);
+      }
+    })();
+  }, [dealId, docs, handleRunModule, getRunProgressApi]);
+
+  // ---------------------------------------------------------------------------
+  // Document management
+  // ---------------------------------------------------------------------------
+
+  const handleUpload = useCallback(
+    async (files: File[]) => {
+      setUploadedFiles((prev) => [...prev, ...files]);
+      // Invalidate caches since files changed
+      chunksCache.current = null;
+      chunksCacheKey.current = "";
+      coverageRef.current = null;
+      universalExtractionsCache.current = null;
+      universalExtractionsCacheKey.current = "";
+      docTablesCacheKey.current = "";
+      docIdsForVerification.current = [];
+
+      const newDocs: Document[] = files.map((f) => ({
+        id: crypto.randomUUID(),
+        deal_id: dealId!,
+        file_name: f.name,
+        file_type: f.type || "application/octet-stream",
+        document_tag: "other" as DocumentTag,
+        document_source: "sellside" as DocumentSource,
+        uploaded_at: new Date().toISOString(),
+      }));
+      setDocs((prev) => [...prev, ...newDocs]);
+      toast.success(`Uploaded ${files.length} document${files.length > 1 ? "s" : ""}`);
+
+      // If there are already completed modules, prompt user to re-run
+      if (completedModules.length > 0) {
+        setRerunModal({
+          fileNames: files.map((f) => f.name),
+          suggestedIds: completedModules.filter((id) => id !== "executive_summary"),
+        });
+      }
+
+      // Persist to database and index for Q&A
+      if (dealId) {
+        for (const f of files) {
+          try {
+            // Extract text for Q&A indexing (fast — no image rendering)
+            const parsedText = await extractTextFromFile(f);
+
+            const result = await saveDocumentApi({
+              dealId,
+              fileName: f.name,
+              fileType: f.type || "application/octet-stream",
+              documentTag: "other",
+              documentSource: "sellside",
+              parsedText: parsedText || null,
+            });
+
+            // Index chunks for full-text search
+            if (parsedText && result?.document?.id) {
+              indexDocumentChunks({
+                documentId: result!.document.id,
+                dealId,
+                fileName: f.name,
+                parsedText,
+              }).catch((err: unknown) =>
+                console.error("Failed to index document chunks:", err)
+              );
+            }
+          } catch (err) {
+            console.error("Failed to save document:", err);
+          }
+        }
+      }
+    },
+    [dealId, saveDocumentApi, indexDocumentChunks]
+  );
+
+  const handleDeleteDoc = useCallback(async (docId: string) => {
+    setDocs((prev) => {
+      const doc = prev.find((d) => d.id === docId);
+      if (doc) {
+        setUploadedFiles((uf) => {
+          const idx = uf.findIndex((f) => f.name === doc.file_name);
+          if (idx >= 0) return uf.filter((_, i) => i !== idx);
+          return uf;
+        });
+      }
+      return prev.filter((d) => d.id !== docId);
+    });
+    // Invalidate caches
+    chunksCache.current = null;
+    chunksCacheKey.current = "";
+    coverageRef.current = null;
+    universalExtractionsCache.current = null;
+    universalExtractionsCacheKey.current = "";
+    docTablesCacheKey.current = "";
+    docIdsForVerification.current = [];
+
+    try {
+      await deleteDocumentApi({ documentId: docId });
+    } catch (err) {
+      console.error("Failed to delete document:", err);
+    }
+    toast.success("Document deleted");
+  }, [deleteDocumentApi]);
+
+  const handleUpdateDocTag = useCallback(
+    (docId: string, tag: DocumentTag) => {
+      setDocs((prev) =>
+        prev.map((d) => (d.id === docId ? { ...d, document_tag: tag } : d))
+      );
+    // Re-tag cached universal extractions so routing picks up the new tag
+    // (No need to re-extract — only the tag assignment changes)
+    if (universalExtractionsCache.current) {
+      const updatedDoc = docs.find((d) => d.id === docId);
+      if (updatedDoc) {
+        universalExtractionsCache.current = universalExtractionsCache.current.map((ext) =>
+          ext.sourceFile === updatedDoc.file_name
+            ? { ...ext, documentTag: tag }
+            : ext
+        );
+      }
+    }
+    // Persist to DB — find current source to pass along
+    const doc = docs.find((d) => d.id === docId);
+    updateDocumentApi({
+      documentId: docId,
+      documentTag: tag,
+      documentSource: doc?.document_source ?? "sellside",
+    }).catch((err: unknown) =>
+      console.error("Failed to update document tag:", err)
+    );
+    },
+    [updateDocumentApi, docs]
+  );
+
+  const handleUpdateDocSource = useCallback(
+    (docId: string, source: DocumentSource) => {
+      setDocs((prev) =>
+        prev.map((d) => (d.id === docId ? { ...d, document_source: source } : d))
+      );
+      // Persist to DB — find current tag to pass along
+      const doc = docs.find((d) => d.id === docId);
+      updateDocumentApi({
+        documentId: docId,
+        documentTag: doc?.document_tag ?? "other",
+        documentSource: source,
+      }).catch((err: unknown) =>
+        console.error("Failed to update document source:", err)
+      );
+    },
+    [updateDocumentApi, docs]
+  );
+
+  // ---------------------------------------------------------------------------
+  // History
+  // ---------------------------------------------------------------------------
+
+  const historyModuleDef = useMemo(
+    () =>
+      historyModule
+        ? MODULE_DEFINITIONS.find((m) => m.id === historyModule)
+        : undefined,
+    [historyModule]
+  );
+
+  const [historyRuns, setHistoryRuns] = useState<Array<{
+    id: string;
+    module_id: string;
+    status: string;
+    triggered_at: string;
+    completed_at: string | null;
+    finding_count: number;
+    critical_count: number;
+  }>>([]);
+
+  useEffect(() => {
+    if (historyModule && dealId) {
+      getRunHistoryApi({ dealId }).then((result) => {
+        if (result) {
+          setHistoryRuns(
+            result.runs.filter((r: { module_id: string }) => r.module_id === historyModule)
+          );
+        }
+      }).catch(() => setHistoryRuns([]));
+    } else {
+      setHistoryRuns([]);
+    }
+  }, [historyModule, dealId, getRunHistoryApi]);
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
+
+  if (dealLoading) {
+    return (
+      <div className="flex items-center justify-center h-full bg-ic-dark">
+        <div className="w-8 h-8 border-2 border-ic-turquoise border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (!deal || dealError) {
+    return (
+      <div className="flex items-center justify-center h-full bg-ic-dark">
+        <div className="text-center">
+          <p className="text-ic-muted text-sm mb-4">Deal not found</p>
+          <button
+            onClick={() => navigate("/")}
+            className="text-ic-turquoise text-sm hover:underline cursor-pointer"
+          >
+            Back to deals
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full min-h-screen bg-ic-dark overflow-hidden">
+      {/* Sidebar */}
+      <Sidebar
+        deal={deal}
+        documents={docs}
+        completedModules={completedModules}
+        totalModules={MODULE_DEFINITIONS.length}
+        onUpload={handleUpload}
+        onDeleteDoc={handleDeleteDoc}
+        onUpdateTag={handleUpdateDocTag}
+        onUpdateSource={handleUpdateDocSource}
+        onBack={() => navigate("/")}
+      />
+
+      {/* Main content */}
+      <div className="flex-1 flex flex-col overflow-auto">
+        <DashboardHeader
+          dealName={deal.name}
+          status={deal.status}
+          useOpus={useOpus}
+          onToggleOpus={setUseOpus}
+          onRunAll={() => setShowRunAll(true)}
+          onBack={() => navigate("/")}
+        />
+
+        <div className="flex-1 px-8 py-8 space-y-8">
+          <StatsRow
+            documentCount={stats.documents}
+            modulesComplete={stats.modulesComplete}
+            totalModules={stats.totalModules}
+            totalFindings={stats.totalFindings}
+            criticalFindings={stats.criticalFindings}
+          />
+
+          {stats.criticalFindings > 0 && (
+            <AlertBanner count={stats.criticalFindings} />
+          )}
+
+          <ModuleGrid
+            moduleStatuses={statuses}
+            runningModules={runningModules}
+            analysisProgressMap={progressMap}
+            onRunModule={handleRunModule}
+            onViewHistory={setHistoryModule}
+          />
+
+          <QAPanel
+            dealId={dealId!}
+            dealName={deal.name}
+            dealSector={deal.sector ?? null}
+            hasDocuments={docs.length > 0}
+          />
+        </div>
+      </div>
+
+      {/* Modals */}
+      <RunAllModal
+        open={showRunAll}
+        onClose={() => setShowRunAll(false)}
+        onConfirm={handleRunAll}
+        completedModules={completedModules}
+      />
+
+      {historyModule && historyModuleDef && (
+        <RunHistory
+          open
+          onClose={() => setHistoryModule(null)}
+          moduleTitle={historyModuleDef.displayName}
+          runs={historyRuns as unknown as import("@/types/module").ModuleRun[]}
+        />
+      )}
+
+      {rerunModal && (
+        <RerunSuggestionModal
+          open
+          onClose={() => setRerunModal(null)}
+          suggestedModuleIds={rerunModal.suggestedIds}
+          uploadedFileNames={rerunModal.fileNames}
+          onConfirm={(selectedIds) => {
+            setRerunModal(null);
+            for (const moduleId of selectedIds) {
+              handleRunModule(moduleId);
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}

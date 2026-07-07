@@ -1,0 +1,198 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import url("https://fonts.cdnfonts.com/css/codec-pro");
+
+/* Note: to optimize performance and build times, never remove this */
+@source not "./apis/*/**";
+@source not "superblocks.d.ts";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* Brand semantic tokens */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Surface system */
+  --color-surface: var(--surface);
+  --color-surface-hover: var(--surface-hover);
+  --color-surface-elevated: var(--surface-elevated);
+  --color-surface-border: var(--surface-border);
+
+  /* Severity system */
+  --color-severity-critical: var(--severity-critical);
+  --color-severity-critical-bg: var(--severity-critical-bg);
+  --color-severity-warning: var(--severity-warning);
+  --color-severity-warning-bg: var(--severity-warning-bg);
+  --color-severity-info: var(--severity-info);
+  --color-severity-info-bg: var(--severity-info-bg);
+
+  /* Brand accent */
+  --color-brand-accent: var(--brand-accent);
+  --color-brand-accent-hover: var(--brand-accent-hover);
+  --color-brand-coral: var(--brand-coral);
+  --color-brand-soft-gray: var(--brand-soft-gray);
+
+  /* Sidebar */
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+
+  /* Chart */
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  /* IC custom palette — used by ic/* components */
+  --color-ic-dark: #061f42;
+  --color-ic-blue: #02277c;
+  --color-ic-turquoise: #00b8c1;
+  --color-ic-coral: #e06448;
+  --color-ic-soft-gray: #c6c6bc;
+  --color-ic-text: #ffffff;
+  --color-ic-muted: #c6c6bc;
+  --color-ic-surface: #0a2a52;
+  --color-ic-surface-light: #0f3568;
+  --color-ic-border: #1a3a6a;
+
+  /* Font */
+  --font-sans: "Codec Pro", system-ui, -apple-system, sans-serif;
+
+  /* Animations */
+  --animate-pulse-border: pulse-border 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+
+  @keyframes pulse-border {
+    0%, 100% { border-color: var(--brand-accent); }
+    50% { border-color: var(--surface-border); }
+  }
+}
+
+/*
+ * Brand Palette (Org Knowledge):
+ *   Dark Blue:  #061f42
+ *   Blue:       #02277c
+ *   Turquoise:  #00b8c1
+ *   White:      #ffffff
+ *   Coral:      #e06448
+ *   Soft Gray:  #c6c6bc
+ */
+
+:root {
+  --radius: 0.625rem;
+
+  /* Dark theme by default — maps to brand */
+  --background: #061f42;
+  --foreground: #ffffff;
+
+  --card: #0a2a52;
+  --card-foreground: #ffffff;
+
+  --popover: #0a2a52;
+  --popover-foreground: #ffffff;
+
+  --primary: #00b8c1;
+  --primary-foreground: #061f42;
+
+  --secondary: #02277c;
+  --secondary-foreground: #ffffff;
+
+  --muted: #0a2a52;
+  --muted-foreground: #c6c6bc;
+
+  --accent: #00b8c1;
+  --accent-foreground: #061f42;
+
+  --destructive: #e06448;
+  --destructive-foreground: #ffffff;
+
+  --border: #1a3a6a;
+  --input: #1a3a6a;
+  --ring: #00b8c1;
+
+  /* Surface system */
+  --surface: #0a2a52;
+  --surface-hover: #0f3568;
+  --surface-elevated: #0f3568;
+  --surface-border: #1a3a6a;
+
+  /* Severity system */
+  --severity-critical: #e06448;
+  --severity-critical-bg: #3d1a12;
+  --severity-warning: #f59e0b;
+  --severity-warning-bg: #451a03;
+  --severity-info: #00b8c1;
+  --severity-info-bg: #062a3a;
+
+  /* Brand accent tokens */
+  --brand-accent: #00b8c1;
+  --brand-accent-hover: #00a3ab;
+  --brand-coral: #e06448;
+  --brand-soft-gray: #c6c6bc;
+
+  /* Sidebar */
+  --sidebar: #041633;
+  --sidebar-foreground: #ffffff;
+  --sidebar-border: #1a3a6a;
+
+  /* Charts */
+  --chart-1: #00b8c1;
+  --chart-2: #e06448;
+  --chart-3: #02277c;
+  --chart-4: #c6c6bc;
+  --chart-5: #f59e0b;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    @apply h-full;
+  }
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: "Codec Pro", system-ui, -apple-system, sans-serif;
+    margin: 0;
+  }
+
+  /* Scrollbar styling */
+  ::-webkit-scrollbar {
+    width: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--surface);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--surface-border);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--brand-soft-gray);
+  }
+}

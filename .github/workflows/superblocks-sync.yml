@@ -1,0 +1,42 @@
+name: Sync changes to Superblocks
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  superblocks-sync:
+    runs-on: ubuntu-latest
+    name: Sync to Superblocks
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Optional: needed only if the CLI version is private in GitHub Packages.
+      - name: Setup npm credentials
+        env:
+          NPM_AUTH_TOKEN: ${{ secrets.NPM_AUTH_TOKEN }}
+        run: |
+          if [ -n "$NPM_AUTH_TOKEN" ]; then
+            echo "@superblocksteam:registry=https://npm.pkg.github.com" >> .npmrc
+            echo "always-auth=true" >> .npmrc
+            echo "//npm.pkg.github.com/:_authToken=$NPM_AUTH_TOKEN" >> .npmrc
+          fi
+
+      - name: Sync
+        uses: superblocksteam/sync-action@v1
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/.npmrc
+        with:
+          token: ${{ secrets.SUPERBLOCKS_TOKEN }}
+          domain: app.superblocks.com
+          path: .
+          sha: ${{ github.sha }}

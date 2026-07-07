@@ -1,0 +1,88 @@
+/**
+ * API Registry - Central export for all APIs.
+ *
+ * This file is the single source of truth for API definitions.
+ * Add new APIs here to get full TypeScript support in the frontend.
+ *
+ * Usage:
+ * 1. Import your API: `import MyApi from './MyApi/api.js';`
+ * 2. Add it to the apis object below
+ * 3. That's it! Types automatically flow to useApi via client/hooks/useApi.ts
+ *
+ * IMPORTANT: Use .js extension for imports (required for ESM compatibility)
+ */
+
+// AI pipeline
+import AnalyzeChunk from './modules/analyze-chunk.js';
+import UniversalExtract from './modules/universal-extract.js';
+import MergeFindings from './modules/merge-findings.js';
+import FormatReport from './modules/format-report.js';
+import WebResearch from './modules/web-research.js';
+import SaveModuleResult from './modules/save-module-result.js';
+import LoadModuleResults from './modules/load-module-results.js';
+import GetRunHistory from './modules/get-run-history.js';
+import GetRunOutput from './modules/get-run-output.js';
+
+// Database setup
+import SetupSchema from './db/setup-schema.js';
+import RunCheckpointMigration from './db/run-checkpoint-migration.js';
+
+// Deals CRUD
+import ListDeals from './deals/list-deals.js';
+import GetDeal from './deals/get-deal.js';
+import CreateDeal from './deals/create-deal.js';
+import UpdateDeal from './deals/update-deal.js';
+import DeleteDeal from './deals/delete-deal.js';
+
+// Documents
+import ListDocuments from './documents/list-documents.js';
+import SaveDocument from './documents/save-document.js';
+import UpdateDocument from './documents/update-document.js';
+import DeleteDocument from './documents/delete-document.js';
+import GetDocumentTexts from './documents/get-document-texts.js';
+import SaveDocTables from './documents/save-doc-tables.js';
+import GetDocTables from './documents/get-doc-tables.js';
+
+// Numeric verification
+import NumericVerify from './numeric/numeric-verify.js';
+import GetNumericReport from './numeric/get-numeric-report.js';
+
+// Q&A
+import IndexDocumentChunks from './qa/index-document-chunks.js';
+import SearchChunks from './qa/search-chunks.js';
+import AskDataRoom from './qa/ask-data-room.js';
+
+// Checkpoints (crash-recovery)
+import SaveExtractions from './checkpoints/save-extractions.js';
+import LoadExtractions from './checkpoints/load-extractions.js';
+import SaveMergeCheckpoint from './checkpoints/save-merge-checkpoint.js';
+import LoadMergeCheckpoints from './checkpoints/load-merge-checkpoints.js';
+import UpdateRunStatus from './checkpoints/update-run-status.js';
+import GetRunProgress from './checkpoints/get-run-progress.js';
+import SaveRunCoverage from './checkpoints/save-run-coverage.js';
+import LoadRunCoverage from './checkpoints/load-run-coverage.js';
+
+const apis = {
+  // AI pipeline
+  AnalyzeChunk, UniversalExtract, MergeFindings, FormatReport, WebResearch,
+  SaveModuleResult, LoadModuleResults, GetRunHistory, GetRunOutput,
+  // DB setup
+  SetupSchema, RunCheckpointMigration,
+  // Deals
+  ListDeals, GetDeal, CreateDeal, UpdateDeal, DeleteDeal,
+  // Documents
+  ListDocuments, SaveDocument, UpdateDocument, DeleteDocument, GetDocumentTexts,
+  SaveDocTables, GetDocTables,
+  // Numeric verification
+  NumericVerify, GetNumericReport,
+  // Q&A
+  IndexDocumentChunks, SearchChunks, AskDataRoom,
+  // Checkpoints
+  SaveExtractions, LoadExtractions, SaveMergeCheckpoint, LoadMergeCheckpoints,
+  UpdateRunStatus, GetRunProgress, SaveRunCoverage, LoadRunCoverage,
+} as const;
+
+export default apis;
+
+/** Type for useApi inference - exported for client type-only imports */
+export type ApiRegistry = typeof apis;

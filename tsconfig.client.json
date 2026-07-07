@@ -1,0 +1,27 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules", "dist", "vite.config.ts", "server"],
+  "compilerOptions": {
+    "composite": true,
+    "noEmit": false,
+    "lib": [
+      "DOM",
+      "DOM.Iterable",
+      "ES2024",
+      "ESNext.Array",
+      "ESNext.Collection",
+      "ESNext.Promise"
+    ],
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "outDir": "./dist/client",
+    "jsx": "react-jsxdev",
+    "jsxImportSource": "@superblocksteam/library",
+    "paths": {
+      "@/*": ["./client/*"]
+    },
+    "typeRoots": ["./client/types", "./node_modules/@types"]
+  },
+  "references": [{ "path": "./tsconfig.server.json" }]
+}
