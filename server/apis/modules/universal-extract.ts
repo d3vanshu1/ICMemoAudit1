@@ -138,9 +138,14 @@ Required top-level keys:
 function injectClaimIds(rawJson: string, chunkIndex: number): string {
   try {
     // Strip markdown code fences if present (```json ... ```)
+    // The model may output prose before the fence, so search for it anywhere
     let jsonStr = rawJson.trim();
-    if (jsonStr.startsWith("```")) {
-      jsonStr = jsonStr.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "");
+    const fenceMatch = jsonStr.match(/```(?:json)?\s*\n([\s\S]*?)\n\s*```/);
+    if (fenceMatch) {
+      jsonStr = fenceMatch[1].trim();
+    } else if (jsonStr.startsWith("```")) {
+      // Fallback: fence without closing (shouldn't happen, but be safe)
+      jsonStr = jsonStr.replace(/^```(?:json)?\s*\n?/, "");
     }
 
     const parsed = JSON.parse(jsonStr);
