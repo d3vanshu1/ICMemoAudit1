@@ -91,12 +91,7 @@ Structure your report as:
 
   contradiction_check: `${REPORT_PREAMBLE}
 
-## NUMERIC VERIFICATION REQUIREMENT
-A "## Numeric Verification Report" section in your input contains code-verified arithmetic results. You MUST:
-- Present all numeric discrepancies and cross-doc figure mismatches as **Confirmed Contradictions** with the highest priority
-- Cite the recomputed_value as the authoritative figure
-- State "[Code-Verified: X]" next to any figure drawn from the Numeric Verification Report
-- Label these findings as: **SOURCE: Deterministic Arithmetic Verification**
+{{FORMAT_NUMERIC_VERIFICATION_BLOCK}}
 
 Structure your report as:
 
@@ -229,12 +224,7 @@ Structure your report as:
 
   model_assumptions_stress: `${REPORT_PREAMBLE}
 
-## NUMERIC VERIFICATION REQUIREMENT
-A "## Numeric Verification Report" section in your input contains code-verified arithmetic results. You MUST:
-- Present numeric discrepancies as dedicated findings (critical discrepancies = Critical Findings section)
-- Cite the recomputed_value as the authoritative figure for any number you reference
-- Never paraphrase or re-derive a code-verified figure from text
-- State "[Code-Verified: X]" next to any figure drawn from the Numeric Verification Report
+{{FORMAT_NUMERIC_VERIFICATION_BLOCK}}
 
 Structure your report as:
 
@@ -412,9 +402,34 @@ export default api({
   }),
 
   async run(ctx, { moduleId, executiveHeader, findings, useOpus, coverageLine, numericReport }) {
-    const reportPrompt = REPORT_PROMPTS[moduleId];
+    let reportPrompt = REPORT_PROMPTS[moduleId];
     if (!reportPrompt) {
       throw new Error(`Module "${moduleId}" report prompt not configured.`);
+    }
+
+    // Determine whether real numeric verification data is available
+    const hasNumericData = !!(numericReport && NUMERIC_MODULES.has(moduleId) &&
+        (numericReport.figures.length > 0 || numericReport.discrepancies.length > 0));
+
+    // Fix #3: Conditionally strip or inject numeric verification instructions in the report prompt.
+    if (hasNumericData) {
+      const numericVerificationInstructions = `## NUMERIC VERIFICATION REQUIREMENT
+A "## Numeric Verification Report" section in your input contains code-verified arithmetic results. You MUST:
+- Present all numeric discrepancies and cross-doc figure mismatches as **Confirmed Contradictions** with the highest priority
+- Cite the recomputed_value as the authoritative figure
+- State "[Code-Verified: X]" next to any figure drawn from the Numeric Verification Report
+- Never paraphrase or re-derive a code-verified figure from text
+- Label these findings as: **SOURCE: Deterministic Arithmetic Verification**`;
+      reportPrompt = reportPrompt.replace("{{FORMAT_NUMERIC_VERIFICATION_BLOCK}}", numericVerificationInstructions);
+    } else {
+      // Fix #1: Belt-and-suspenders guard language for report formatting
+      const noNumericGuard = `## IMPORTANT — NO CODE-VERIFIED DATA AVAILABLE
+No deterministic numeric verification was performed for this analysis. All figures in the findings are derived from AI text interpretation. You MUST:
+- NEVER use the phrases "code-verified", "[Code-Verified]", "[Code-Verified: X]", "confirmed by code", or "deterministic verification" in your report
+- NEVER label any figure as independently verified or confirmed unless two source documents explicitly state the same number
+- When citing a specific number, attribute it to its source document: "per the [document]" or "as stated in [document]"
+- Use qualifiers like "approximately", "as reported", or "per the model" — do NOT imply independent arithmetic verification`;
+      reportPrompt = reportPrompt.replace("{{FORMAT_NUMERIC_VERIFICATION_BLOCK}}", noNumericGuard);
     }
 
     // Numeric report block for numeric-eligible modules

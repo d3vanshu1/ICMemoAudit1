@@ -82,24 +82,16 @@ ${MERGE_OUTPUT_STRUCTURE}`,
 
   contradiction_check: `You are a senior investment committee advisor. You are synthesizing analyst findings that extracted narrative claims and data points from deal documents. Your job is to cross-reference narrative claims against data-derived findings and flag contradictions.
 
-## NUMERIC VERIFICATION — AUTHORITATIVE GROUND TRUTH
-
-If a "## Numeric Verification Report" section appears in the input, it contains deterministic arithmetic results produced by code — NOT by AI inference. You MUST:
-- Treat every figure and discrepancy in that section as factual ground truth
-- Any narrative claim that contradicts a code-verified figure is a CONFIRMED contradiction — cite the exact recomputed_value
-- Cross-doc agreement discrepancies are pre-verified contradictions — report them directly as findings
-- Never re-derive or contradict a code-verified figure based on text reading
-- A figure that appears in the Numeric Verification Report overrides any number read from text
+{{NUMERIC_VERIFICATION_BLOCK}}
 
 ## Your Task
 
-1. **Numeric Contradictions First**: Convert every cross_doc_agreement and sign_consistency discrepancy from the Numeric Verification Report into a finding. These are confirmed contradictions between data sources.
-2. **Cross-Reference Narrative vs. Data**: For each narrative claim, search the data extractions AND the verified figures for confirming or contradicting evidence.
-3. **Flag Contradictions**: When a narrative claim conflicts with data or a code-verified figure, document both sides with exact citations and the authoritative value.
-4. **Identify Unsupported Claims**: Flag narrative claims that have no data support.
-5. **Assess Materiality**: Rate each contradiction by its potential impact on the investment thesis.
-6. **Note Consistent Claims**: Briefly acknowledge claims that are well-supported by data.
-7. **Consolidate**: Combine overlapping observations into single, stronger findings.
+1. {{NUMERIC_TASK_STEP_1}}**Cross-Reference Narrative vs. Data**: For each narrative claim, search the data extractions for confirming or contradicting evidence.
+2. **Flag Contradictions**: When a narrative claim conflicts with data, document both sides with exact citations.
+3. **Identify Unsupported Claims**: Flag narrative claims that have no data support.
+4. **Assess Materiality**: Rate each contradiction by its potential impact on the investment thesis.
+5. **Note Consistent Claims**: Briefly acknowledge claims that are well-supported by data.
+6. **Consolidate**: Combine overlapping observations into single, stronger findings.
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   blind_spot_scanner: `You are a senior investment committee advisor and contrarian thinker. You are synthesizing analyst findings that extracted the investment thesis, explicit assumptions, and implicit assumptions from deal documents. Your job is to identify blind spots.
@@ -161,24 +153,16 @@ ${MERGE_OUTPUT_STRUCTURE}`,
 
   model_assumptions_stress: `You are a senior PE operating partner and financial model reviewer. You are synthesizing analyst findings that extracted quantitative model assumptions from deal documents. Your job is to stress-test the deal team's underwriting model.
 
-## NUMERIC VERIFICATION — AUTHORITATIVE GROUND TRUTH
-
-If a "## Numeric Verification Report" section appears in the input, it contains deterministic arithmetic results produced by code — NOT by AI inference. You MUST:
-- Treat every figure and discrepancy in that section as factual ground truth
-- Cite the exact code-verified value whenever a number is referenced in your findings
-- Surface every flagged discrepancy as a finding (critical discrepancies = critical findings)
-- Never re-derive or contradict a code-verified figure based on text reading
-- State explicitly when a reported value disagrees with the code-verified value
+{{NUMERIC_VERIFICATION_BLOCK}}
 
 ## Your Task
 
-1. **Numeric Discrepancies First**: Start by converting every discrepancy from the Numeric Verification Report into a finding at the stated severity. Use the recomputed_value as the authoritative figure.
-2. **Compare to Historical Actuals**: Does the assumption align with the company's own historical performance?
-3. **Test Internal Consistency**: Do assumptions across documents agree? Reference code-verified values where available.
-4. **Compare Deal Team vs. Management**: Where the deal team has diverged from management's projections, assess whether the haircut is sufficient.
-5. **Rate Each Assumption**: Score as Aggressive / Reasonable / Conservative.
-6. **Sensitivity Analysis**: For each critical assumption, describe what happens to returns if it is 20% worse.
-7. **Consolidate**: Combine overlapping observations into single, stronger findings.
+1. {{NUMERIC_TASK_STEP_1}}**Compare to Historical Actuals**: Does the assumption align with the company's own historical performance?
+2. **Test Internal Consistency**: Do assumptions across documents agree?
+3. **Compare Deal Team vs. Management**: Where the deal team has diverged from management's projections, assess whether the haircut is sufficient.
+4. **Rate Each Assumption**: Score as Aggressive / Reasonable / Conservative.
+5. **Sensitivity Analysis**: For each critical assumption, describe what happens to returns if it is 20% worse.
+6. **Consolidate**: Combine overlapping observations into single, stronger findings.
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   diligence_completeness: `You are a senior PE operating partner conducting a final diligence completeness review. You are synthesizing analyst findings that evaluated documents against the 10 standard PE diligence dimensions.
@@ -277,9 +261,39 @@ export default api({
 
     // Swap in the appropriate findings requirement based on round
     const findingsRule = isFinalRound ? FINDINGS_RULE_FINAL : FINDINGS_RULE_INTERMEDIATE;
-    const mergePrompt = rawPrompt.replace("{{FINDINGS_REQUIREMENT}}", findingsRule);
+    let mergePrompt = rawPrompt.replace("{{FINDINGS_REQUIREMENT}}", findingsRule);
 
-    // Modules that receive numeric verification as authoritative input
+    // Determine whether real numeric verification data is available
+    const hasNumericData = !!(numericReport && NUMERIC_MODULES.has(moduleId) &&
+        (numericReport.figures.length > 0 || numericReport.discrepancies.length > 0));
+
+    // Fix #3: Conditionally strip or inject numeric verification instructions.
+    // When no numeric data exists, remove the numeric verification block entirely
+    // and inject a guard that prevents the LLM from hallucinating [Code-Verified] labels.
+    if (hasNumericData) {
+      const numericVerificationInstructions = `## NUMERIC VERIFICATION — AUTHORITATIVE GROUND TRUTH
+
+A "## Numeric Verification Report" section appears in the input below. It contains deterministic arithmetic results produced by code — NOT by AI inference. You MUST:
+- Treat every figure and discrepancy in that section as factual ground truth
+- Any narrative claim that contradicts a code-verified figure is a CONFIRMED contradiction — cite the exact recomputed_value
+- Cross-doc agreement discrepancies are pre-verified contradictions — report them directly as findings
+- Never re-derive or contradict a code-verified figure based on text reading
+- A figure that appears in the Numeric Verification Report overrides any number read from text`;
+      mergePrompt = mergePrompt.replace("{{NUMERIC_VERIFICATION_BLOCK}}", numericVerificationInstructions);
+      mergePrompt = mergePrompt.replace("{{NUMERIC_TASK_STEP_1}}",
+        "**Numeric Contradictions First**: Convert every discrepancy from the Numeric Verification Report into a finding. These are confirmed contradictions. Use the recomputed_value as the authoritative figure.\n");
+    } else {
+      // Fix #1: Belt-and-suspenders guard language
+      const noNumericGuard = `## IMPORTANT — NO CODE-VERIFIED DATA AVAILABLE
+
+No deterministic numeric verification was performed for this analysis. All figures you cite are derived from AI text interpretation, which is inherently non-deterministic. You MUST:
+- NEVER use the phrases "code-verified", "[Code-Verified]", "confirmed by code", or "deterministic verification" in your output
+- NEVER label any figure as "confirmed" unless you are comparing two figures explicitly stated in different source documents
+- When citing a specific number, state the source document and acknowledge it is "as stated in [document]" or "per [document]"
+- Qualify numerical claims appropriately: use "approximately", "as reported", or "per the model" rather than implying independent verification`;
+      mergePrompt = mergePrompt.replace("{{NUMERIC_VERIFICATION_BLOCK}}", noNumericGuard);
+      mergePrompt = mergePrompt.replace("{{NUMERIC_TASK_STEP_1}}", "");
+    }
 
     // Build numeric report block if applicable
     let numericBlock = "";

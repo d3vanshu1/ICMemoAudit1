@@ -446,14 +446,32 @@ export default function DealDashboardPage() {
 
         if (tablesPayload.length > 0) {
           docIdsForVerification.current = docsWithTables;
-          saveDocTablesApi({ tables: tablesPayload }).catch((err: unknown) =>
-            console.error("[doc_tables] Failed to save structured tables:", err)
-          );
+          // Await the save so doc_tables are persisted BEFORE NumericVerify runs.
+          // Previously this was fire-and-forget, causing a race where NumericVerify
+          // could query doc_tables before the INSERT completed — or worse, the save
+          // could fail silently and NumericVerify would find nothing.
+          try {
+            await saveDocTablesApi({ tables: tablesPayload });
+          } catch (err) {
+            console.error("[doc_tables] Failed to save structured tables:", err);
+            // Clear the doc IDs so NumericVerify doesn't run against empty tables
+            docIdsForVerification.current = [];
+          }
         } else {
-          // Fall back to DB doc IDs for spreadsheet files already in the DB
-          docIdsForVerification.current = docs
-            .filter((d) => /\.(xlsx|xls|xlsm|csv)$/i.test(d.file_name))
-            .map((d) => d.id);
+          // Fall back to DB doc IDs for spreadsheet files already in the DB.
+          // These may not have doc_tables entries if they were uploaded before
+          // the structured table feature was added, or if the original save failed.
+          const storedSpreadsheetDocs = docs.filter((d) =>
+            /\.(xlsx|xls|xlsm|csv)$/i.test(d.file_name)
+          );
+          if (storedSpreadsheetDocs.length > 0) {
+            console.warn(
+              `[doc_tables] ${storedSpreadsheetDocs.length} stored spreadsheet file(s) found but no fresh uploads available for structured table extraction. ` +
+              `NumericVerify will attempt to use existing doc_tables entries if any. ` +
+              `If results are empty, re-upload the Excel/CSV files to populate doc_tables.`
+            );
+          }
+          docIdsForVerification.current = storedSpreadsheetDocs.map((d) => d.id);
         }
       }
 
@@ -1137,6 +1155,14 @@ export default function DealDashboardPage() {
             } else if (verifyResult.discrepancyCount > 0) {
               toast.info(`Numeric verification: ${verifyResult.discrepancyCount} discrepancy(ies) flagged.`);
             }
+          } else {
+            // No doc_tables data found — NumericVerify had nothing to verify.
+            // This means the LLM will NOT receive any code-verified figures,
+            // and the prompt guard will prevent it from hallucinating [Code-Verified] labels.
+            console.warn(
+              `[NumericVerify] Returned empty for ${docIdsForVerification.current.length} document(s). ` +
+              `No structured tables found in doc_tables. Re-upload Excel/CSV files to enable numeric verification.`
+            );
           }
         } catch (err) {
           // Non-fatal — log and continue without numeric report
