@@ -1644,6 +1644,8 @@ export default function DealDashboardPage() {
       // Persist genuinely new files to database and index for Q&A.
       // Re-uploaded files are skipped — they already exist in the DB
       // and their doc_tables will be extracted via the normal chunk-building path.
+      // Track real DB IDs for doc_tables extraction below.
+      const savedDbIds: Record<string, string> = {};
       if (dealId) {
         for (const f of newFiles) {
           try {
@@ -1659,10 +1661,23 @@ export default function DealDashboardPage() {
               parsedText: parsedText || null,
             });
 
+            // Store the real DB ID for doc_tables extraction
+            if (result?.document?.id) {
+              savedDbIds[f.name] = result.document.id;
+              // Update docs state with the real DB ID (replace client-side UUID)
+              setDocs((prev) =>
+                prev.map((d) =>
+                  d.file_name === f.name && !d.uploaded_at.startsWith("20")
+                    ? { ...d, id: result.document.id }
+                    : d
+                )
+              );
+            }
+
             // Index chunks for full-text search
             if (parsedText && result?.document?.id) {
               indexDocumentChunks({
-                documentId: result!.document.id,
+                documentId: result.document.id,
                 dealId,
                 fileName: f.name,
                 parsedText,
@@ -1679,9 +1694,12 @@ export default function DealDashboardPage() {
       // Eagerly extract and save structured tables for all uploaded Excel/CSV files.
       // This ensures doc_tables is populated immediately at upload time, not deferred
       // to the module run. Covers both new uploads and re-uploads of existing files.
-      const allDocsSnapshot = [...docs]; // current docs state (includes any just-added)
+      // Build docIdByName from: (1) real DB IDs for newly saved files, (2) existing docs for re-uploads
       const docIdByName: Record<string, string> = {};
-      for (const doc of allDocsSnapshot) docIdByName[doc.file_name] = doc.id;
+      // First, map existing docs (covers re-uploaded files)
+      for (const doc of docs) docIdByName[doc.file_name] = doc.id;
+      // Then, overlay with real DB IDs from the persist loop (overrides client-side UUIDs)
+      Object.assign(docIdByName, savedDbIds);
 
       const tablesPayload: Array<{
         documentId: string;
@@ -1728,13 +1746,16 @@ export default function DealDashboardPage() {
         }
       }
 
+      console.info(`[doc_tables] docIdByName keys: ${Object.keys(docIdByName).join(", ")}; files: ${files.map(f=>f.name).join(", ")}; tablesPayload count: ${tablesPayload.length}`);
       if (tablesPayload.length > 0) {
         try {
           await saveDocTablesApi({ tables: tablesPayload });
-          console.info(`[doc_tables] Saved ${tablesPayload.length} table(s) at upload time.`);
+          console.info(`[doc_tables] Saved ${tablesPayload.length} table(s) at upload time for doc IDs: ${[...new Set(tablesPayload.map(t=>t.documentId))].join(", ")}`);
         } catch (err) {
           console.error("[doc_tables] Failed to save structured tables at upload:", err);
         }
+      } else {
+        console.warn(`[doc_tables] No tables extracted. Excel/CSV files found: ${files.filter(f => /\.(xlsx|xls|xlsm|csv)$/i.test(f.name)).map(f=>f.name).join(", ") || "none"}`);
       }
     },
     [dealId, docs, saveDocumentApi, saveDocTablesApi, indexDocumentChunks]
