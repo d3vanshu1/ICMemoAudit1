@@ -1675,8 +1675,69 @@ export default function DealDashboardPage() {
           }
         }
       }
+
+      // Eagerly extract and save structured tables for all uploaded Excel/CSV files.
+      // This ensures doc_tables is populated immediately at upload time, not deferred
+      // to the module run. Covers both new uploads and re-uploads of existing files.
+      const allDocsSnapshot = [...docs]; // current docs state (includes any just-added)
+      const docIdByName: Record<string, string> = {};
+      for (const doc of allDocsSnapshot) docIdByName[doc.file_name] = doc.id;
+
+      const tablesPayload: Array<{
+        documentId: string;
+        sheetOrPage: string;
+        caption: string | null;
+        data: { row_headers: string[]; col_headers: string[]; cells: StructuredCell[] };
+      }> = [];
+
+      for (const f of files) {
+        const docId = docIdByName[f.name];
+        if (!docId) continue;
+        const lower = f.name.toLowerCase();
+        if (lower.endsWith(".xlsx") || lower.endsWith(".xls") || lower.endsWith(".xlsm")) {
+          try {
+            const buf = await f.arrayBuffer();
+            const tables = parseExcelToTables(buf, f.name);
+            for (const t of tables) {
+              tablesPayload.push({
+                documentId: docId,
+                sheetOrPage: t.sheetOrPage,
+                caption: t.caption,
+                data: { row_headers: t.rowHeaders, col_headers: t.colHeaders, cells: t.cells },
+              });
+            }
+          } catch (err) {
+            console.warn(`[doc_tables] Failed to parse ${f.name} at upload:`, err);
+          }
+        } else if (lower.endsWith(".csv")) {
+          try {
+            const buf = await f.arrayBuffer();
+            const csvText = new TextDecoder("utf-8").decode(buf);
+            const t = parseCsvToTable(csvText, f.name);
+            if (t) {
+              tablesPayload.push({
+                documentId: docId,
+                sheetOrPage: t.sheetOrPage,
+                caption: t.caption,
+                data: { row_headers: t.rowHeaders, col_headers: t.colHeaders, cells: t.cells },
+              });
+            }
+          } catch (err) {
+            console.warn(`[doc_tables] Failed to parse ${f.name} at upload:`, err);
+          }
+        }
+      }
+
+      if (tablesPayload.length > 0) {
+        try {
+          await saveDocTablesApi({ tables: tablesPayload });
+          console.info(`[doc_tables] Saved ${tablesPayload.length} table(s) at upload time.`);
+        } catch (err) {
+          console.error("[doc_tables] Failed to save structured tables at upload:", err);
+        }
+      }
     },
-    [dealId, docs, saveDocumentApi, indexDocumentChunks]
+    [dealId, docs, saveDocumentApi, saveDocTablesApi, indexDocumentChunks]
   );
 
   const handleDeleteDoc = useCallback(async (docId: string) => {
