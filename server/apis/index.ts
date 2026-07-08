@@ -62,6 +62,9 @@ import GetRunProgress from './checkpoints/get-run-progress.js';
 import SaveRunCoverage from './checkpoints/save-run-coverage.js';
 import LoadRunCoverage from './checkpoints/load-run-coverage.js';
 
+// Audit (temporary)
+import ReportLanguageAudit from './audit/report-language-audit.js';
+
 const apis = {
   // AI pipeline
   AnalyzeChunk, UniversalExtract, MergeFindings, FormatReport, WebResearch,
@@ -80,6 +83,8 @@ const apis = {
   // Checkpoints
   SaveExtractions, LoadExtractions, SaveMergeCheckpoint, LoadMergeCheckpoints,
   UpdateRunStatus, GetRunProgress, SaveRunCoverage, LoadRunCoverage,
+  // Audit
+  ReportLanguageAudit,
 } as const;
 
 export default apis;

@@ -1588,7 +1588,14 @@ export default function DealDashboardPage() {
 
   const handleUpload = useCallback(
     async (files: File[]) => {
-      setUploadedFiles((prev) => [...prev, ...files]);
+      // Deduplicate: separate files that already exist in this deal (by filename)
+      // from genuinely new files. Existing files still get added to uploadedFiles
+      // so doc_tables extraction runs, but they skip the DB insert.
+      const existingFileNames = new Set(docs.map((d) => d.file_name));
+      const newFiles = files.filter((f) => !existingFileNames.has(f.name));
+      const reuploadedFiles = files.filter((f) => existingFileNames.has(f.name));
+
+      setUploadedFiles((prev) => [...prev, ...files]); // all files for extraction
       // Invalidate caches since files changed
       chunksCache.current = null;
       chunksCacheKey.current = "";
@@ -1598,17 +1605,33 @@ export default function DealDashboardPage() {
       docTablesCacheKey.current = "";
       docIdsForVerification.current = [];
 
-      const newDocs: Document[] = files.map((f) => ({
-        id: crypto.randomUUID(),
-        deal_id: dealId!,
-        file_name: f.name,
-        file_type: f.type || "application/octet-stream",
-        document_tag: "other" as DocumentTag,
-        document_source: "sellside" as DocumentSource,
-        uploaded_at: new Date().toISOString(),
-      }));
-      setDocs((prev) => [...prev, ...newDocs]);
-      toast.success(`Uploaded ${files.length} document${files.length > 1 ? "s" : ""}`);
+      // Only add genuinely new docs to UI state — skip duplicates
+      if (newFiles.length > 0) {
+        const newDocs: Document[] = newFiles.map((f) => ({
+          id: crypto.randomUUID(),
+          deal_id: dealId!,
+          file_name: f.name,
+          file_type: f.type || "application/octet-stream",
+          document_tag: "other" as DocumentTag,
+          document_source: "sellside" as DocumentSource,
+          uploaded_at: new Date().toISOString(),
+        }));
+        setDocs((prev) => [...prev, ...newDocs]);
+      }
+
+      // User feedback
+      if (reuploadedFiles.length > 0 && newFiles.length === 0) {
+        toast.info(
+          `Re-processing ${reuploadedFiles.length} existing file${reuploadedFiles.length > 1 ? "s" : ""} for structured table extraction (no duplicates created).`
+        );
+      } else if (reuploadedFiles.length > 0 && newFiles.length > 0) {
+        toast.success(
+          `Uploaded ${newFiles.length} new document${newFiles.length > 1 ? "s" : ""}. ` +
+          `Re-processing ${reuploadedFiles.length} existing file${reuploadedFiles.length > 1 ? "s" : ""} (no duplicates).`
+        );
+      } else {
+        toast.success(`Uploaded ${files.length} document${files.length > 1 ? "s" : ""}`);
+      }
 
       // If there are already completed modules, prompt user to re-run
       if (completedModules.length > 0) {
@@ -1618,9 +1641,11 @@ export default function DealDashboardPage() {
         });
       }
 
-      // Persist to database and index for Q&A
+      // Persist genuinely new files to database and index for Q&A.
+      // Re-uploaded files are skipped — they already exist in the DB
+      // and their doc_tables will be extracted via the normal chunk-building path.
       if (dealId) {
-        for (const f of files) {
+        for (const f of newFiles) {
           try {
             // Extract text for Q&A indexing (fast — no image rendering)
             const parsedText = await extractTextFromFile(f);
@@ -1651,7 +1676,7 @@ export default function DealDashboardPage() {
         }
       }
     },
-    [dealId, saveDocumentApi, indexDocumentChunks]
+    [dealId, docs, saveDocumentApi, indexDocumentChunks]
   );
 
   const handleDeleteDoc = useCallback(async (docId: string) => {
