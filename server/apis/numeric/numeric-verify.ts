@@ -558,18 +558,152 @@ export default api({
       };
     }
 
-    // Load doc_tables for this run
-    const rawRows = await ctx.integrations.db.query(
-      `SELECT id, document_id, sheet_or_page, caption, data
-       FROM doc_tables
-       WHERE document_id = ANY($1::uuid[])
-       ORDER BY document_id, sheet_or_page`,
-      DocTableSchema,
-      [documentIds],
-      { label: "Load doc_tables for numeric verification" }
-    );
+    // Load doc_tables one row at a time to stay under the gRPC 4MB response limit.
+    // First get the list of table IDs + data sizes, then fetch each individually
+    // (skipping tables whose data exceeds 2.5 MB — those are customer-detail
+    // sheets that can't fit in a single gRPC response).
+    const MAX_DATA_BYTES = 2_500_000;
 
-    if (rawRows.length === 0) {
+    const TableIdSchema = z.object({
+      id: z.string(),
+      document_id: z.string(),
+      sheet_or_page: z.string(),
+      caption: z.string().nullable(),
+      data_length: z.number(),
+    });
+
+    const tableIndex: z.infer<typeof TableIdSchema>[] = [];
+    for (const docId of documentIds) {
+      const rows = await ctx.integrations.db.query(
+        `SELECT id, document_id, sheet_or_page, caption,
+                length(data::text) AS data_length
+         FROM doc_tables
+         WHERE document_id = $1::uuid
+         ORDER BY sheet_or_page`,
+        TableIdSchema,
+        [docId],
+        { label: `List doc_tables for document ${docId.slice(0, 8)}` }
+      );
+      tableIndex.push(...rows);
+    }
+
+    const loadable = tableIndex.filter((t) => t.data_length <= MAX_DATA_BYTES);
+    const oversized = tableIndex.filter((t) => t.data_length > MAX_DATA_BYTES);
+
+    if (oversized.length > 0) {
+      ctx.log.info(
+        `Skipping ${oversized.length} oversized table(s) for full analysis: ${oversized.map((t) => `${t.sheet_or_page} (${(t.data_length / 1_000_000).toFixed(1)}MB)`).join(", ")}`
+      );
+    }
+
+    const allRawRows: z.infer<typeof DocTableSchema>[] = [];
+    for (const meta of loadable) {
+      const rows = await ctx.integrations.db.query(
+        `SELECT id, document_id, sheet_or_page, caption, data
+         FROM doc_tables
+         WHERE id = $1::uuid`,
+        DocTableSchema,
+        [meta.id],
+        { label: `Load table ${meta.sheet_or_page}` }
+      );
+      allRawRows.push(...rows);
+    }
+
+    // For oversized tables (e.g., large ARR-by-customer sheets), extract
+    // summary-level rows (totals, subtotals) via JSONB so we still get
+    // cross-doc agreement checks on key figures without loading full data.
+    const SummaryCellSchema = z.object({
+      row_idx: z.coerce.number(),
+      row_label: z.string(),
+      col_idx: z.coerce.number(),
+      col_label: z.string(),
+      cell_value: z.any(),
+      cell_type: z.string(),
+    });
+
+    for (const meta of oversized) {
+      // Extract row headers + total-row cells via JSONB
+      const summaryRows = await ctx.integrations.db.query(
+        `WITH tbl AS (
+           SELECT data FROM doc_tables WHERE id = $1::uuid
+         ),
+         headers AS (
+           SELECT ordinality - 1 AS idx, elem::text AS label
+           FROM tbl, jsonb_array_elements_text(data->'row_headers') WITH ORDINALITY AS t(elem, ordinality)
+         ),
+         total_rows AS (
+           SELECT idx, label FROM headers
+           WHERE lower(label) ~ '(total|subtotal|sum|net|grand|ebitda|ebit|gross profit|revenue|arr|noi)'
+         ),
+         col_headers AS (
+           SELECT ordinality - 1 AS idx, elem::text AS label
+           FROM tbl, jsonb_array_elements_text(data->'col_headers') WITH ORDINALITY AS t(elem, ordinality)
+         ),
+         total_cells AS (
+           SELECT
+             tr.idx AS row_idx,
+             tr.label AS row_label,
+             ch.idx AS col_idx,
+             ch.label AS col_label,
+             cell->>'value' AS cell_value,
+             cell->>'type' AS cell_type
+           FROM tbl,
+                total_rows tr,
+                col_headers ch,
+                jsonb_array_elements(data->'cells') AS cell
+           WHERE (cell->>'r')::int = tr.idx
+             AND (cell->>'c')::int = ch.idx
+             AND cell->>'type' = 'number'
+         )
+         SELECT row_idx, row_label, col_idx, col_label, cell_value, cell_type
+         FROM total_cells
+         ORDER BY row_idx, col_idx
+         LIMIT 500`,
+        SummaryCellSchema,
+        [meta.id],
+        { label: `Extract summary rows from oversized table ${meta.sheet_or_page}` }
+      );
+
+      if (summaryRows.length === 0) continue;
+
+      // Reconstruct a minimal table with just the summary rows
+      const colHeadersResult = await ctx.integrations.db.query(
+        `SELECT elem::text AS label
+         FROM doc_tables, jsonb_array_elements_text(data->'col_headers') AS elem
+         WHERE id = $1::uuid`,
+        z.object({ label: z.string() }),
+        [meta.id],
+        { label: `Get col_headers for ${meta.sheet_or_page}` }
+      );
+
+      const uniqueRowIndices = [...new Set(summaryRows.map((r) => r.row_idx))].sort((a, b) => a - b);
+      const rowIndexMap = new Map(uniqueRowIndices.map((oldIdx, newIdx) => [oldIdx, newIdx]));
+
+      const miniCells: Cell[] = summaryRows.map((r) => ({
+        r: rowIndexMap.get(r.row_idx) ?? 0,
+        c: r.col_idx,
+        value: r.cell_value != null ? Number(r.cell_value) : null,
+        type: "number" as const,
+      }));
+
+      const miniRowHeaders = uniqueRowIndices.map(
+        (idx) => summaryRows.find((r) => r.row_idx === idx)?.row_label ?? `row${idx}`
+      );
+
+      allRawRows.push({
+        id: meta.id,
+        document_id: meta.document_id,
+        sheet_or_page: meta.sheet_or_page,
+        caption: meta.caption,
+        data: {
+          row_headers: miniRowHeaders,
+          col_headers: colHeadersResult.map((c) => c.label),
+          cells: miniCells,
+        },
+      });
+    }
+
+    if (allRawRows.length === 0) {
       return {
         numericReportId: null,
         figureCount: 0,
@@ -581,7 +715,7 @@ export default api({
     }
 
     // Parse into internal format and run all checks
-    const tables = parseTables(rawRows);
+    const tables = parseTables(allRawRows);
     const { figures, discrepancies } = runAllChecks(tables);
 
     // Persist to numeric_reports

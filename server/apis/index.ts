@@ -42,10 +42,13 @@ import DeleteDocument from './documents/delete-document.js';
 import GetDocumentTexts from './documents/get-document-texts.js';
 import SaveDocTables from './documents/save-doc-tables.js';
 import GetDocTables from './documents/get-doc-tables.js';
+import BackfillDocTablesFromText from './documents/backfill-doc-tables-from-text.js';
+import GetDocTablesSummary from './documents/get-doc-tables-summary.js';
 
 // Numeric verification
 import NumericVerify from './numeric/numeric-verify.js';
 import GetNumericReport from './numeric/get-numeric-report.js';
+import SearchNumericFindings from './numeric/search-numeric-findings.js';
 
 // Q&A
 import IndexDocumentChunks from './qa/index-document-chunks.js';
@@ -64,6 +67,8 @@ import LoadRunCoverage from './checkpoints/load-run-coverage.js';
 
 // Audit (temporary)
 import ReportLanguageAudit from './audit/report-language-audit.js';
+import ExtractReportSnippets from './audit/extract-report-snippets.js';
+import FramingPatternAudit from './audit/framing-pattern-audit.js';
 
 const apis = {
   // AI pipeline
@@ -75,16 +80,16 @@ const apis = {
   ListDeals, GetDeal, CreateDeal, UpdateDeal, DeleteDeal,
   // Documents
   ListDocuments, SaveDocument, UpdateDocument, DeleteDocument, GetDocumentTexts,
-  SaveDocTables, GetDocTables,
+  SaveDocTables, GetDocTables, BackfillDocTablesFromText, GetDocTablesSummary,
   // Numeric verification
-  NumericVerify, GetNumericReport,
+  NumericVerify, GetNumericReport, SearchNumericFindings,
   // Q&A
   IndexDocumentChunks, SearchChunks, AskDataRoom,
   // Checkpoints
   SaveExtractions, LoadExtractions, SaveMergeCheckpoint, LoadMergeCheckpoints,
   UpdateRunStatus, GetRunProgress, SaveRunCoverage, LoadRunCoverage,
   // Audit
-  ReportLanguageAudit,
+  ReportLanguageAudit, ExtractReportSnippets, FramingPatternAudit,
 } as const;
 
 export default apis;

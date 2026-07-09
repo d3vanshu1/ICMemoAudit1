@@ -353,6 +353,316 @@ function sanitizeBraces(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Bug 1 fix: Sanitize confidence language in findings against NumericVerify
+// ---------------------------------------------------------------------------
+
+/**
+ * Confidence-language patterns that imply deterministic verification.
+ * When a finding contains these but has no matching NumericVerify discrepancy,
+ * the language must be hedged.
+ */
+const CONFIDENCE_PATTERNS = [
+  /code-verified\s+(?:analysis|arithmetic\s+analysis)\s+(?:confirms?|identifies|reveals?|shows?|detects?|finds?)/gi,
+  /code-verified\s+analysis/gi,
+  /confirmed\s+(model\s+integrity|arithmetic|by\s+code|contradiction)/gi,
+  /deterministic\s+(arithmetic|verification)/gi,
+  /\[Code-Verified[^\]]*\]/gi,
+  /code-recomputed/gi,
+  /independently\s+verified/gi,
+  /arithmetic\s+engine\s+confirms?/gi,
+];
+
+const CONFIDENCE_HEDGING_MAP: Array<{ pattern: RegExp; replacement: string }> = [
+  // Broad "code-verified [qualifier] [verb]" — catches all LLM rephrasings
+  { pattern: /code-verified\s+(?:arithmetic\s+)?analysis\s+(?:confirms?|identifies|reveals?|shows?|detects?|finds?)/gi, replacement: "analysis indicates" },
+  // Standalone "code-verified analysis" without a following verb
+  { pattern: /code-verified\s+analysis/gi, replacement: "document analysis" },
+  { pattern: /confirmed\s+model\s+integrity\s+(?:failures?|issues?)/gi, replacement: "potential model integrity issues" },
+  { pattern: /confirmed\s+arithmetic\s+(?:failures?|discrepancies?|errors?)/gi, replacement: "potential arithmetic discrepancies" },
+  { pattern: /confirmed\s+by\s+code/gi, replacement: "flagged by analysis" },
+  { pattern: /confirmed\s+(?:double-count|double\s+count)(?:ing)?/gi, replacement: "reported potential double-count" },
+  { pattern: /confirmed\s+contradiction/gi, replacement: "potential contradiction" },
+  { pattern: /\[Code-Verified:\s*[^\]]+\]/gi, replacement: "" },
+  { pattern: /\[Code-Verified\]/gi, replacement: "" },
+  { pattern: /code-recomputed/gi, replacement: "as reported" },
+  { pattern: /deterministic\s+arithmetic\s+verification/gi, replacement: "document analysis" },
+  { pattern: /deterministic\s+verification/gi, replacement: "analysis" },
+  { pattern: /independently\s+verified/gi, replacement: "reported" },
+  { pattern: /arithmetic\s+engine\s+confirms?/gi, replacement: "analysis flags" },
+];
+
+/**
+ * Extract dollar amounts and percentages from a text string.
+ * Returns normalized strings like "72000", "341004", "31.1".
+ */
+function extractNumericValues(text: string): Set<string> {
+  const values = new Set<string>();
+  // Dollar amounts: $72,000 or $341,004 or $144K
+  const dollarRegex = /\$([\d,]+(?:\.\d+)?)[KkMmBb]?/g;
+  let m;
+  while ((m = dollarRegex.exec(text)) !== null) {
+    values.add(m[1].replace(/,/g, ""));
+  }
+  // Plain numbers with commas: 72,000 or 8,194,662
+  const numRegex = /\b([\d,]{4,})\b/g;
+  while ((m = numRegex.exec(text)) !== null) {
+    values.add(m[1].replace(/,/g, ""));
+  }
+  // Percentages: 31.1% or 617.43%
+  const pctRegex = /([\d.]+)\s*%/g;
+  while ((m = pctRegex.exec(text)) !== null) {
+    values.add(m[1]);
+  }
+  return values;
+}
+
+/**
+ * Check if a finding's numeric claims have backing in the NumericVerify output.
+ * Returns true if at least one key numeric value from the finding appears in
+ * the discrepancy descriptions, expected, or actual values.
+ */
+function findingHasNumericBacking(
+  finding: { title: string; detail: string; full_analysis: string },
+  discrepancies: Array<Record<string, unknown>>
+): boolean {
+  const findingValues = extractNumericValues(
+    `${finding.title} ${finding.detail} ${finding.full_analysis}`
+  );
+  if (findingValues.size === 0) return false;
+
+  // Build a set of all numeric values from discrepancies
+  const discValues = new Set<string>();
+  for (const d of discrepancies) {
+    const desc = String(d.description || "");
+    for (const v of extractNumericValues(desc)) discValues.add(v);
+    if (d.expected != null) discValues.add(String(d.expected).replace(/,/g, ""));
+    if (d.actual != null) discValues.add(String(d.actual).replace(/,/g, ""));
+  }
+
+  // Check if any finding numeric value appears in discrepancy values
+  for (const v of findingValues) {
+    if (discValues.has(v)) return true;
+  }
+  return false;
+}
+
+/**
+ * Check if a text contains confidence language patterns.
+ */
+function hasConfidenceLanguage(text: string): boolean {
+  return CONFIDENCE_PATTERNS.some(p => {
+    p.lastIndex = 0;
+    return p.test(text);
+  });
+}
+
+/**
+ * Rewrite confidence language in a string with hedged alternatives.
+ */
+function hedgeConfidenceLanguage(text: string): string {
+  let result = text;
+  for (const { pattern, replacement } of CONFIDENCE_HEDGING_MAP) {
+    pattern.lastIndex = 0;
+    result = result.replace(pattern, replacement);
+  }
+  // Clean up doubled spaces from removed tags
+  result = result.replace(/  +/g, " ").trim();
+  return result;
+}
+
+/**
+ * Sanitize a finding's confidence language if it lacks NumericVerify backing.
+ * Rewrites title, detail, and full_analysis with hedged language.
+ * Also strips "Confirmed" from titles when unbacked.
+ */
+function sanitizeFinding(
+  finding: { severity: string; title: string; detail: string; full_analysis: string; source_docs: string[]; claim_ids?: string[] },
+  discrepancies: Array<Record<string, unknown>>
+): typeof finding {
+  const combined = `${finding.title} ${finding.detail} ${finding.full_analysis}`;
+  if (!hasConfidenceLanguage(combined)) return finding;
+  if (findingHasNumericBacking(finding, discrepancies)) return finding;
+
+  // This finding uses confidence language but has no NumericVerify backing — hedge it
+  let newTitle = hedgeConfidenceLanguage(finding.title);
+  // Also replace "Confirmed" at the start of titles
+  newTitle = newTitle.replace(/^Confirmed\s+/i, "Reported ");
+  newTitle = newTitle.replace(/\bConfirmed\b/gi, "Reported");
+
+  return {
+    ...finding,
+    title: newTitle,
+    detail: hedgeConfidenceLanguage(finding.detail),
+    full_analysis: hedgeConfidenceLanguage(finding.full_analysis),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Bug 1 fix (post-LLM pass): Sanitize LLM output for unbacked confidence
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a whitelist of numeric values that genuinely appear in NumericVerify
+ * discrepancies. Only `[Code-Verified: X]` tags whose X normalizes to a
+ * value in this set are allowed to survive.
+ */
+function buildVerifiedValueSet(discrepancies: Array<Record<string, unknown>>): Set<string> {
+  const allowed = new Set<string>();
+  for (const d of discrepancies) {
+    if (d.expected != null) allowed.add(String(d.expected).replace(/,/g, ""));
+    if (d.actual != null) allowed.add(String(d.actual).replace(/,/g, ""));
+    const desc = String(d.description || "");
+    for (const v of extractNumericValues(desc)) allowed.add(v);
+  }
+  return allowed;
+}
+
+/**
+ * Post-LLM output sanitizer. Runs on the completed LLM report text to:
+ * 1. Strip [Code-Verified: X] tags where X does not trace to a real NumericVerify value
+ * 2. Strip bare [Code-Verified] tags entirely
+ * 3. Hedge confidence language in sentences that reference figures not in NumericVerify
+ *
+ * This is the last-resort guard: the prompt tells the LLM not to do this, the pre-LLM
+ * pass hedges the input findings, and this pass catches anything the LLM re-invents.
+ */
+function sanitizeReportOutput(
+  report: string,
+  discrepancies: Array<Record<string, unknown>>
+): string {
+  const verifiedValues = buildVerifiedValueSet(discrepancies);
+
+  let result = report;
+
+  // 1. Strip bare [Code-Verified] tags (no value inside)
+  result = result.replace(/\[Code-Verified\]/gi, "");
+
+  // 2. Check each [Code-Verified: X] tag — keep only if X contains a verified value
+  result = result.replace(/\[Code-Verified:\s*([^\]]+)\]/gi, (_match, inner: string) => {
+    const innerValues = extractNumericValues(inner);
+    // If any value in the tag is actually from NumericVerify, keep it
+    for (const v of innerValues) {
+      if (verifiedValues.has(v)) return _match; // Keep — genuinely verified
+    }
+    // No match — strip the tag entirely
+    return "";
+  });
+
+  // 3. Hedge remaining unbacked confidence language patterns in the report body.
+  // We apply the same hedging map but only to sentences that don't reference verified values.
+  // To avoid false positives on legitimate verified-value sentences, we process line by line.
+  const lines = result.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!hasConfidenceLanguage(line)) continue;
+
+    // Check if this line references any verified numeric value
+    const lineValues = extractNumericValues(line);
+    let hasVerifiedRef = false;
+    for (const v of lineValues) {
+      if (verifiedValues.has(v)) {
+        hasVerifiedRef = true;
+        break;
+      }
+    }
+
+    // If the line has confidence language but no verified numeric reference, hedge it
+    if (!hasVerifiedRef) {
+      lines[i] = hedgeConfidenceLanguage(line);
+    }
+  }
+  result = lines.join("\n");
+
+  // Clean up doubled spaces from tag removal
+  result = result.replace(/  +/g, " ");
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Bug 2 fix: Code-generated Numeric Appendix (outside LLM control)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a deterministic markdown appendix listing every NumericVerify
+ * discrepancy verbatim. This section is appended AFTER the LLM output
+ * and cannot be editorially dropped.
+ */
+function buildNumericAppendix(
+  discrepancies: Array<Record<string, unknown>>,
+  figures: Array<Record<string, unknown>>
+): string {
+  if (discrepancies.length === 0 && figures.length === 0) return "";
+
+  const lines: string[] = [];
+  lines.push("");
+  lines.push("---");
+  lines.push("");
+  lines.push("## Numeric Verification Appendix");
+  lines.push("");
+  lines.push("*This section is auto-generated from the deterministic arithmetic engine output. It is not editable by the report writer and includes every discrepancy found, regardless of severity.*");
+  lines.push("");
+
+  const critical = discrepancies.filter(d => d.severity === "critical");
+  const warning = discrepancies.filter(d => d.severity === "warning");
+  const info = discrepancies.filter(d => d.severity !== "critical" && d.severity !== "warning");
+
+  if (critical.length > 0) {
+    lines.push(`### Critical Discrepancies (${critical.length})`);
+    lines.push("");
+    lines.push("| # | Check Type | Description | Expected | Reported |");
+    lines.push("|---|-----------|-------------|----------|----------|");
+    for (let i = 0; i < critical.length; i++) {
+      const d = critical[i];
+      const expected = d.expected != null ? String(d.expected) : "—";
+      const actual = d.actual != null ? String(d.actual) : "—";
+      lines.push(`| ${i + 1} | ${String(d.check_type || "—")} | ${String(d.description || "—")} | ${expected} | ${actual} |`);
+    }
+    lines.push("");
+  }
+
+  if (warning.length > 0) {
+    lines.push(`### Warning Discrepancies (${warning.length})`);
+    lines.push("");
+    lines.push("| # | Check Type | Description | Expected | Reported |");
+    lines.push("|---|-----------|-------------|----------|----------|");
+    for (let i = 0; i < warning.length; i++) {
+      const d = warning[i];
+      const expected = d.expected != null ? String(d.expected) : "—";
+      const actual = d.actual != null ? String(d.actual) : "—";
+      lines.push(`| ${i + 1} | ${String(d.check_type || "—")} | ${String(d.description || "—")} | ${expected} | ${actual} |`);
+    }
+    lines.push("");
+  }
+
+  if (info.length > 0) {
+    lines.push(`### Other Discrepancies (${info.length})`);
+    lines.push("");
+    for (let i = 0; i < info.length; i++) {
+      const d = info[i];
+      lines.push(`${i + 1}. **[${String(d.severity || "info").toUpperCase()}]** ${String(d.description || "—")}`);
+    }
+    lines.push("");
+  }
+
+  if (figures.length > 0) {
+    lines.push(`### Verified Figures (${figures.length})`);
+    lines.push("");
+    lines.push("| Figure | Value | Source Cell |");
+    lines.push("|--------|-------|-------------|");
+    for (const f of figures) {
+      lines.push(`| ${String(f.name || "—")} | ${String(f.recomputed_value ?? "—")} | ${String(f.source_cell || "—")} |`);
+    }
+    lines.push("");
+  }
+
+  lines.push(`*${discrepancies.length} discrepancies total: ${critical.length} critical, ${warning.length} warning. ${figures.length} verified figures.*`);
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Anthropic response schema
 // ---------------------------------------------------------------------------
 const MessageResponseSchema = z.object({
@@ -411,15 +721,24 @@ export default api({
     const hasNumericData = !!(numericReport && NUMERIC_MODULES.has(moduleId) &&
         (numericReport.figures.length > 0 || numericReport.discrepancies.length > 0));
 
+    // Bug 1 fix: Sanitize finding confidence language against NumericVerify backing.
+    // Any finding that uses "confirmed"/"code-verified" language but has no matching
+    // NumericVerify discrepancy gets rewritten with hedged language BEFORE reaching the LLM.
+    const discrepancies = (numericReport?.discrepancies ?? []) as Array<Record<string, unknown>>;
+    const sanitizedFindings = findings.map(f => sanitizeFinding(f, discrepancies));
+
     // Fix #3: Conditionally strip or inject numeric verification instructions in the report prompt.
     if (hasNumericData) {
       const numericVerificationInstructions = `## NUMERIC VERIFICATION REQUIREMENT
 A "## Numeric Verification Report" section in your input contains code-verified arithmetic results. You MUST:
 - Present all numeric discrepancies and cross-doc figure mismatches as **Confirmed Contradictions** with the highest priority
 - Cite the recomputed_value as the authoritative figure
-- State "[Code-Verified: X]" next to any figure drawn from the Numeric Verification Report
+- State "[Code-Verified: X]" next to any figure **ONLY** when the exact figure X appears in the "## Numeric Verification Report" section below as an expected, actual, or recomputed_value
+- **NEVER** apply [Code-Verified] or [Code-Verified: X] to a figure that appears only in the Findings JSON — those figures come from AI text interpretation, NOT from the arithmetic engine
+- **NEVER** use bare [Code-Verified] tags without a specific numeric value inside
 - Never paraphrase or re-derive a code-verified figure from text
-- Label these findings as: **SOURCE: Deterministic Arithmetic Verification**`;
+- Label findings as **SOURCE: Deterministic Arithmetic Verification** ONLY when they directly reference a discrepancy from the Numeric Verification Report section — NOT for findings whose figures come solely from the AI-generated Findings JSON
+- If a finding discusses a dollar amount (e.g. "$72,000") that does NOT appear in the Numeric Verification Report, treat it as a text-derived claim: attribute it to its source document, use hedged language ("as reported in", "per the model"), and do NOT imply arithmetic verification`;
       reportPrompt = reportPrompt.replace("{{FORMAT_NUMERIC_VERIFICATION_BLOCK}}", numericVerificationInstructions);
     } else {
       // Fix #1: Belt-and-suspenders guard language for report formatting
@@ -469,8 +788,8 @@ No deterministic numeric verification was performed for this analysis. All figur
       }
     }
 
-    // Build the input for the report writer
-    const findingsJson = sanitizeBraces(JSON.stringify(findings, null, 2));
+    // Build the input for the report writer (use sanitized findings)
+    const findingsJson = sanitizeBraces(JSON.stringify(sanitizedFindings, null, 2));
     // Build coverage block if provided
     const coverageBlock = coverageLine
       ? `\n\n> **Coverage:** ${sanitizeBraces(coverageLine)}\n`
@@ -481,15 +800,15 @@ No deterministic numeric verification was performed for this analysis. All figur
       ? `\n\n**⚠ Note:** Not all documents in the data room were ingested. ${sanitizeBraces(coverageLine)}`
       : "";
 
-    const criticalCount = findings.filter(f => f.severity === "critical").length;
-    const warningCount = findings.filter(f => f.severity === "warning").length;
-    const infoCount = findings.filter(f => f.severity === "info").length;
+    const criticalCount = sanitizedFindings.filter(f => f.severity === "critical").length;
+    const warningCount = sanitizedFindings.filter(f => f.severity === "warning").length;
+    const infoCount = sanitizedFindings.filter(f => f.severity === "info").length;
 
     const reportInput =
       `## Executive Header\n\n${sanitizeBraces(executiveHeader)}${exclusionNote}\n\n` +
       `## Data Room Coverage${coverageBlock}\n\n` +
       `## Findings (${findings.length} total: ${criticalCount} critical, ${warningCount} warning, ${infoCount} info)\n` +
-      `**REMINDER: Your report must contain exactly ${findings.length} fully detailed write-ups — one per finding.**\n\n` +
+      `**REMINDER: Your report must contain exactly ${sanitizedFindings.length} fully detailed write-ups — one per finding.**\n\n` +
       `${findingsJson}${sanitizeBraces(numericBlock)}`;
 
     const result = await ctx.integrations.ai.apiRequest(
@@ -524,6 +843,24 @@ No deterministic numeric verification was performed for this analysis. All figur
     let fullReport = textBlock.text;
     if (coverageLine) {
       fullReport = `> **Coverage:** ${coverageLine}\n\n${fullReport}`;
+    }
+
+    // Bug 1 fix (post-LLM pass): Sanitize any confidence language the LLM re-invented
+    // despite the prompt guard. This is the critical second pass — the pre-LLM pass
+    // hedges the input, but the LLM can still regenerate confidence language from context.
+    if (hasNumericData) {
+      fullReport = sanitizeReportOutput(fullReport, discrepancies);
+    }
+
+    // Bug 2 fix: Append deterministic Numeric Appendix (outside LLM control).
+    // Lists every NumericVerify discrepancy verbatim — CRITICAL and WARNING both.
+    // Cannot be editorially dropped by the LLM.
+    if (hasNumericData) {
+      const figures = (numericReport?.figures ?? []) as Array<Record<string, unknown>>;
+      const appendix = buildNumericAppendix(discrepancies, figures);
+      if (appendix) {
+        fullReport += appendix;
+      }
     }
 
     return { fullReport };
