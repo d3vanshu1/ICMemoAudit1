@@ -1520,7 +1520,7 @@ export default function DealDashboardPage() {
   // ---------------------------------------------------------------------------
 
   const runServerPipeline = useCallback(
-    async (moduleId: string) => {
+    async (moduleId: string, resumeRunId?: string) => {
       const displayName = MODULE_MAP[moduleId]?.displayName ?? moduleId;
 
       // Ensure universal extractions exist on the server
@@ -1547,13 +1547,15 @@ export default function DealDashboardPage() {
         }
       }
 
-      // Kick off server pipeline
-      setModuleProgress(moduleId, { message: "Starting server-side analysis…" });
+      // Kick off server pipeline (or resume an existing one)
+      setModuleProgress(moduleId, {
+        message: resumeRunId ? "Resuming server-side analysis…" : "Starting server-side analysis…",
+      });
 
       let pipelineResult = await runModulePipelineApi({
         dealId: dealId!,
         moduleId,
-        runId: undefined,
+        runId: resumeRunId ?? undefined,
         useOpus: useOpus || undefined,
         numericReport,
       });
@@ -1572,9 +1574,12 @@ export default function DealDashboardPage() {
         // Update progress UI
         const prog = pipelineResult.progress;
         const phase = pipelineResult.phase;
+        const failInfo = (pipelineResult as { failedChunks?: number; firstError?: string | null }).failedChunks
+          ? ` (${(pipelineResult as { failedChunks?: number }).failedChunks} failed)`
+          : "";
         if (phase === "analysis") {
           setModuleProgress(moduleId, {
-            message: `Analyzing chunks (server)… ${prog.analysisCompleted}/${prog.analysisTotal}`,
+            message: `Analyzing chunks (server)… ${prog.analysisCompleted}/${prog.analysisTotal}${failInfo}`,
             detail: { current: prog.analysisCompleted, total: prog.analysisTotal, phase: "analyzing" },
           });
         } else if (phase === "merge") {
@@ -1611,7 +1616,10 @@ export default function DealDashboardPage() {
       }
 
       if (pipelineResult.status === "failed") {
-        throw new Error(`Server pipeline failed during ${pipelineResult.phase}`);
+        const errDetail = (pipelineResult as { firstError?: string | null }).firstError;
+        throw new Error(
+          `Server pipeline failed during ${pipelineResult.phase}${errDetail ? `: ${errDetail}` : ""}`
+        );
       }
 
       // Pipeline completed — format report
@@ -1671,8 +1679,9 @@ export default function DealDashboardPage() {
       }));
 
       // Auto-purge stale runs (>30 min stuck as "running") before starting
+      // Exclude the current module so we don't kill its own prior run (we'll resume it instead)
       if (dealId) {
-        purgeStaleRunsApi({ dealId, staleMinutes: 30 }).catch(() => {});
+        purgeStaleRunsApi({ dealId, staleMinutes: 30, excludeModuleId: moduleId }).catch(() => {});
       }
 
       try {
@@ -1680,11 +1689,11 @@ export default function DealDashboardPage() {
           await runExecutiveSummary();
         } else if (WEB_RESEARCH_MODULES.has(moduleId)) {
           await runWebResearchModule(moduleId);
-        } else if (dealId && !resumeRunId) {
+        } else if (dealId) {
           // Server-side pipeline: survives tab closure, checkpointed
-          await runServerPipeline(moduleId);
+          await runServerPipeline(moduleId, resumeRunId);
         } else {
-          // Fallback: client-side pipeline (for resume or no-deal edge case)
+          // Fallback: client-side pipeline (no-deal edge case)
           await runStandardModule(moduleId, resumeRunId);
         }
       } catch (err) {
@@ -1801,27 +1810,26 @@ export default function DealDashboardPage() {
   // Resume interrupted runs on deal load
   // ---------------------------------------------------------------------------
   const resumeChecked = useRef(false);
-  // AUTO-RESUME DISABLED — re-enable once pipeline handles large deals efficiently
-  // useEffect(() => {
-  //   if (!dealId || resumeChecked.current || !docsInitialized.current) return;
-  //   if (docs.length === 0) return;
-  //   resumeChecked.current = true;
-  //   (async () => {
-  //     try {
-  //       const progress = await getRunProgressApi({ dealId });
-  //       const runs = progress?.runs ?? [];
-  //       const inProgressRuns = runs.filter((r) => r.status === "running");
-  //       if (inProgressRuns.length === 0) return;
-  //       toast.info(`Resuming ${inProgressRuns.length} interrupted run(s)…`);
-  //       for (const run of inProgressRuns) {
-  //         if (WEB_RESEARCH_MODULES.has(run.moduleId) || run.moduleId === "executive_summary") continue;
-  //         handleRunModule(run.moduleId, run.runId);
-  //       }
-  //     } catch (err) {
-  //       console.error("Failed to check for interrupted runs:", err);
-  //     }
-  //   })();
-  // }, [dealId, docs, handleRunModule, getRunProgressApi]);
+  useEffect(() => {
+    if (!dealId || resumeChecked.current || !docsInitialized.current) return;
+    if (docs.length === 0) return;
+    resumeChecked.current = true;
+    (async () => {
+      try {
+        const progress = await getRunProgressApi({ dealId });
+        const runs = progress?.runs ?? [];
+        const inProgressRuns = runs.filter((r: { status: string }) => r.status === "running");
+        if (inProgressRuns.length === 0) return;
+        toast.info(`Resuming ${inProgressRuns.length} interrupted run(s)…`);
+        for (const run of inProgressRuns) {
+          if (WEB_RESEARCH_MODULES.has(run.moduleId) || run.moduleId === "executive_summary") continue;
+          handleRunModule(run.moduleId, run.runId);
+        }
+      } catch (err) {
+        console.error("Failed to check for interrupted runs:", err);
+      }
+    })();
+  }, [dealId, docs, handleRunModule, getRunProgressApi]);
 
   // ---------------------------------------------------------------------------
   // Document management

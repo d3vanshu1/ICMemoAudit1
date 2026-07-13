@@ -27,6 +27,7 @@ export default api({
   input: z.object({
     dealId: z.string(),
     staleMinutes: z.number().optional(), // default 30
+    excludeModuleId: z.string().nullable().optional(), // don't purge the module currently being started
   }),
 
   output: z.object({
@@ -34,10 +35,11 @@ export default api({
     purgedRuns: z.array(PurgedRunSchema),
   }),
 
-  async run(ctx, { dealId, staleMinutes }) {
+  async run(ctx, { dealId, staleMinutes, excludeModuleId }) {
     const minutes = staleMinutes ?? 30;
 
     // Mark all "running" runs older than the threshold as "failed"
+    // Exclude the module currently being started to avoid killing its own prior run
     const purged = await ctx.integrations.db.query(
       `UPDATE module_runs
        SET status = 'failed'::module_status,
@@ -45,9 +47,10 @@ export default api({
        WHERE deal_id = $1
          AND status = 'running'
          AND triggered_at < now() - ($2 || ' minutes')::interval
+         AND ($3::text IS NULL OR module_id != $3)
        RETURNING id, module_id, triggered_at::text`,
       PurgedRunSchema,
-      [dealId, String(minutes)],
+      [dealId, String(minutes), excludeModuleId ?? null],
       { label: `Purge stale runs (>${minutes}min)` }
     );
 

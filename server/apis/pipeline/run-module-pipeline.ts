@@ -167,6 +167,9 @@ export default api({
       findings: z.array(z.any()),
       mergedText: z.string(),
     }).nullable(),
+    // Failure diagnostics
+    failedChunks: z.number().optional(),
+    firstError: z.string().nullable().optional(),
   }),
 
   async run(ctx, input) {
@@ -258,31 +261,42 @@ export default api({
 
     const pendingChunks = routed.filter((_, i) => !analyzedSet.has(i));
     let analysisCompleted = analyzedSet.size;
+    let failedChunks = 0;
+    let firstError: string | null = null;
 
-    // Process pending chunks with bounded concurrency
-    for (let bStart = 0; bStart < pendingChunks.length; bStart += ANALYSIS_CONCURRENCY) {
-      if (timeRemaining() < 30_000) {
-        // Less than 30s left — checkpoint and return
-        await ctx.integrations.db.execute(
-          `UPDATE module_runs SET status = 'running'::module_status WHERE id = $1`,
-          [runId],
-          { label: "Keep run as running (time budget)" }
-        );
-        return {
-          status: "in_progress" as const,
-          runId,
-          phase: "analysis",
-          progress: {
-            analysisTotal: routed.length,
-            analysisCompleted,
-            mergeRound: 0,
-            mergeTotal: Math.ceil(Math.log(Math.max(routed.length, 2)) / Math.log(MERGE_GROUP_SIZE)),
-          },
-          result: null,
-        };
+    // Helper: return in_progress checkpoint
+    const returnInProgress = (phase: "analysis" | "merge", mergeRound = 0) => ({
+      status: "in_progress" as const,
+      runId,
+      phase,
+      progress: {
+        analysisTotal: routed.length,
+        analysisCompleted,
+        mergeRound,
+        mergeTotal: Math.ceil(Math.log(Math.max(routed.length, 2)) / Math.log(MERGE_GROUP_SIZE)),
+      },
+      result: null,
+      failedChunks,
+      firstError,
+    });
+
+    // Process pending chunks with dynamic batch sizing
+    for (let bStart = 0; bStart < pendingChunks.length; ) {
+      // Dynamic batch size: shrink as time runs low
+      const remaining = timeRemaining();
+      let batchSize: number;
+      if (remaining < 60_000) {
+        // Less than 60s — checkpoint immediately, don't start another batch
+        return returnInProgress("analysis");
+      } else if (remaining < 90_000) {
+        // Less than 90s — small batch to avoid overrun
+        batchSize = 5;
+      } else {
+        batchSize = ANALYSIS_CONCURRENCY;
       }
 
-      const batch = pendingChunks.slice(bStart, bStart + ANALYSIS_CONCURRENCY);
+      const batch = pendingChunks.slice(bStart, bStart + batchSize);
+      bStart += batchSize;
 
       const results = await Promise.allSettled(
         batch.map(async (row) => {
@@ -323,9 +337,28 @@ export default api({
         })
       );
 
-      // Count successes
+      // Count successes and track failures
       for (const r of results) {
-        if (r.status === "fulfilled") analysisCompleted++;
+        if (r.status === "fulfilled") {
+          analysisCompleted++;
+        } else {
+          failedChunks++;
+          if (!firstError) {
+            firstError = r.reason?.message ?? String(r.reason ?? "Unknown error");
+          }
+        }
+      }
+
+      // Refresh triggered_at so long multi-pass runs aren't purged as stale
+      await ctx.integrations.db.execute(
+        `UPDATE module_runs SET triggered_at = now() WHERE id = $1`,
+        [runId],
+        { label: "Refresh triggered_at (checkpoint heartbeat)" }
+      );
+
+      // Post-batch time check: if we're close to platform kill, checkpoint immediately
+      if (timeRemaining() < 60_000) {
+        return returnInProgress("analysis");
       }
     }
 
@@ -363,6 +396,8 @@ export default api({
         phase: "analysis",
         progress: { analysisTotal: routed.length, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
         result: null,
+        failedChunks,
+        firstError: firstError ?? "All chunks failed or no analysis results produced",
       };
     }
 
@@ -458,18 +493,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
 
       if (timeRemaining() < 60_000) {
         // Not enough time for another merge round
-        return {
-          status: "in_progress" as const,
-          runId,
-          phase: "merge",
-          progress: {
-            analysisTotal: routed.length,
-            analysisCompleted,
-            mergeRound: currentRound - 1,
-            mergeTotal: totalMergeRounds,
-          },
-          result: null,
-        };
+        return returnInProgress("merge", currentRound - 1);
       }
 
       const groups: Array<{ idx: number; members: MergeNode[] }> = [];
@@ -481,6 +505,11 @@ A "## Numeric Verification Report" section appears in the input below. It contai
       const isFinalRound = currentRound === totalMergeRounds;
 
       for (const group of groups) {
+        // Mid-round time check: bail before starting a long merge call
+        if (timeRemaining() < 60_000) {
+          return returnInProgress("merge", currentRound - 1);
+        }
+
         if (group.members.length === 1) {
           nextNodes[group.idx] = group.members[0];
           continue;
@@ -571,6 +600,8 @@ A "## Numeric Verification Report" section appears in the input below. It contai
         findings: finalNode.findings,
         mergedText: finalNode.text,
       },
+      failedChunks,
+      firstError,
     };
   },
 });
