@@ -21,6 +21,7 @@ const MERGE_MAX_TOKENS = 8000;
 const REPORT_MAX_TOKENS = 16000;
 
 const ANALYSIS_CONCURRENCY = 15;
+const MERGE_CONCURRENCY = 10;
 const MERGE_GROUP_SIZE = 4;
 const TIME_BUDGET_MS = 250_000; // 4m10s — must stay under platform's 5min app API limit
 
@@ -160,6 +161,8 @@ export default api({
       analysisCompleted: z.number(),
       mergeRound: z.number(),
       mergeTotal: z.number(),
+      mergeGroupsDone: z.number().optional(),
+      mergeGroupsTotal: z.number().optional(),
     }),
     // Only populated when status === "completed"
     result: z.object({
@@ -265,7 +268,7 @@ export default api({
     let firstError: string | null = null;
 
     // Helper: return in_progress checkpoint
-    const returnInProgress = (phase: "analysis" | "merge", mergeRound = 0) => ({
+    const returnInProgress = (phase: "analysis" | "merge", mergeRound = 0, mergeGroupsDone = 0, mergeGroupsTotal = 0) => ({
       status: "in_progress" as const,
       runId,
       phase,
@@ -274,6 +277,8 @@ export default api({
         analysisCompleted,
         mergeRound,
         mergeTotal: Math.ceil(Math.log(Math.max(routed.length, 2)) / Math.log(MERGE_GROUP_SIZE)),
+        mergeGroupsDone,
+        mergeGroupsTotal,
       },
       result: null,
       failedChunks,
@@ -493,7 +498,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
 
       if (timeRemaining() < 60_000) {
         // Not enough time for another merge round
-        return returnInProgress("merge", currentRound - 1);
+        return returnInProgress("merge", currentRound - 1, 0, 0);
       }
 
       const groups: Array<{ idx: number; members: MergeNode[] }> = [];
@@ -502,75 +507,134 @@ A "## Numeric Verification Report" section appears in the input below. It contai
       }
 
       const nextNodes: MergeNode[] = new Array(groups.length);
-      const isFinalRound = currentRound === totalMergeRounds;
+      const totalGroupsThisRound = groups.length;
+      let groupsDone = 0;
+      let mergeFailedGroups = 0;
+      let mergeFirstError: string | null = null;
 
+      // Separate trivial groups (single member or already checkpointed) from groups needing AI merge
+      const pendingGroups: Array<{ idx: number; members: MergeNode[] }> = [];
       for (const group of groups) {
-        // Mid-round time check: bail before starting a long merge call
-        if (timeRemaining() < 60_000) {
-          return returnInProgress("merge", currentRound - 1);
-        }
-
         if (group.members.length === 1) {
           nextNodes[group.idx] = group.members[0];
+          groupsDone++;
           continue;
         }
-
-        // Check checkpoint
         const cpKey = `${currentRound}:${group.idx}`;
         if (checkpointMap.has(cpKey)) {
           nextNodes[group.idx] = checkpointMap.get(cpKey)!;
+          groupsDone++;
           continue;
         }
+        pendingGroups.push(group);
+      }
 
-        // Perform merge
-        const setBlocks = group.members.map((m, i) => `## Analysis Set ${i + 1}\n\n${m.text}`);
-        const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock;
-
-        const mergeResult = await callAnthropic(
-          ctx,
-          {
-            model: useOpus ? OPUS_MODEL : SONNET_MODEL,
-            max_tokens: MERGE_MAX_TOKENS,
-            system: [{ type: "text", text: mergePrompt, cache_control: { type: "ephemeral" } }],
-            messages: [{ role: "user", content: mergeInput }],
-          },
-          `Merge R${currentRound} G${group.idx + 1}/${groups.length}`
-        );
-
-        const mergeText = mergeResult.content.find(c => c.type === "text")?.text ?? "";
-        const executiveHeader = extractTag(mergeText, "executive_header") || "Analysis complete.";
-        const findingsRaw = extractTag(mergeText, "findings_json");
-
-        let findings: MergedFinding[] = [];
-        if (findingsRaw) {
-          try {
-            const parsed = JSON.parse(findingsRaw);
-            if (Array.isArray(parsed)) {
-              findings = parsed.map((f: Record<string, unknown>) => ({
-                severity: (f.severity === "critical" || f.severity === "warning" || f.severity === "info") ? f.severity : "info",
-                title: String(f.title ?? "Untitled"),
-                detail: String(f.detail ?? ""),
-                full_analysis: String(f.full_analysis ?? f.detail ?? ""),
-                source_docs: Array.isArray(f.source_docs) ? f.source_docs.map(String) : [],
-                ...(Array.isArray(f.claim_ids) && f.claim_ids.length > 0 ? { claim_ids: f.claim_ids.map(String) } : {}),
-              }));
-            }
-          } catch { /* parse failure — use empty findings */ }
+      // Process pending groups in batches (parallel within batch, sequential across batches)
+      for (let bStart = 0; bStart < pendingGroups.length; ) {
+        // Time check between batches
+        if (timeRemaining() < 60_000) {
+          return returnInProgress("merge", currentRound - 1, groupsDone, totalGroupsThisRound);
         }
 
-        const mergedTextForNode = buildMergedText(executiveHeader, findings);
-        const node: MergeNode = { text: mergedTextForNode, executiveHeader, findings };
-        nextNodes[group.idx] = node;
+        const batchSize = timeRemaining() < 90_000 ? Math.min(3, MERGE_CONCURRENCY) : MERGE_CONCURRENCY;
+        const batch = pendingGroups.slice(bStart, bStart + batchSize);
+        bStart += batchSize;
 
-        // Save merge checkpoint
+        const results = await Promise.allSettled(
+          batch.map(async (group) => {
+            const setBlocks = group.members.map((m, i) => `## Analysis Set ${i + 1}\n\n${m.text}`);
+            const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock;
+
+            const mergeResult = await callAnthropic(
+              ctx,
+              {
+                model: useOpus ? OPUS_MODEL : SONNET_MODEL,
+                max_tokens: MERGE_MAX_TOKENS,
+                system: [{ type: "text", text: mergePrompt, cache_control: { type: "ephemeral" } }],
+                messages: [{ role: "user", content: mergeInput }],
+              },
+              `Merge R${currentRound} G${group.idx + 1}/${totalGroupsThisRound}`
+            );
+
+            const mergeText = mergeResult.content.find(c => c.type === "text")?.text ?? "";
+            const executiveHeader = extractTag(mergeText, "executive_header") || "Analysis complete.";
+            const findingsRaw = extractTag(mergeText, "findings_json");
+
+            let findings: MergedFinding[] = [];
+            if (findingsRaw) {
+              try {
+                const parsed = JSON.parse(findingsRaw);
+                if (Array.isArray(parsed)) {
+                  findings = parsed.map((f: Record<string, unknown>) => ({
+                    severity: (f.severity === "critical" || f.severity === "warning" || f.severity === "info") ? f.severity : "info",
+                    title: String(f.title ?? "Untitled"),
+                    detail: String(f.detail ?? ""),
+                    full_analysis: String(f.full_analysis ?? f.detail ?? ""),
+                    source_docs: Array.isArray(f.source_docs) ? f.source_docs.map(String) : [],
+                    ...(Array.isArray(f.claim_ids) && f.claim_ids.length > 0 ? { claim_ids: f.claim_ids.map(String) } : {}),
+                  }));
+                }
+              } catch { /* parse failure — use empty findings */ }
+            }
+
+            const mergedTextForNode = buildMergedText(executiveHeader, findings);
+            const node: MergeNode = { text: mergedTextForNode, executiveHeader, findings };
+
+            return { group, node };
+          })
+        );
+
+        // Process results: checkpoint successes, track failures
+        for (let i = 0; i < results.length; i++) {
+          const result = results[i];
+          const group = batch[i];
+
+          if (result.status === "fulfilled") {
+            const { node } = result.value;
+            nextNodes[group.idx] = node;
+            groupsDone++;
+
+            // Save merge checkpoint
+            await ctx.integrations.db.execute(
+              `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json)
+               VALUES ($1, $2, $3, $4::jsonb)
+               ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb`,
+              [runId, currentRound, group.idx, JSON.stringify({ text: node.text, executiveHeader: node.executiveHeader, findings: node.findings })],
+              { label: `Save merge checkpoint R${currentRound}:G${group.idx}` }
+            );
+          } else {
+            // Merge call failed — use a placeholder so the tree can still reduce
+            mergeFailedGroups++;
+            if (!mergeFirstError) {
+              mergeFirstError = result.reason instanceof Error ? result.reason.message : String(result.reason);
+            }
+            // Use first member's text as fallback so tree reduction can continue
+            const fallback: MergeNode = { text: group.members[0].text, executiveHeader: "Merge failed", findings: [] };
+            nextNodes[group.idx] = fallback;
+            groupsDone++;
+
+            // Save error checkpoint
+            await ctx.integrations.db.execute(
+              `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json)
+               VALUES ($1, $2, $3, $4::jsonb)
+               ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb`,
+              [runId, currentRound, group.idx, JSON.stringify({ error: mergeFirstError })],
+              { label: `Save merge error checkpoint R${currentRound}:G${group.idx}` }
+            );
+          }
+        }
+
+        // Refresh heartbeat after each batch
         await ctx.integrations.db.execute(
-          `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json)
-           VALUES ($1, $2, $3, $4::jsonb)
-           ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb`,
-          [runId, currentRound, group.idx, JSON.stringify({ text: mergedTextForNode, executiveHeader, findings })],
-          { label: `Save merge checkpoint R${currentRound}:G${group.idx}` }
+          `UPDATE module_runs SET triggered_at = now() WHERE id = $1`,
+          [runId],
+          { label: "Refresh triggered_at (merge batch heartbeat)" }
         );
       }
+
+      // Track merge failures in overall counters
+      failedChunks += mergeFailedGroups;
+      if (!firstError && mergeFirstError) firstError = mergeFirstError;
 
       nodes = nextNodes;
     }
@@ -594,6 +658,8 @@ A "## Numeric Verification Report" section appears in the input below. It contai
         analysisCompleted: routed.length,
         mergeRound: totalMergeRounds,
         mergeTotal: totalMergeRounds,
+        mergeGroupsDone: undefined,
+        mergeGroupsTotal: undefined,
       },
       result: {
         executiveHeader: finalNode.executiveHeader,

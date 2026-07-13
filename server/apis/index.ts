@@ -25,6 +25,7 @@ import GetRunOutput from './modules/get-run-output.js';
 
 // Server-side pipeline
 import RunModulePipeline from './pipeline/run-module-pipeline.js';
+import ResumeStalePipelines from './pipeline/resume-stale-pipelines.js';
 
 // Database setup
 import SetupSchema from './db/setup-schema.js';
@@ -82,7 +83,7 @@ const apis = {
   AnalyzeChunk, UniversalExtract, MergeFindings, FormatReport, WebResearch,
   SaveModuleResult, LoadModuleResults, GetRunHistory, GetRunOutput,
   // Server-side pipeline
-  RunModulePipeline,
+  RunModulePipeline, ResumeStalePipelines,
   // DB setup
   SetupSchema, RunCheckpointMigration, CreatePipelineTable,
   // Deals

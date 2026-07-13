@@ -1583,8 +1583,11 @@ export default function DealDashboardPage() {
             detail: { current: prog.analysisCompleted, total: prog.analysisTotal, phase: "analyzing" },
           });
         } else if (phase === "merge") {
+          const groupInfo = prog.mergeGroupsTotal
+            ? ` — ${prog.mergeGroupsDone ?? 0}/${prog.mergeGroupsTotal} groups`
+            : "";
           setModuleProgress(moduleId, {
-            message: `Merging findings (server)… round ${prog.mergeRound}/${prog.mergeTotal}`,
+            message: `Merging findings (server)… round ${prog.mergeRound}/${prog.mergeTotal}${groupInfo}`,
             detail: { current: prog.mergeRound, total: prog.mergeTotal, phase: "synthesizing" },
           });
         }
