@@ -2,6 +2,9 @@ import { api, z, postgres } from "@superblocksteam/sdk-api";
 
 const IC_DILIGENCE_DB = "ba09e2b9-2715-4460-8131-896f50b0c414";
 
+// Same slice size as GetDocumentTexts to stay safely under the 10MB wire limit
+const SLICE_SIZE = 2_000_000; // 2MB per substring read
+
 // ---------------------------------------------------------------------------
 // parsed_text CSV → structured tables
 // ---------------------------------------------------------------------------
@@ -173,6 +176,19 @@ function parsedTextToTables(parsedText: string, fileName: string): ParsedTable[]
 }
 
 // ---------------------------------------------------------------------------
+// Schemas
+// ---------------------------------------------------------------------------
+const DocMetaSchema = z.object({
+  id: z.string(),
+  file_name: z.string(),
+  text_length: z.coerce.number(),
+});
+
+const TextSliceSchema = z.object({
+  text_slice: z.string(),
+});
+
+// ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
 export default api({
@@ -197,18 +213,15 @@ export default api({
         totalCells: z.number(),
       })
     ),
+    warnings: z.array(z.string()),
   }),
 
   async run(ctx, { dealId }) {
-    // Get all Excel/CSV documents for this deal that have parsed_text
-    const DocSchema = z.object({
-      id: z.string(),
-      file_name: z.string(),
-      parsed_text: z.string(),
-    });
+    const warnings: string[] = [];
 
+    // Step 1: Get metadata only (no parsed_text) to avoid the 10MB wire limit
     const docs = await ctx.integrations.db.query(
-      `SELECT id, file_name, parsed_text
+      `SELECT id, file_name, COALESCE(length(parsed_text), 0) AS text_length
        FROM documents
        WHERE deal_id = $1
          AND parsed_text IS NOT NULL
@@ -216,61 +229,104 @@ export default api({
          AND (file_type LIKE '%spreadsheet%' OR file_type LIKE '%excel%' OR file_type LIKE '%csv%' OR file_name LIKE '%.xlsx' OR file_name LIKE '%.xls' OR file_name LIKE '%.csv')
        ORDER BY uploaded_at
        LIMIT 50`,
-      DocSchema,
+      DocMetaSchema,
       [dealId],
-      { label: "Fetch Excel/CSV documents for backfill" }
+      { label: "Fetch Excel/CSV document metadata for backfill" }
     );
 
     if (docs.length === 0) {
-      ctx.log.info("No Excel/CSV documents with parsed_text found for this deal");
-      return { totalTables: 0, perDocument: [] };
+      return { totalTables: 0, perDocument: [], warnings: ["No Excel/CSV documents with parsed_text found for this deal"] };
     }
 
     let totalTables = 0;
     const perDocument: Array<{ documentId: string; fileName: string; sheetCount: number; totalCells: number }> = [];
 
     for (const doc of docs) {
-      // Delete existing doc_tables for this document
-      await ctx.integrations.db.execute(
-        `DELETE FROM doc_tables WHERE document_id = $1`,
-        [doc.id],
-        { label: `Clear existing doc_tables for ${doc.file_name}` }
-      );
+      try {
+        // Step 2: Load text using chunked reads (same approach as GetDocumentTexts)
+        let parsedText: string;
 
-      const tables = parsedTextToTables(doc.parsed_text, doc.file_name);
-      let docTotalCells = 0;
+        if (doc.text_length <= SLICE_SIZE) {
+          const rows = await ctx.integrations.db.query(
+            `SELECT parsed_text AS text_slice FROM documents WHERE id = $1`,
+            TextSliceSchema,
+            [doc.id],
+            { label: `Load text: ${doc.file_name} (${(doc.text_length / 1000).toFixed(0)}KB)` }
+          );
+          parsedText = rows[0]?.text_slice ?? "";
+        } else {
+          // Large document — load in slices using substring()
+          const slices: string[] = [];
+          let offset = 1; // PostgreSQL substring is 1-indexed
+          const totalSlices = Math.ceil(doc.text_length / SLICE_SIZE);
 
-      for (const table of tables) {
-        docTotalCells += table.cells.length;
+          for (let i = 0; i < totalSlices; i++) {
+            const rows = await ctx.integrations.db.query(
+              `SELECT substring(parsed_text FROM ${offset} FOR ${SLICE_SIZE}) AS text_slice
+               FROM documents WHERE id = $1`,
+              TextSliceSchema,
+              [doc.id],
+              { label: `Load slice ${i + 1}/${totalSlices}: ${doc.file_name}` }
+            );
+            const slice = rows[0]?.text_slice ?? "";
+            if (slice.length === 0) break;
+            slices.push(slice);
+            offset += SLICE_SIZE;
+          }
 
+          parsedText = slices.join("");
+          warnings.push(`${doc.file_name}: loaded in ${slices.length} slices (${(doc.text_length / 1_000_000).toFixed(1)}MB)`);
+        }
+
+        if (!parsedText || parsedText.trim().length === 0) {
+          warnings.push(`${doc.file_name}: empty parsed_text after loading`);
+          continue;
+        }
+
+        // Step 3: Delete existing doc_tables for this document
         await ctx.integrations.db.execute(
-          `INSERT INTO doc_tables (document_id, sheet_or_page, caption, data)
-           VALUES ($1, $2, $3, $4)`,
-          [
-            doc.id,
-            table.sheetOrPage,
-            table.caption,
-            JSON.stringify({
-              row_headers: table.rowHeaders,
-              col_headers: table.colHeaders,
-              cells: table.cells,
-            }),
-          ],
-          { label: `Save doc_table: ${doc.file_name} / ${table.sheetOrPage}` }
+          `DELETE FROM doc_tables WHERE document_id = $1`,
+          [doc.id],
+          { label: `Clear existing doc_tables for ${doc.file_name}` }
         );
+
+        // Step 4: Parse text into structured tables
+        const tables = parsedTextToTables(parsedText, doc.file_name);
+        let docTotalCells = 0;
+
+        for (const table of tables) {
+          docTotalCells += table.cells.length;
+
+          await ctx.integrations.db.execute(
+            `INSERT INTO doc_tables (document_id, sheet_or_page, caption, data)
+             VALUES ($1, $2, $3, $4)`,
+            [
+              doc.id,
+              table.sheetOrPage,
+              table.caption,
+              JSON.stringify({
+                row_headers: table.rowHeaders,
+                col_headers: table.colHeaders,
+                cells: table.cells,
+              }),
+            ],
+            { label: `Save doc_table: ${doc.file_name} / ${table.sheetOrPage}` }
+          );
+        }
+
+        totalTables += tables.length;
+        perDocument.push({
+          documentId: doc.id,
+          fileName: doc.file_name,
+          sheetCount: tables.length,
+          totalCells: docTotalCells,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        warnings.push(`${doc.file_name}: FAILED — ${msg}`);
       }
-
-      totalTables += tables.length;
-      perDocument.push({
-        documentId: doc.id,
-        fileName: doc.file_name,
-        sheetCount: tables.length,
-        totalCells: docTotalCells,
-      });
-
-      ctx.log.info(`Backfilled ${tables.length} tables (${docTotalCells} cells) from ${doc.file_name}`);
     }
 
-    return { totalTables, perDocument };
+    return { totalTables, perDocument, warnings };
   },
 });

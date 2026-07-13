@@ -6,9 +6,9 @@ import { api, z, anthropic } from "@superblocksteam/sdk-api";
 const ANTHROPIC_ID = "8ccd43c8-5340-4ae2-8eee-7cbb3896df53";
 
 // ---------------------------------------------------------------------------
-// Models
+// Models — default used when no override is provided via input
 // ---------------------------------------------------------------------------
-const SUB_AGENT_MODEL = "claude-sonnet-4-6";
+const DEFAULT_MODEL = "claude-sonnet-4-6";
 const SUB_AGENT_MAX_TOKENS = 8000;
 
 // ---------------------------------------------------------------------------
@@ -239,6 +239,7 @@ export default api({
     chunkIndex: z.number(),
     totalChunks: z.number(),
     chunk: ChunkSchema,
+    model: z.string().optional(),
   }),
 
   output: z.object({
@@ -248,7 +249,8 @@ export default api({
     sourceFile: z.string(),
   }),
 
-  async run(ctx, { chunkIndex, totalChunks, chunk }) {
+  async run(ctx, { chunkIndex, totalChunks, chunk, model }) {
+    const useModel = model || DEFAULT_MODEL;
     const content = buildMultimodalContent(chunk);
     const label = `Universal extract: ${sanitizeBraces(chunk.label)} (${chunkIndex + 1}/${totalChunks})`;
 
@@ -257,7 +259,7 @@ export default api({
         method: "POST",
         path: "/v1/messages",
         body: {
-          model: SUB_AGENT_MODEL,
+          model: useModel,
           max_tokens: SUB_AGENT_MAX_TOKENS,
           system: [
             {

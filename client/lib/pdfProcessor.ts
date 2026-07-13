@@ -64,7 +64,7 @@ export interface StructuredTable {
 }
 
 /** Reason a file was excluded from processing */
-export type ExclusionReason = "unsupported_type" | "parse_failure" | "superseded";
+export type ExclusionReason = "unsupported_type" | "parse_failure" | "superseded" | "spreadsheet";
 
 /** A file that was excluded from processing */
 export interface ExcludedFile {

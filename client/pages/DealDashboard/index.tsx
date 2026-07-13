@@ -6,6 +6,7 @@ import { useApiData } from "@/hooks/useApiData.js";
 import { processAllFiles, extractTextFromFile, parseExcelToTables, parseCsvToTable } from "@/lib/pdfProcessor";
 import type { DocumentChunk, ProcessedFileInfo, ExcludedFile, StructuredCell } from "@/lib/pdfProcessor";
 import { MODULE_DEFINITIONS, MODULE_MAP, NUMERIC_MODULES } from "@/lib/moduleConfig";
+import { CHUNK_CHARS, CHUNK_CONCURRENCY, EXTRACTION_MODEL, isSpreadsheetFile } from "@/lib/pipelineConfig";
 import { getExtractionsForModule } from "@/lib/chunkRouting";
 import type { TaggedExtraction } from "@/lib/chunkRouting";
 import type { Document, DocumentTag, DocumentSource } from "@/types/document";
@@ -52,8 +53,7 @@ const SOCIAL_REPUTATION_MAX_ITERATIONS = 9;
 const SOCIAL_REPUTATION_CONFIDENCE_THRESHOLD = 8;
 const SOCIAL_REPUTATION_CONSECUTIVE_THRESHOLD = 2;
 
-// Concurrency for chunk analysis (per module)
-const CHUNK_CONCURRENCY = 5;
+// Concurrency imported from @/lib/pipelineConfig
 
 /** Combined chunk-processing result with coverage tracking */
 interface CoverageResult {
@@ -272,12 +272,16 @@ export default function DealDashboardPage() {
 
       const result = await getDocumentTexts({ dealId });
       const dbDocs = result?.documents;
+      const loadWarnings = (result as any)?.warnings as string[] | undefined;
+      if (loadWarnings && loadWarnings.length > 0) {
+        console.warn("[doc-load]", loadWarnings.join("; "));
+      }
 
       if (!dbDocs || dbDocs.length === 0) {
         return { chunks: [], totalPages: 0, filesProcessed: [], filesExcluded: [] };
       }
 
-      const CHUNK_CHARS = 5000;
+      // CHUNK_CHARS imported from @/lib/pipelineConfig
       const chunks: DocumentChunk[] = [];
       const dbFilesProcessed: ProcessedFileInfo[] = [];
       const dbFilesExcluded: ExcludedFile[] = [];
@@ -286,6 +290,12 @@ export default function DealDashboardPage() {
         // Skip if a fresh upload with the same name already exists
         if (skipFileNames && skipFileNames.has(doc.file_name)) {
           dbFilesExcluded.push({ fileName: doc.file_name, reason: "superseded", detail: "Replaced by a fresh upload" });
+          continue;
+        }
+
+        // Skip spreadsheet files — their data goes through doc_tables/NumericVerify, not LLM extraction
+        if (isSpreadsheetFile(doc.file_name)) {
+          dbFilesExcluded.push({ fileName: doc.file_name, reason: "spreadsheet", detail: "Routed to doc_tables/NumericVerify (no LLM extraction needed)" });
           continue;
         }
 
@@ -626,6 +636,7 @@ export default function DealDashboardPage() {
               chunkIndex: i,
               totalChunks: chunks.length,
               chunk,
+              model: EXTRACTION_MODEL,
             });
             const tag = tagMap[chunk.sourceFile] ?? "other";
             const tagged: TaggedExtraction = {
@@ -1557,30 +1568,27 @@ export default function DealDashboardPage() {
   // Resume interrupted runs on deal load
   // ---------------------------------------------------------------------------
   const resumeChecked = useRef(false);
-  useEffect(() => {
-    if (!dealId || resumeChecked.current || !docsInitialized.current) return;
-    if (docs.length === 0) return; // Wait until docs are loaded
-
-    resumeChecked.current = true;
-
-    (async () => {
-      try {
-        const progress = await getRunProgressApi({ dealId });
-        const runs = progress?.runs ?? [];
-        const inProgressRuns = runs.filter((r) => r.status === "running");
-        if (inProgressRuns.length === 0) return;
-
-        toast.info(`Resuming ${inProgressRuns.length} interrupted run(s)…`);
-        for (const run of inProgressRuns) {
-          // Skip web research and exec summary — those aren't checkpointed yet
-          if (WEB_RESEARCH_MODULES.has(run.moduleId) || run.moduleId === "executive_summary") continue;
-          handleRunModule(run.moduleId, run.runId);
-        }
-      } catch (err) {
-        console.error("Failed to check for interrupted runs:", err);
-      }
-    })();
-  }, [dealId, docs, handleRunModule, getRunProgressApi]);
+  // AUTO-RESUME DISABLED — re-enable once pipeline handles large deals efficiently
+  // useEffect(() => {
+  //   if (!dealId || resumeChecked.current || !docsInitialized.current) return;
+  //   if (docs.length === 0) return;
+  //   resumeChecked.current = true;
+  //   (async () => {
+  //     try {
+  //       const progress = await getRunProgressApi({ dealId });
+  //       const runs = progress?.runs ?? [];
+  //       const inProgressRuns = runs.filter((r) => r.status === "running");
+  //       if (inProgressRuns.length === 0) return;
+  //       toast.info(`Resuming ${inProgressRuns.length} interrupted run(s)…`);
+  //       for (const run of inProgressRuns) {
+  //         if (WEB_RESEARCH_MODULES.has(run.moduleId) || run.moduleId === "executive_summary") continue;
+  //         handleRunModule(run.moduleId, run.runId);
+  //       }
+  //     } catch (err) {
+  //       console.error("Failed to check for interrupted runs:", err);
+  //     }
+  //   })();
+  // }, [dealId, docs, handleRunModule, getRunProgressApi]);
 
   // ---------------------------------------------------------------------------
   // Document management
