@@ -2,6 +2,7 @@ import * as pdfjsLib from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
 import * as XLSX from "xlsx";
 import Papa from "papaparse";
+import { isSpreadsheetFile } from "@/lib/pipelineConfig";
 
 // Use local worker file (required for pdfjs-dist v5 with Vite)
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -64,7 +65,7 @@ export interface StructuredTable {
 }
 
 /** Reason a file was excluded from processing */
-export type ExclusionReason = "unsupported_type" | "parse_failure" | "superseded" | "spreadsheet";
+export type ExclusionReason = "unsupported_type" | "parse_failure" | "superseded" | "spreadsheet" | "too_large";
 
 /** A file that was excluded from processing */
 export interface ExcludedFile {
@@ -745,6 +746,12 @@ export async function processAllFiles(
 
   for (const file of files) {
     const category = getFileCategory(file);
+
+    // Skip spreadsheet files from LLM extraction — routed to doc_tables/NumericVerify instead
+    if (isSpreadsheetFile(file.name)) {
+      filesExcluded.push({ fileName: file.name, reason: "spreadsheet", detail: "Routed to doc_tables/NumericVerify (no LLM extraction needed)" });
+      continue;
+    }
 
     if (category === "pdf") {
       try {

@@ -64,6 +64,8 @@ import UpdateRunStatus from './checkpoints/update-run-status.js';
 import GetRunProgress from './checkpoints/get-run-progress.js';
 import SaveRunCoverage from './checkpoints/save-run-coverage.js';
 import LoadRunCoverage from './checkpoints/load-run-coverage.js';
+import CancelModuleRun from './checkpoints/cancel-module-run.js';
+import CheckRunCancelled from './checkpoints/check-run-cancelled.js';
 
 // Audit (temporary)
 import ReportLanguageAudit from './audit/report-language-audit.js';
@@ -88,6 +90,7 @@ const apis = {
   // Checkpoints
   SaveExtractions, LoadExtractions, SaveMergeCheckpoint, LoadMergeCheckpoints,
   UpdateRunStatus, GetRunProgress, SaveRunCoverage, LoadRunCoverage,
+  CancelModuleRun, CheckRunCancelled,
   // Audit
   ReportLanguageAudit, ExtractReportSnippets, FramingPatternAudit,
 } as const;

@@ -13,6 +13,7 @@ interface ModuleGridProps {
   runningModules: Set<string>;
   analysisProgressMap: Record<string, AnalysisProgress>;
   onRunModule: (moduleId: string) => void;
+  onCancelModule: (moduleId: string) => void;
   onViewHistory: (moduleId: string) => void;
 }
 
@@ -21,6 +22,7 @@ export default function ModuleGrid({
   runningModules,
   analysisProgressMap,
   onRunModule,
+  onCancelModule,
   onViewHistory,
 }: ModuleGridProps) {
   return (
@@ -38,6 +40,7 @@ export default function ModuleGrid({
               isRunning={isRunning}
               analysisProgress={isRunning ? analysisProgressMap[mod.id] : undefined}
               onRun={() => onRunModule(mod.id)}
+              onCancel={() => onCancelModule(mod.id)}
               onViewHistory={() => onViewHistory(mod.id)}
             />
           );

@@ -10,7 +10,7 @@ const ProcessedFileSchema = z.object({
 
 const ExcludedFileSchema = z.object({
   fileName: z.string(),
-  reason: z.enum(["unsupported_type", "parse_failure", "superseded", "spreadsheet"]),
+  reason: z.enum(["unsupported_type", "parse_failure", "superseded", "spreadsheet", "too_large"]),
   detail: z.string().optional(),
 });
 

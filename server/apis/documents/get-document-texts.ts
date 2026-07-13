@@ -29,6 +29,8 @@ const DocTextOutputSchema = z.object({
   document_tag: z.string(),
   document_source: z.string().nullable(),
   parsed_text: z.string().nullable(),
+  /** When parsed_text is null, indicates why: "too_large" | "load_error" | undefined (text exists) */
+  skip_reason: z.enum(["too_large", "load_error"]).nullable().optional(),
 });
 
 export default api({
@@ -88,6 +90,7 @@ export default api({
             document_tag: meta.document_tag,
             document_source: meta.document_source,
             parsed_text: null,
+            skip_reason: "too_large",
           });
           continue;
         }
@@ -144,6 +147,7 @@ export default api({
           document_tag: meta.document_tag,
           document_source: meta.document_source,
           parsed_text: null,
+          skip_reason: "load_error",
         });
       }
     }

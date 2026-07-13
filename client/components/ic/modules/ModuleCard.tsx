@@ -14,6 +14,7 @@ import {
   FileText,
   Users,
   Loader2,
+  XCircle,
 } from "lucide-react";
 import type { ModuleDefinition } from "@/lib/moduleConfig";
 import type { ModuleStatus } from "@/types/module";
@@ -28,6 +29,7 @@ interface ModuleCardProps {
   isRunning?: boolean;
   analysisProgress?: AnalysisProgress;
   onRun: () => void;
+  onCancel: () => void;
   onViewHistory: () => void;
 }
 
@@ -49,6 +51,7 @@ export default function ModuleCard({
   isRunning = false,
   analysisProgress,
   onRun,
+  onCancel,
   onViewHistory,
 }: ModuleCardProps) {
   const [showOutput, setShowOutput] = useState(false);
@@ -108,11 +111,21 @@ export default function ModuleCard({
         {/* Running state with live progress */}
         {isRunning && (
           <div className="py-2 space-y-2">
-            <div className="flex items-center gap-2.5">
-              <Loader2 className="w-4 h-4 text-ic-turquoise animate-spin" />
-              <span className="text-xs text-ic-turquoise font-bold">
-                {analysisProgress?.message ?? "Running analysis…"}
-              </span>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <Loader2 className="w-4 h-4 text-ic-turquoise animate-spin" />
+                <span className="text-xs text-ic-turquoise font-bold">
+                  {analysisProgress?.message ?? "Running analysis…"}
+                </span>
+              </div>
+              <button
+                onClick={onCancel}
+                className="flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-bold text-ic-coral hover:bg-ic-coral/10 transition-colors"
+                title="Cancel this run"
+              >
+                <XCircle className="w-3.5 h-3.5" />
+                Cancel
+              </button>
             </div>
             {analysisProgress?.detail && analysisProgress.detail.phase === "analyzing" && (
               <ProgressBar

@@ -198,6 +198,13 @@ export default function DealDashboardPage() {
   const { run: loadRunCoverageApi } = useApi("LoadRunCoverage");
   const { run: saveDocTablesApi } = useApi("SaveDocTables");
   const { run: numericVerifyApi } = useApi("NumericVerify");
+  const { run: cancelModuleRunApi } = useApi("CancelModuleRun");
+  const { run: checkRunCancelledApi } = useApi("CheckRunCancelled");
+
+  // Cancellation tracking — stores run IDs that have been cancelled
+  const cancelledRunsRef = useRef<Set<string>>(new Set());
+  // Maps moduleId → active runId so we know what to cancel
+  const activeRunIdRef = useRef<Record<string, string>>({});
 
   const completedModules = useMemo(
     () =>
@@ -301,7 +308,14 @@ export default function DealDashboardPage() {
 
         const text = doc.parsed_text;
         if (!text || text.trim().length === 0) {
-          dbFilesExcluded.push({ fileName: doc.file_name, reason: "parse_failure", detail: "Empty or missing parsed text" });
+          // Use skip_reason from API if available, otherwise default to parse_failure
+          const reason = (doc as any).skip_reason === "too_large" ? "too_large" as const
+            : (doc as any).skip_reason === "load_error" ? "parse_failure" as const
+            : "parse_failure" as const;
+          const detail = reason === "too_large"
+            ? "Document exceeds 50MB size limit"
+            : "Empty or missing parsed text";
+          dbFilesExcluded.push({ fileName: doc.file_name, reason, detail });
           continue;
         }
 
@@ -676,6 +690,16 @@ export default function DealDashboardPage() {
         });
 
         await Promise.all(batchPromises);
+
+        // Check for cancellation after each batch
+        if (cancelledRunsRef.current.size > 0) {
+          // If any active run for the current progressLabel (moduleId) was cancelled, abort
+          const activeRunId = activeRunIdRef.current[progressLabel];
+          if (activeRunId && cancelledRunsRef.current.has(activeRunId)) {
+            toast.info("Run cancelled — stopping extraction.");
+            break;
+          }
+        }
 
         // Save batch to DB immediately after each batch completes
         if (dealId && newExtractions.length > 0) {
@@ -1115,8 +1139,19 @@ export default function DealDashboardPage() {
         }
       }
 
+      // Track active run for cancellation
+      if (runId) {
+        activeRunIdRef.current[moduleId] = runId;
+      }
+
       // Phase 1: Get or run universal extractions (shared across all modules)
       const allExtractions = await getOrRunUniversalExtractions(moduleId);
+
+      // Check cancellation after extraction (may have been cancelled during batch loop)
+      if (runId && cancelledRunsRef.current.has(runId)) {
+        return; // Already cleaned up by handleCancelModule
+      }
+
       if (allExtractions.length === 0) {
         toast.error("No processable content found. Check your files.");
         if (runId) updateRunStatusApi({ runId, dealId: dealId!, moduleId, status: "failed" }).catch(() => {});
@@ -1515,6 +1550,12 @@ export default function DealDashboardPage() {
           return next;
         });
         clearModuleProgress(moduleId);
+        // Clean up cancellation tracking
+        const finishedRunId = activeRunIdRef.current[moduleId];
+        if (finishedRunId) {
+          cancelledRunsRef.current.delete(finishedRunId);
+          delete activeRunIdRef.current[moduleId];
+        }
       }
     },
     [
@@ -1527,6 +1568,42 @@ export default function DealDashboardPage() {
       runExecutiveSummary,
       clearModuleProgress,
     ]
+  );
+
+  // ---------------------------------------------------------------------------
+  // Cancel a running module
+  // ---------------------------------------------------------------------------
+
+  const handleCancelModule = useCallback(
+    async (moduleId: string) => {
+      const runId = activeRunIdRef.current[moduleId];
+      if (!runId) {
+        toast.warning("No active run to cancel.");
+        return;
+      }
+
+      // Mark cancelled locally (immediate — extraction loop checks this ref)
+      cancelledRunsRef.current.add(runId);
+
+      // Mark cancelled server-side
+      try {
+        await cancelModuleRunApi({ runId });
+        toast.info(`${MODULE_MAP[moduleId]?.displayName ?? moduleId} cancelled.`);
+      } catch (err) {
+        console.error("Failed to cancel run in DB:", err);
+        toast.error("Cancel request failed — the run may still stop on next batch.");
+      }
+
+      // Clean up local state
+      setRunningModules((prev) => {
+        const next = new Set(prev);
+        next.delete(moduleId);
+        return next;
+      });
+      clearModuleProgress(moduleId);
+      delete activeRunIdRef.current[moduleId];
+    },
+    [cancelModuleRunApi, clearModuleProgress]
   );
 
   // ---------------------------------------------------------------------------
@@ -1954,6 +2031,7 @@ export default function DealDashboardPage() {
             runningModules={runningModules}
             analysisProgressMap={progressMap}
             onRunModule={handleRunModule}
+            onCancelModule={handleCancelModule}
             onViewHistory={setHistoryModule}
           />
 
