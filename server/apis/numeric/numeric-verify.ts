@@ -97,19 +97,26 @@ function cellRef(table: ParsedTable, cell: Cell): string {
 }
 
 function isSubtotalHeader(header: string): boolean {
-  const h = header.toLowerCase();
-  return (
-    h.includes("total") ||
-    h.includes("subtotal") ||
-    h.includes("sum") ||
-    h.includes("net") ||
-    h.includes("grand") ||
-    h.includes("aggregate") ||
-    h.includes("gross profit") ||
-    h.includes("ebitda") ||
-    h.includes("ebit") ||
-    h.includes("noi")
-  );
+  const h = header.toLowerCase().trim();
+  if (!h) return false;
+
+  // Use word-boundary regex to avoid false positives like "Ethernet" matching "net"
+  // or "Networks" matching "net"
+  if (/\b(total|subtotal|sub-total|sum|grand)\b/.test(h)) return true;
+  if (/\b(aggregate)\b/.test(h)) return true;
+  if (/\bgross\s*profit\b/.test(h)) return true;
+  if (/\bebitda\b/.test(h)) return true;
+  // "ebit" but not inside "ebitda" 
+  if (/\bebit\b/.test(h) && !/\bebitda\b/.test(h)) return true;
+  if (/\bnoi\b/.test(h)) return true;
+
+  // "Net" is only a subtotal indicator when it appears with financial context:
+  // "Net income", "Net revenue", "Net profit", "Net of X", or standalone "Net"
+  // NOT: "Net upsell/Downsell", "Net new", "Net adds"
+  if (/\bnet\s+(income|revenue|profit|result|earnings|margin|proceeds|cash|operating|position)\b/.test(h)) return true;
+  if (/^net$/.test(h)) return true; // standalone "Net"
+
+  return false;
 }
 
 function isSensitivityHeader(headers: string[]): boolean {
@@ -503,13 +510,34 @@ function parseTables(rows: z.infer<typeof DocTableSchema>[]): ParsedTable[] {
       continue; // skip malformed table
     }
 
+    // Derive effective row headers: if stored row_headers are mostly empty/placeholder,
+    // scan for the first string-type cell in each row to extract meaningful labels.
+    let effectiveRowHeaders = data.row_headers;
+    const meaningfulCount = data.row_headers.filter(
+      (h) => h !== "" && h !== "x" && h.length > 1
+    ).length;
+    const rowCount = data.row_headers.length;
+
+    if (rowCount > 0 && meaningfulCount / rowCount < 0.3) {
+      // Row headers are mostly empty — derive from cell data
+      effectiveRowHeaders = deriveRowLabelsFromCells(data.row_headers, data.cells, data.col_headers);
+    }
+
+    // Derive effective col headers: if stored col_headers are all generic "Col1", "Col2", etc.,
+    // look for meaningful headers in the first row of string cells.
+    let effectiveColHeaders = data.col_headers;
+    const genericColCount = data.col_headers.filter((h) => /^Col\d+$/i.test(h)).length;
+    if (data.col_headers.length > 0 && genericColCount / data.col_headers.length > 0.7) {
+      effectiveColHeaders = deriveColLabelsFromCells(data.col_headers, data.cells);
+    }
+
     const table: ParsedTable = {
       id: row.id,
       documentId: row.document_id,
       sheetOrPage: row.sheet_or_page,
       caption: row.caption ?? row.sheet_or_page,
-      rowHeaders: data.row_headers,
-      colHeaders: data.col_headers,
+      rowHeaders: effectiveRowHeaders,
+      colHeaders: effectiveColHeaders,
       cells: data.cells,
       grid: new Map(),
     };
@@ -518,6 +546,162 @@ function parseTables(rows: z.infer<typeof DocTableSchema>[]): ParsedTable[] {
   }
 
   return parsed;
+}
+
+/**
+ * Derive meaningful row labels from cell data when stored row_headers are empty.
+ * Strategy: for each row index, find the first string-type cell (leftmost column)
+ * that contains a meaningful label.
+ */
+function deriveRowLabelsFromCells(
+  originalHeaders: string[],
+  cells: Cell[],
+  colHeaders: string[]
+): string[] {
+  const maxRow = originalHeaders.length;
+  const derived: string[] = new Array(maxRow).fill("");
+
+  // Group string cells by row, sorted by column
+  const stringCellsByRow = new Map<number, Cell[]>();
+  for (const cell of cells) {
+    if (cell.r < maxRow && cell.type === "string" && cell.value != null && String(cell.value).trim() !== "") {
+      if (!stringCellsByRow.has(cell.r)) stringCellsByRow.set(cell.r, []);
+      stringCellsByRow.get(cell.r)!.push(cell);
+    }
+  }
+
+  // Determine label column: the leftmost column index that has the most string cells across rows
+  // This handles cases where row labels are in column 0, 1, or 2
+  const colStringFreq = new Map<number, number>();
+  for (const [, rowCells] of stringCellsByRow) {
+    const sorted = rowCells.sort((a, b) => a.c - b.c);
+    // Only consider the first 4 columns as potential label columns
+    for (const cell of sorted.filter((c) => c.c < 4)) {
+      colStringFreq.set(cell.c, (colStringFreq.get(cell.c) ?? 0) + 1);
+    }
+  }
+
+  // Pick the column with the highest frequency of string values as the label column
+  let labelCol = 0;
+  let maxFreq = 0;
+  for (const [col, freq] of colStringFreq) {
+    if (freq > maxFreq) {
+      maxFreq = freq;
+      labelCol = col;
+    }
+  }
+
+  // Extract labels from the identified column
+  for (const cell of cells) {
+    if (cell.c === labelCol && cell.r < maxRow && cell.type === "string" && cell.value != null) {
+      const label = String(cell.value).trim();
+      if (label && label !== "x") {
+        derived[cell.r] = label;
+      }
+    }
+  }
+
+  // For rows that still have no label, fall back to original header
+  for (let i = 0; i < maxRow; i++) {
+    if (!derived[i] && originalHeaders[i] && originalHeaders[i] !== "" && originalHeaders[i] !== "x") {
+      derived[i] = originalHeaders[i];
+    }
+  }
+
+  return derived;
+}
+
+/**
+ * Derive meaningful column labels when stored col_headers are generic (Col1, Col2, ...).
+ * Looks for the first row (row 0) string cells that could be period headers (years, quarters).
+ */
+function deriveColLabelsFromCells(originalHeaders: string[], cells: Cell[]): string[] {
+  const derived = [...originalHeaders];
+
+  // Look at row 0 cells for potential column headers
+  const row0Cells = cells.filter((c) => c.r === 0).sort((a, b) => a.c - b.c);
+
+  for (const cell of row0Cells) {
+    if (cell.c < derived.length && cell.value != null) {
+      const val = String(cell.value).trim();
+      if (val && val !== "x") {
+        derived[cell.c] = val;
+      }
+    }
+  }
+
+  return derived;
+}
+
+/**
+ * Deduplicate and rank discrepancies to produce a focused output.
+ * Groups by (row_label extracted from description, check_type, sheet),
+ * keeps the most severe per group, then caps total.
+ */
+function deduplicateAndRank(
+  discrepancies: Discrepancy[],
+  maxPerGroup: number,
+  maxTotal: number
+): Discrepancy[] {
+  // Extract a grouping key from description — row label is typically in quotes
+  function groupKey(d: Discrepancy): string {
+    // Extract row label from description like: row "Total revenue per MA"
+    const rowMatch = d.description.match(/row "([^"]+)"/);
+    const sheetMatch = d.description.match(/in "([^"]+)"/);
+    const row = rowMatch?.[1] ?? "unknown";
+    const sheet = sheetMatch?.[1] ?? d.sources[0] ?? "unknown";
+    return `${d.check_type}::${sheet}::${row}`;
+  }
+
+  // Severity ranking for sorting
+  function severityRank(s: string): number {
+    switch (s) {
+      case "critical": return 0;
+      case "warning": return 1;
+      case "info": return 2;
+      default: return 3;
+    }
+  }
+
+  // Compute the absolute deviation magnitude for ranking within a group
+  function deviation(d: Discrepancy): number {
+    if (d.expected != null && d.actual != null) {
+      const exp = typeof d.expected === "number" ? d.expected : parseFloat(String(d.expected));
+      const act = typeof d.actual === "number" ? d.actual : parseFloat(String(d.actual));
+      if (!isNaN(exp) && !isNaN(act) && Math.max(Math.abs(exp), Math.abs(act)) > 0) {
+        return Math.abs(exp - act) / Math.max(Math.abs(exp), Math.abs(act));
+      }
+    }
+    return 0;
+  }
+
+  // Group
+  const groups = new Map<string, Discrepancy[]>();
+  for (const d of discrepancies) {
+    const key = groupKey(d);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(d);
+  }
+
+  // Within each group, sort by severity then deviation (largest first), keep top N
+  const kept: Discrepancy[] = [];
+  for (const [, group] of groups) {
+    group.sort((a, b) => {
+      const sevDiff = severityRank(a.severity) - severityRank(b.severity);
+      if (sevDiff !== 0) return sevDiff;
+      return deviation(b) - deviation(a);
+    });
+    kept.push(...group.slice(0, maxPerGroup));
+  }
+
+  // Sort all kept by severity then deviation, cap
+  kept.sort((a, b) => {
+    const sevDiff = severityRank(a.severity) - severityRank(b.severity);
+    if (sevDiff !== 0) return sevDiff;
+    return deviation(b) - deviation(a);
+  });
+
+  return kept.slice(0, maxTotal);
 }
 
 // ---------------------------------------------------------------------------
@@ -716,7 +900,24 @@ export default api({
 
     // Parse into internal format and run all checks
     const tables = parseTables(allRawRows);
-    const { figures, discrepancies } = runAllChecks(tables);
+    const raw = runAllChecks(tables);
+
+    // Deduplicate and cap findings to avoid overwhelming the LLM with noise.
+    // Strategy:
+    // 1. Group discrepancies by (row_label, check_type, sheet)
+    // 2. Keep at most MAX_PER_GROUP per group (the most severe / largest deviation)
+    // 3. Cap total output at MAX_DISCREPANCIES
+    const MAX_PER_GROUP = 3; // max findings per (row_label, check_type, sheet)
+    const MAX_DISCREPANCIES = 100; // total cap for LLM consumption
+    const MAX_FIGURES = 200;
+
+    const discrepancies = deduplicateAndRank(raw.discrepancies, MAX_PER_GROUP, MAX_DISCREPANCIES);
+    const figures = raw.figures.slice(0, MAX_FIGURES);
+
+    ctx.log.info(
+      `NumericVerify: ${raw.figures.length} raw figures, ${raw.discrepancies.length} raw discrepancies → ` +
+      `capped to ${figures.length} figures, ${discrepancies.length} discrepancies`
+    );
 
     // Persist to numeric_reports
     const reportRows = await ctx.integrations.db.query(

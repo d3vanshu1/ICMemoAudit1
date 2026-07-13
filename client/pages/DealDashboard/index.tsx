@@ -200,6 +200,10 @@ export default function DealDashboardPage() {
   const { run: numericVerifyApi } = useApi("NumericVerify");
   const { run: cancelModuleRunApi } = useApi("CancelModuleRun");
   const { run: checkRunCancelledApi } = useApi("CheckRunCancelled");
+  const { run: purgeStaleRunsApi } = useApi("PurgeStaleRuns");
+  const { run: backfillDocTablesApi } = useApi("BackfillDocTablesFromText");
+  const { run: getDocTablesSummaryApi } = useApi("GetDocTablesSummary");
+  const { run: runModulePipelineApi } = useApi("RunModulePipeline");
 
   // Cancellation tracking — stores run IDs that have been cancelled
   const cancelledRunsRef = useRef<Set<string>>(new Set());
@@ -482,26 +486,42 @@ export default function DealDashboardPage() {
             docIdsForVerification.current = [];
           }
         } else {
-          // Fall back to DB doc IDs for spreadsheet files already in the DB.
-          // These may not have doc_tables entries if they were uploaded before
-          // the structured table feature was added, or if the original save failed.
+          // No fresh uploads — check if stored spreadsheet docs have doc_tables,
+          // and backfill if missing. Never assume doc_tables is pre-populated.
           const storedSpreadsheetDocs = docs.filter((d) =>
             /\.(xlsx|xls|xlsm|csv)$/i.test(d.file_name)
           );
-          if (storedSpreadsheetDocs.length > 0) {
-            console.warn(
-              `[doc_tables] ${storedSpreadsheetDocs.length} stored spreadsheet file(s) found but no fresh uploads available for structured table extraction. ` +
-              `NumericVerify will attempt to use existing doc_tables entries if any. ` +
-              `If results are empty, re-upload the Excel/CSV files to populate doc_tables.`
-            );
+          if (storedSpreadsheetDocs.length > 0 && dealId) {
+            try {
+              setModuleProgress(moduleId, { message: "Checking structured table data…" });
+              const summary = await getDocTablesSummaryApi({ dealId });
+              if (summary && summary.totalRows > 0) {
+                // doc_tables already populated — use those document IDs
+                const docIdsWithTables = [...new Set(summary.sheets.map((s) => s.documentId))];
+                docIdsForVerification.current = docIdsWithTables;
+              } else {
+                // No doc_tables — run backfill
+                setModuleProgress(moduleId, { message: "Backfilling structured tables from stored spreadsheets…" });
+                const backfillResult = await backfillDocTablesApi({ dealId });
+                if (backfillResult && backfillResult.totalTables > 0) {
+                  docIdsForVerification.current = backfillResult.perDocument.map((d) => d.documentId);
+                  toast.info(`Backfilled ${backfillResult.totalTables} table(s) from ${backfillResult.perDocument.length} spreadsheet(s).`);
+                } else {
+                  console.warn("[doc_tables] Backfill returned no tables — spreadsheets may lack parseable content.");
+                  docIdsForVerification.current = [];
+                }
+              }
+            } catch (err) {
+              console.error("[doc_tables] Check/backfill failed:", err);
+              docIdsForVerification.current = storedSpreadsheetDocs.map((d) => d.id);
+            }
           }
-          docIdsForVerification.current = storedSpreadsheetDocs.map((d) => d.id);
         }
       }
 
       return combined;
     },
-    [uploadedFiles, docs, setModuleProgress, buildChunksFromDbText, saveDocTablesApi]
+    [uploadedFiles, docs, dealId, setModuleProgress, buildChunksFromDbText, saveDocTablesApi, getDocTablesSummaryApi, backfillDocTablesApi]
   );
 
   // ---------------------------------------------------------------------------
@@ -1495,6 +1515,131 @@ export default function DealDashboardPage() {
   }, [statuses, analyzeChunksParallel, treeMerge, generateReport, saveModuleResult, setModuleProgress]);
 
   // ---------------------------------------------------------------------------
+  // Server-side pipeline: kick-off → poll → format report
+  // The pipeline runs entirely on the server and survives browser tab closure.
+  // ---------------------------------------------------------------------------
+
+  const runServerPipeline = useCallback(
+    async (moduleId: string) => {
+      const displayName = MODULE_MAP[moduleId]?.displayName ?? moduleId;
+
+      // Ensure universal extractions exist on the server
+      // (they were saved during previous client-side runs or bulk-extract)
+      setModuleProgress(moduleId, { message: "Preparing server-side pipeline…" });
+
+      // Numeric verification (client-side, fast — needs doc_tables)
+      let numericReport: { figures: unknown[]; discrepancies: unknown[] } | null = null;
+      if (NUMERIC_MODULES.has(moduleId) && docIdsForVerification.current.length > 0) {
+        try {
+          setModuleProgress(moduleId, { message: "Running deterministic numeric verification…" });
+          const verifyResult = await numericVerifyApi({
+            moduleRunId: crypto.randomUUID(), // placeholder — server creates real run
+            documentIds: docIdsForVerification.current,
+          });
+          if (verifyResult && (verifyResult.figureCount > 0 || verifyResult.discrepancyCount > 0)) {
+            numericReport = {
+              figures: verifyResult.figures ?? [],
+              discrepancies: verifyResult.discrepancies ?? [],
+            };
+          }
+        } catch (err) {
+          console.warn("[NumericVerify] Verification failed, continuing without:", err);
+        }
+      }
+
+      // Kick off server pipeline
+      setModuleProgress(moduleId, { message: "Starting server-side analysis…" });
+
+      let pipelineResult = await runModulePipelineApi({
+        dealId: dealId!,
+        moduleId,
+        runId: undefined,
+        useOpus: useOpus || undefined,
+        numericReport,
+      });
+
+      if (!pipelineResult) throw new Error("Pipeline returned no result");
+
+      const runId = pipelineResult.runId;
+      activeRunIdRef.current[moduleId] = runId;
+
+      // Poll loop: re-invoke pipeline if it returned in_progress (time budget)
+      const POLL_INTERVAL_MS = 5_000;
+      const MAX_POLLS = 120; // 10 min max polling (5s × 120)
+      let pollCount = 0;
+
+      while (pipelineResult.status === "in_progress" && pollCount < MAX_POLLS) {
+        // Update progress UI
+        const prog = pipelineResult.progress;
+        const phase = pipelineResult.phase;
+        if (phase === "analysis") {
+          setModuleProgress(moduleId, {
+            message: `Analyzing chunks (server)… ${prog.analysisCompleted}/${prog.analysisTotal}`,
+            detail: { current: prog.analysisCompleted, total: prog.analysisTotal, phase: "analyzing" },
+          });
+        } else if (phase === "merge") {
+          setModuleProgress(moduleId, {
+            message: `Merging findings (server)… round ${prog.mergeRound}/${prog.mergeTotal}`,
+            detail: { current: prog.mergeRound, total: prog.mergeTotal, phase: "synthesizing" },
+          });
+        }
+
+        // Check cancellation
+        if (cancelledRunsRef.current.has(runId)) return;
+
+        // Wait before re-invoking
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        pollCount++;
+
+        // Check cancellation again after sleep
+        if (cancelledRunsRef.current.has(runId)) return;
+
+        // Re-invoke pipeline to continue from checkpoints
+        pipelineResult = await runModulePipelineApi({
+          dealId: dealId!,
+          moduleId,
+          runId,
+          useOpus: useOpus || undefined,
+          numericReport,
+        });
+
+        if (!pipelineResult) throw new Error("Pipeline continuation returned no result");
+      }
+
+      if (pipelineResult.status === "in_progress") {
+        throw new Error("Pipeline timed out after maximum poll attempts");
+      }
+
+      if (pipelineResult.status === "failed") {
+        throw new Error(`Server pipeline failed during ${pipelineResult.phase}`);
+      }
+
+      // Pipeline completed — format report
+      const finalResult = pipelineResult.result;
+      if (!finalResult) throw new Error("Pipeline completed but no result returned");
+
+      const finalMerge: MergeNode = {
+        text: finalResult.mergedText,
+        executiveHeader: finalResult.executiveHeader,
+        findings: finalResult.findings as MergeNode["findings"],
+      };
+
+      const coverageLine = buildCoverageLine();
+      const totalMergeRounds = pipelineResult.progress.mergeTotal;
+      const fullReport = await generateReport(moduleId, finalMerge, totalMergeRounds + 1, coverageLine, numericReport);
+
+      await saveModuleResult(moduleId, {
+        executiveHeader: finalMerge.executiveHeader,
+        findings: finalMerge.findings,
+        fullReport,
+      });
+
+      toast.success(`${displayName} complete!`);
+    },
+    [dealId, useOpus, numericVerifyApi, runModulePipelineApi, generateReport, saveModuleResult, setModuleProgress]
+  );
+
+  // ---------------------------------------------------------------------------
   // Run single module
   // ---------------------------------------------------------------------------
 
@@ -1525,12 +1670,21 @@ export default function DealDashboardPage() {
         [moduleId]: { message: "Starting…", detail: null, chunkErrors: [] },
       }));
 
+      // Auto-purge stale runs (>30 min stuck as "running") before starting
+      if (dealId) {
+        purgeStaleRunsApi({ dealId, staleMinutes: 30 }).catch(() => {});
+      }
+
       try {
         if (moduleId === "executive_summary") {
           await runExecutiveSummary();
         } else if (WEB_RESEARCH_MODULES.has(moduleId)) {
           await runWebResearchModule(moduleId);
+        } else if (dealId && !resumeRunId) {
+          // Server-side pipeline: survives tab closure, checkpointed
+          await runServerPipeline(moduleId);
         } else {
+          // Fallback: client-side pipeline (for resume or no-deal edge case)
           await runStandardModule(moduleId, resumeRunId);
         }
       } catch (err) {
@@ -1563,7 +1717,9 @@ export default function DealDashboardPage() {
       uploadedFiles,
       docs,
       statuses,
+      dealId,
       runStandardModule,
+      runServerPipeline,
       runWebResearchModule,
       runExecutiveSummary,
       clearModuleProgress,

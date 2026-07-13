@@ -23,9 +23,13 @@ import LoadModuleResults from './modules/load-module-results.js';
 import GetRunHistory from './modules/get-run-history.js';
 import GetRunOutput from './modules/get-run-output.js';
 
+// Server-side pipeline
+import RunModulePipeline from './pipeline/run-module-pipeline.js';
+
 // Database setup
 import SetupSchema from './db/setup-schema.js';
 import RunCheckpointMigration from './db/run-checkpoint-migration.js';
+import CreatePipelineTable from './db/create-pipeline-table.js';
 
 // Deals CRUD
 import ListDeals from './deals/list-deals.js';
@@ -66,6 +70,7 @@ import SaveRunCoverage from './checkpoints/save-run-coverage.js';
 import LoadRunCoverage from './checkpoints/load-run-coverage.js';
 import CancelModuleRun from './checkpoints/cancel-module-run.js';
 import CheckRunCancelled from './checkpoints/check-run-cancelled.js';
+import PurgeStaleRuns from './checkpoints/purge-stale-runs.js';
 
 // Audit (temporary)
 import ReportLanguageAudit from './audit/report-language-audit.js';
@@ -76,8 +81,10 @@ const apis = {
   // AI pipeline
   AnalyzeChunk, UniversalExtract, MergeFindings, FormatReport, WebResearch,
   SaveModuleResult, LoadModuleResults, GetRunHistory, GetRunOutput,
+  // Server-side pipeline
+  RunModulePipeline,
   // DB setup
-  SetupSchema, RunCheckpointMigration,
+  SetupSchema, RunCheckpointMigration, CreatePipelineTable,
   // Deals
   ListDeals, GetDeal, CreateDeal, UpdateDeal, DeleteDeal,
   // Documents
@@ -90,7 +97,7 @@ const apis = {
   // Checkpoints
   SaveExtractions, LoadExtractions, SaveMergeCheckpoint, LoadMergeCheckpoints,
   UpdateRunStatus, GetRunProgress, SaveRunCoverage, LoadRunCoverage,
-  CancelModuleRun, CheckRunCancelled,
+  CancelModuleRun, CheckRunCancelled, PurgeStaleRuns,
   // Audit
   ReportLanguageAudit, ExtractReportSnippets, FramingPatternAudit,
 } as const;

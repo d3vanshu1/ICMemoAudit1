@@ -227,6 +227,28 @@ export default api({
     );
     tablesCreated.push("merge_checkpoints");
 
+    // -----------------------------------------------------------------------
+    // 10. Pipeline analysis checkpoints (server-side pipeline per-chunk results)
+    // -----------------------------------------------------------------------
+    await ctx.integrations.db.execute(
+      `CREATE TABLE IF NOT EXISTS pipeline_analysis (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        run_id          UUID NOT NULL,
+        chunk_index     INT NOT NULL,
+        result_json     JSONB NOT NULL DEFAULT '{}',
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (run_id, chunk_index)
+      )`,
+      undefined,
+      { label: "Create pipeline_analysis table" }
+    );
+    await ctx.integrations.db.execute(
+      `CREATE INDEX IF NOT EXISTS idx_pipeline_analysis_run ON pipeline_analysis(run_id)`,
+      undefined,
+      { label: "Create pipeline_analysis run index" }
+    );
+    tablesCreated.push("pipeline_analysis");
+
     return { success: true, tablesCreated };
   },
 });

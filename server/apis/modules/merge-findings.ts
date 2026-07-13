@@ -35,7 +35,7 @@ const FindingSchema = z.object({
 // ---------------------------------------------------------------------------
 // Merge Prompts — one per module
 // ---------------------------------------------------------------------------
-const MERGE_OUTPUT_STRUCTURE = `
+export const MERGE_OUTPUT_STRUCTURE = `
 
 ## Presentation Rules
 
@@ -65,11 +65,11 @@ A JSON array. Each object has:
 
 {{FINDINGS_REQUIREMENT}}`;
 
-const FINDINGS_RULE_FINAL = `You MUST produce findings. Every analysis has findings — if the documents are adequate, produce info-level findings confirming coverage. If the documents are inadequate, produce critical findings for every gap. An empty findings array is NEVER acceptable.`;
+export const FINDINGS_RULE_FINAL = `You MUST produce findings. Every analysis has findings — if the documents are adequate, produce info-level findings confirming coverage. If the documents are inadequate, produce critical findings for every gap. An empty findings array is NEVER acceptable.`;
 
-const FINDINGS_RULE_INTERMEDIATE = `Produce findings that represent the consolidated output of this merge. If all input sets agree and there is nothing new to flag at this level, you may produce a minimal set of findings rather than manufacturing filler. Focus on consolidation quality, not finding count.`;
+export const FINDINGS_RULE_INTERMEDIATE = `Produce findings that represent the consolidated output of this merge. If all input sets agree and there is nothing new to flag at this level, you may produce a minimal set of findings rather than manufacturing filler. Focus on consolidation quality, not finding count.`;
 
-const MERGE_PROMPTS: Record<string, string> = {
+export const MERGE_PROMPTS: Record<string, string> = {
   omission_audit: `You are a senior investment committee advisor conducting a deal data room omission audit. You are synthesizing analyst findings into a comprehensive assessment of what information is missing from the deal materials.
 
 ## Your Task

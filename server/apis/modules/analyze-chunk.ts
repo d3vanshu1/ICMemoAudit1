@@ -44,7 +44,7 @@ Be precise and dense — every word should carry information:
 - "context" in data_points notes WHY this data point is relevant, in one phrase.
 - "raw_summary": 2-3 dense sentences.`;
 
-const SUB_AGENT_PROMPTS: Record<string, string> = {
+export const SUB_AGENT_PROMPTS: Record<string, string> = {
   // ---- Omission Audit ----
   omission_audit: `You are a senior private equity due diligence analyst. Analyze this document chunk from a deal data room and identify what information is MISSING — data, sections, time periods, benchmarks, or risk factors that should be present but are absent.
 
