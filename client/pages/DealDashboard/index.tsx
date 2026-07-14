@@ -1814,7 +1814,15 @@ export default function DealDashboardPage() {
 
   const handleCancelModule = useCallback(
     async (moduleId: string) => {
-      const runId = activeRunIdRef.current[moduleId];
+      // Try activeRunIdRef first (set during live pipeline execution),
+      // then fall back to the DB-reported running run ID from statuses
+      let runId = activeRunIdRef.current[moduleId];
+      if (!runId) {
+        const dbRun = statuses[moduleId]?.latestRun;
+        if (dbRun?.status === "running") {
+          runId = dbRun.id;
+        }
+      }
       if (!runId) {
         toast.warning("No active run to cancel.");
         return;
@@ -1841,7 +1849,7 @@ export default function DealDashboardPage() {
       clearModuleProgress(moduleId);
       delete activeRunIdRef.current[moduleId];
     },
-    [cancelModuleRunApi, clearModuleProgress]
+    [cancelModuleRunApi, clearModuleProgress, statuses]
   );
 
   // ---------------------------------------------------------------------------
