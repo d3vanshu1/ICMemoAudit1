@@ -9,7 +9,7 @@ import { z } from "@superblocksteam/sdk-api";
 import { buildMergedText, type MergedFinding } from "../modules/build-merged-text.js";
 import { NUMERIC_MODULES } from "../modules/constants.js";
 import { SUB_AGENT_PROMPTS } from "../modules/analyze-chunk.js";
-import { MERGE_PROMPTS, FINDINGS_RULE_FINAL } from "../modules/merge-findings.js";
+import { MERGE_PROMPTS, FINDINGS_RULE_FINAL, FINDINGS_RULE_INTERMEDIATE } from "../modules/merge-findings.js";
 
 // ---------------------------------------------------------------------------
 // Models & Config
@@ -505,6 +505,11 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   const totalMergeRounds = Math.ceil(Math.log(Math.max(nodes.length, 2)) / Math.log(MERGE_GROUP_SIZE));
   let currentRound = 0;
 
+  // Findings accumulator — collects all findings across all rounds.
+  // This is the safety net: even if higher rounds fail to re-extract findings,
+  // we have the full set from intermediate rounds to fall back on.
+  let accumulatedFindings: MergedFinding[] = [];
+
   // Build numeric block for merge
   const hasNumericData = !!(numericReport && NUMERIC_MODULES.has(moduleId) &&
     (numericReport.figures.length > 0 || numericReport.discrepancies.length > 0));
@@ -532,8 +537,8 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     }
   }
 
-  // Prepare merge prompt (substitute numeric and findings blocks)
-  let mergePrompt = rawMergePrompt.replace("{{FINDINGS_REQUIREMENT}}", FINDINGS_RULE_FINAL);
+  // Prepare base merge prompt (numeric blocks are static, findings rule varies per round)
+  let baseMergePrompt = rawMergePrompt;
   if (hasNumericData) {
     const numericVerifInst = `## NUMERIC VERIFICATION — AUTHORITATIVE GROUND TRUTH
 
@@ -542,12 +547,12 @@ A "## Numeric Verification Report" section appears in the input below. It contai
 - Any narrative claim that contradicts a code-verified figure is a CONFIRMED contradiction
 - Cross-doc agreement discrepancies are pre-verified contradictions — report them directly as findings
 - Never re-derive or contradict a code-verified figure based on text reading`;
-    mergePrompt = mergePrompt.replace("{{NUMERIC_VERIFICATION_BLOCK}}", numericVerifInst);
-    mergePrompt = mergePrompt.replace("{{NUMERIC_TASK_STEP_1}}",
+    baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_VERIFICATION_BLOCK}}", numericVerifInst);
+    baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_TASK_STEP_1}}",
       "**Numeric Contradictions First**: Convert every discrepancy from the Numeric Verification Report into a finding.\n");
   } else {
-    mergePrompt = mergePrompt.replace("{{NUMERIC_VERIFICATION_BLOCK}}", "");
-    mergePrompt = mergePrompt.replace("{{NUMERIC_TASK_STEP_1}}", "");
+    baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_VERIFICATION_BLOCK}}", "");
+    baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_TASK_STEP_1}}", "");
   }
 
   while (nodes.length > 1) {
@@ -561,6 +566,11 @@ A "## Numeric Verification Report" section appears in the input below. It contai
     for (let g = 0; g < Math.ceil(nodes.length / MERGE_GROUP_SIZE); g++) {
       groups.push({ idx: g, members: nodes.slice(g * MERGE_GROUP_SIZE, (g + 1) * MERGE_GROUP_SIZE) });
     }
+
+    // Determine if this is the final round (will produce 1 node)
+    const isFinalRound = groups.length === 1 || currentRound === totalMergeRounds;
+    const findingsRule = isFinalRound ? FINDINGS_RULE_FINAL : FINDINGS_RULE_INTERMEDIATE;
+    const mergePrompt = baseMergePrompt.replace("{{FINDINGS_REQUIREMENT}}", findingsRule);
 
     const nextNodes: MergeNode[] = new Array(groups.length);
     const totalGroupsThisRound = groups.length;
@@ -633,6 +643,16 @@ A "## Numeric Verification Report" section appears in the input below. It contai
             } catch { /* parse failure — use empty findings */ }
           }
 
+          // Fallback: if findings are empty (model failed to extract), union input
+          // members' findings — degrades to unconsolidated duplicates rather than
+          // erasing everything below this node in the tree
+          if (findings.length === 0) {
+            findings = group.members.flatMap(m => m.findings ?? []);
+          }
+
+          // Accumulate findings across all rounds so we never lose data
+          accumulatedFindings.push(...findings);
+
           const mergedTextForNode = buildMergedText(executiveHeader, findings);
           const node: MergeNode = { text: mergedTextForNode, executiveHeader, findings, truncated };
 
@@ -666,7 +686,10 @@ A "## Numeric Verification Report" section appears in the input below. It contai
             mergeFirstError = result.reason instanceof Error ? result.reason.message : String(result.reason);
           }
           // Use first member's text as fallback so tree reduction can continue
-          const fallback: MergeNode = { text: group.members[0].text, executiveHeader: "Merge failed", findings: [] };
+          // Preserve input members' findings so they aren't lost
+          const memberFindings = group.members.flatMap(m => m.findings ?? []);
+          accumulatedFindings.push(...memberFindings);
+          const fallback: MergeNode = { text: group.members[0].text, executiveHeader: "Merge failed", findings: memberFindings };
           nextNodes[group.idx] = fallback;
           groupsDone++;
 
@@ -699,6 +722,13 @@ A "## Numeric Verification Report" section appears in the input below. It contai
   // --- Step 5: Complete ---
   const finalNode = nodes[0];
 
+  // If the final node lost its findings (common in deep trees where the last
+  // merge round produces narrative prose but fails to re-extract structured JSON),
+  // fall back to the de-duplicated accumulated set from all rounds.
+  const finalFindings = finalNode.findings && finalNode.findings.length > 0
+    ? finalNode.findings
+    : accumulatedFindings;
+
   // Mark run completed
   await ctx.integrations.db.execute(
     `UPDATE module_runs SET status = 'completed'::module_status, completed_at = now() WHERE id = $1`,
@@ -718,7 +748,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
     },
     result: {
       executiveHeader: finalNode.executiveHeader,
-      findings: finalNode.findings,
+      findings: finalFindings,
       mergedText: finalNode.text,
     },
     failedChunks,
