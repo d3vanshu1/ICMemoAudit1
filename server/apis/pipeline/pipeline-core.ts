@@ -193,16 +193,25 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   }
 
   // --- Step 1: Load universal extractions + route ---
-  const allExtractions = await ctx.integrations.db.query(
-    `SELECT document_id, chunk_index, extraction_json
-     FROM universal_extractions
-     WHERE deal_id = $1
-     ORDER BY document_id, chunk_index
-     LIMIT 1000`,
-    ExtractionRowSchema,
-    [dealId],
-    { label: "Load extractions" }
-  );
+  // Load in pages to stay under the 4MB gRPC response limit
+  const PAGE_SIZE = 200;
+  const allExtractions: Array<{ document_id: string; chunk_index: number; extraction_json: any }> = [];
+  let offset = 0;
+  while (true) {
+    const page = await ctx.integrations.db.query(
+      `SELECT document_id, chunk_index, extraction_json
+       FROM universal_extractions
+       WHERE deal_id = $1
+       ORDER BY document_id, chunk_index
+       LIMIT ${PAGE_SIZE} OFFSET ${offset}`,
+      ExtractionRowSchema,
+      [dealId],
+      { label: `Load extractions (offset ${offset})` }
+    );
+    allExtractions.push(...page);
+    if (page.length < PAGE_SIZE) break;
+    offset += PAGE_SIZE;
+  }
 
   const relevantTags = MODULE_TAG_RELEVANCE[moduleId] ?? new Set(["other"]);
   const routed = allExtractions.filter(row => {
