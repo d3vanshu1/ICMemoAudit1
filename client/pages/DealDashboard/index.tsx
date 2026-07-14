@@ -1015,7 +1015,9 @@ export default function DealDashboardPage() {
         executiveHeader: string;
         findings: MergeNode["findings"];
         fullReport: string;
-      }
+      },
+      /** When provided, attaches output to this existing run (server-pipeline path). */
+      existingRunId?: string
     ) => {
       // Update local state immediately for instant UI feedback
       setStatuses((prev) => ({
@@ -1023,7 +1025,7 @@ export default function DealDashboardPage() {
         [moduleId]: {
           moduleId,
           latestRun: {
-            id: crypto.randomUUID(),
+            id: existingRunId ?? crypto.randomUUID(),
             deal_id: dealId!,
             module_id: moduleId,
             status: "completed",
@@ -1039,7 +1041,7 @@ export default function DealDashboardPage() {
           },
           latestOutput: {
             id: crypto.randomUUID(),
-            module_run_id: crypto.randomUUID(),
+            module_run_id: existingRunId ?? crypto.randomUUID(),
             executive_header: result.executiveHeader,
             findings: result.findings,
             full_report_markdown: result.fullReport,
@@ -1060,6 +1062,7 @@ export default function DealDashboardPage() {
             documentsIncluded: uploadedFiles.length > 0
               ? uploadedFiles.map((f) => f.name)
               : docs.map((d) => d.file_name),
+            runId: existingRunId ?? null,
           });
         } catch (err) {
           console.error("Failed to persist module result:", err);
@@ -1643,7 +1646,7 @@ export default function DealDashboardPage() {
         executiveHeader: finalMerge.executiveHeader,
         findings: finalMerge.findings,
         fullReport,
-      });
+      }, runId);
 
       toast.success(`${displayName} complete!`);
     },

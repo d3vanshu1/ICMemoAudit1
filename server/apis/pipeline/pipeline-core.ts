@@ -115,6 +115,8 @@ export interface PipelineResult {
     mergedText: string;
   } | null;
   failedChunks?: number;
+  truncatedChunks?: number; // analysis chunks where stop_reason was "max_tokens"
+  truncatedMerges?: number; // merge groups where stop_reason was "max_tokens"
   firstError?: string | null;
 }
 
@@ -256,6 +258,8 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   const pendingChunks = routed.filter((_, i) => !analyzedSet.has(i));
   let analysisCompleted = analyzedSet.size;
   let failedChunks = 0;
+  let truncatedChunks = 0;
+  let truncatedMerges = 0;
   let firstError: string | null = null;
 
   // Helper: return in_progress checkpoint
@@ -273,6 +277,8 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     },
     result: null,
     failedChunks,
+    truncatedChunks,
+    truncatedMerges,
     firstError,
   });
 
@@ -312,17 +318,18 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
         const textBlock = result.content.find((c: { type: string }) => c.type === "text");
         const extraction = `### Extraction from: ${chunkLabel}\n\n${textBlock?.text ?? ""}`;
+        const truncated = result.stop_reason === "max_tokens";
 
-        // Save checkpoint
+        // Save checkpoint (flag truncated responses so thin findings are traceable)
         await ctx.integrations.db.execute(
           `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json)
            VALUES ($1, $2, $3::jsonb)
            ON CONFLICT (run_id, chunk_index) DO NOTHING`,
-          [runId, globalIdx, JSON.stringify({ label: chunkLabel, extraction, chunkIndex: globalIdx })],
+          [runId, globalIdx, JSON.stringify({ label: chunkLabel, extraction, chunkIndex: globalIdx, truncated })],
           { label: `Save analysis checkpoint ${globalIdx}` }
         );
 
-        return { label: chunkLabel, extraction, chunkIndex: globalIdx };
+        return { label: chunkLabel, extraction, chunkIndex: globalIdx, truncated };
       })
     );
 
@@ -330,6 +337,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     for (const r of results) {
       if (r.status === "fulfilled") {
         analysisCompleted++;
+        if (r.value.truncated) truncatedChunks++;
       } else {
         failedChunks++;
         if (!firstError) {
@@ -403,6 +411,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     text: string;
     executiveHeader: string;
     findings: MergedFinding[];
+    truncated?: boolean; // true when stop_reason was "max_tokens" — findings may be thin
   }
 
   // Load existing merge checkpoints (paginated: merged_json is the largest per-row payload, ~8-20KB)
@@ -432,6 +441,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
       text: String(data.text ?? ""),
       executiveHeader: String(data.executiveHeader ?? ""),
       findings: (data.findings ?? []) as MergedFinding[],
+      truncated: data.truncated === true,
     });
   }
 
@@ -554,6 +564,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           );
 
           const mergeText = mergeResult.content.find((c: { type: string }) => c.type === "text")?.text ?? "";
+          const truncated = mergeResult.stop_reason === "max_tokens";
           const executiveHeader = extractTag(mergeText, "executive_header") || "Analysis complete.";
           const findingsRaw = extractTag(mergeText, "findings_json");
 
@@ -575,7 +586,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           }
 
           const mergedTextForNode = buildMergedText(executiveHeader, findings);
-          const node: MergeNode = { text: mergedTextForNode, executiveHeader, findings };
+          const node: MergeNode = { text: mergedTextForNode, executiveHeader, findings, truncated };
 
           return { group, node };
         })
@@ -589,6 +600,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
         if (result.status === "fulfilled") {
           const { node } = result.value;
           nextNodes[group.idx] = node;
+          if (node.truncated) truncatedMerges++;
           groupsDone++;
 
           // Save merge checkpoint
@@ -596,7 +608,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
             `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json)
              VALUES ($1, $2, $3, $4::jsonb)
              ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb`,
-            [runId, currentRound, group.idx, JSON.stringify({ text: node.text, executiveHeader: node.executiveHeader, findings: node.findings })],
+            [runId, currentRound, group.idx, JSON.stringify({ text: node.text, executiveHeader: node.executiveHeader, findings: node.findings, truncated: node.truncated ?? false })],
             { label: `Save merge checkpoint R${currentRound}:G${group.idx}` }
           );
         } else {
@@ -662,6 +674,8 @@ A "## Numeric Verification Report" section appears in the input below. It contai
       mergedText: finalNode.text,
     },
     failedChunks,
+    truncatedChunks,
+    truncatedMerges,
     firstError,
   };
 }

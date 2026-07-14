@@ -57,8 +57,10 @@ export default api({
       findings: z.array(z.any()),
       mergedText: z.string(),
     }).nullable(),
-    // Failure diagnostics
+    // Failure & quality diagnostics
     failedChunks: z.number().optional(),
+    truncatedChunks: z.number().optional(),
+    truncatedMerges: z.number().optional(),
     firstError: z.string().nullable().optional(),
   }),
 
