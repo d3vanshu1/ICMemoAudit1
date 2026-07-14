@@ -186,11 +186,57 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     );
     runId = rows[0].run_id;
   } else {
-    // Mark as running (in case it was failed from timeout)
-    await ctx.integrations.db.execute(
-      `UPDATE module_runs SET status = 'running'::module_status WHERE id = $1`,
+    // Only resume runs that are still in 'running' status.
+    // Completed or failed runs must NOT be resurrected — that causes the
+    // "zombie run" bug where terminated runs get re-opened.
+    const currentStatus = await ctx.integrations.db.query(
+      `SELECT status FROM module_runs WHERE id = $1 LIMIT 1`,
+      z.object({ status: z.string() }),
       [runId],
-      { label: "Resume run → running" }
+      { label: "Check run status before resume" }
+    );
+
+    if (currentStatus.length === 0) {
+      throw new Error(`Run ${runId} not found`);
+    }
+
+    const status = currentStatus[0].status;
+    if (status === "completed") {
+      // Already done — return immediately with a synthetic completed result
+      // so the caller knows not to keep polling.
+      return {
+        status: "completed",
+        runId,
+        phase: "done",
+        progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
+        result: null, // Caller should load output from module_outputs
+        failedChunks: 0,
+        truncatedChunks: 0,
+        truncatedMerges: 0,
+        firstError: null,
+      };
+    }
+
+    if (status === "failed" || status === "cancelled") {
+      // Terminated — don't resurrect. Return the terminal state.
+      return {
+        status: "failed",
+        runId,
+        phase: "terminated",
+        progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
+        result: null,
+        failedChunks: 0,
+        truncatedChunks: 0,
+        truncatedMerges: 0,
+        firstError: `Run was already ${status} — cannot resume`,
+      };
+    }
+
+    // Status is 'running' — refresh triggered_at to claim ownership
+    await ctx.integrations.db.execute(
+      `UPDATE module_runs SET triggered_at = now() WHERE id = $1`,
+      [runId],
+      { label: "Resume run — refresh triggered_at" }
     );
   }
 
