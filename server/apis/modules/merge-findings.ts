@@ -245,6 +245,7 @@ export default api({
       figures: z.array(z.any()),
       discrepancies: z.array(z.any()),
     }).nullable().optional(),
+    numericPartial: z.boolean().optional(),
   }),
 
   output: z.object({
@@ -253,7 +254,7 @@ export default api({
     mergedText: z.string(),
   }),
 
-  async run(ctx, { moduleId, batches, roundLabel, isFinalRound, useOpus, numericReport }) {
+  async run(ctx, { moduleId, batches, roundLabel, isFinalRound, useOpus, numericReport, numericPartial }) {
     const rawPrompt = MERGE_PROMPTS[moduleId];
     if (!rawPrompt) {
       throw new Error(`Module "${moduleId}" merge prompt not configured.`);
@@ -278,7 +279,9 @@ A "## Numeric Verification Report" section appears in the input below. It contai
 - Any narrative claim that contradicts a code-verified figure is a CONFIRMED contradiction — cite the exact recomputed_value
 - Cross-doc agreement discrepancies are pre-verified contradictions — report them directly as findings
 - Never re-derive or contradict a code-verified figure based on text reading
-- A figure that appears in the Numeric Verification Report overrides any number read from text`;
+- A figure that appears in the Numeric Verification Report overrides any number read from text${numericPartial ? `
+
+⚠️ PARTIAL COVERAGE WARNING: The numeric verification engine ran out of time and could NOT process all documents/tables in this deal. The figures and discrepancies below are correct for the tables that WERE analyzed, but ABSENCE of a discrepancy does NOT prove correctness — unverified tables may contain additional arithmetic errors. Do NOT claim "code-verified" status for any figure that does not explicitly appear in the Numeric Verification Report below.` : ""}`;
       mergePrompt = mergePrompt.replace("{{NUMERIC_VERIFICATION_BLOCK}}", numericVerificationInstructions);
       mergePrompt = mergePrompt.replace("{{NUMERIC_TASK_STEP_1}}",
         "**Numeric Contradictions First**: Convert every discrepancy from the Numeric Verification Report into a finding. These are confirmed contradictions. Use the recomputed_value as the authoritative figure.\n");

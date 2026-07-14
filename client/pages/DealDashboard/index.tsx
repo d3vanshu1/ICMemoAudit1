@@ -836,7 +836,8 @@ export default function DealDashboardPage() {
       moduleId: string,
       extractions: Array<{ label: string; extraction: string; chunkIndex: number }>,
       moduleRunId?: string,
-      numericReport?: { figures: unknown[]; discrepancies: unknown[] } | null
+      numericReport?: { figures: unknown[]; discrepancies: unknown[] } | null,
+      numericPartial?: boolean
     ) => {
       let nodes: MergeNode[] = extractions.map((e) => ({
         text: e.extraction,
@@ -929,7 +930,7 @@ export default function DealDashboardPage() {
                   roundLabel: `Round ${currentRound}, group ${group.idx + 1}/${groups.length}`,
                   useOpus,
                   isFinalRound: currentRound === totalMergeRounds,
-                  ...(mergeNumericReport ? { numericReport: mergeNumericReport } : {}),
+                  ...(mergeNumericReport ? { numericReport: mergeNumericReport, numericPartial: numericPartial || undefined } : {}),
                 }),
                 `Merge R${currentRound} G${group.idx + 1}`
               );
@@ -1243,6 +1244,7 @@ export default function DealDashboardPage() {
 
       // Phase 3: Numeric Verification (numeric-eligible modules only)
       let numericReport: { figures: unknown[]; discrepancies: unknown[] } | null = null;
+      let numericPartialFlag = false;
       if (NUMERIC_MODULES.has(moduleId) && docIdsForVerification.current.length > 0 && runId) {
         try {
           setModuleProgress(moduleId, { message: "Running deterministic numeric verification…" });
@@ -1255,6 +1257,7 @@ export default function DealDashboardPage() {
               figures: verifyResult.figures ?? [],
               discrepancies: verifyResult.discrepancies ?? [],
             };
+            numericPartialFlag = verifyResult.partial ?? false;
             if (verifyResult.criticalCount > 0) {
               toast.warning(
                 `Numeric verification: ${verifyResult.criticalCount} critical discrepancy(ies) found — will be reported as findings.`
@@ -1278,7 +1281,7 @@ export default function DealDashboardPage() {
       }
 
       // Phase 4: Tree-reduce merge (with checkpoint support)
-      const finalMerge = await treeMerge(moduleId, extractions, runId, numericReport);
+      const finalMerge = await treeMerge(moduleId, extractions, runId, numericReport, numericPartialFlag);
 
       // Phase 3.5: Save coverage manifest and build coverage line
       const coverageLine = buildCoverageLine();
@@ -1570,6 +1573,7 @@ export default function DealDashboardPage() {
 
       // Numeric verification (client-side, fast — needs doc_tables)
       let numericReport: { figures: unknown[]; discrepancies: unknown[] } | null = null;
+      let numericPartial = false;
       if (NUMERIC_MODULES.has(moduleId) && docIdsForVerification.current.length > 0) {
         try {
           setModuleProgress(moduleId, { message: "Running deterministic numeric verification…" });
@@ -1582,6 +1586,7 @@ export default function DealDashboardPage() {
               figures: verifyResult.figures ?? [],
               discrepancies: verifyResult.discrepancies ?? [],
             };
+            numericPartial = verifyResult.partial ?? false;
           }
         } catch (err) {
           console.warn("[NumericVerify] Verification failed, continuing without:", err);
@@ -1605,6 +1610,7 @@ export default function DealDashboardPage() {
               runId: runIdArg ?? undefined,
               useOpus: useOpus || undefined,
               numericReport,
+              numericPartial: numericPartial || undefined,
             });
           } catch (err) {
             const msg = err && typeof err === "object" && "message" in err ? String((err as { message: unknown }).message) : String(err);

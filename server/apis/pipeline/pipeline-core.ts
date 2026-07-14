@@ -41,9 +41,11 @@
  *    to prevent exceeding the 4MB gRPC transport limit. FormatReport uses its own
  *    context-window truncation anyway.
  *
- * 8. FAILED EXTRACTIONS NOT PUSHED TO DB: When `universalExtract` fails after
- *    retries, the extraction is marked `{ failed: true }` locally but NOT saved
- *    to `extraction_checkpoints`. This prevents poisoning the cache for future runs.
+ * 8. FAILED EXTRACTIONS ARE PERSISTED WITH failed:true: When `universalExtract`
+ *    fails after retries, the extraction is saved to `universal_extractions` WITH
+ *    `failed: true` in its `extraction_json`. This enables invariant #2: the cache-
+ *    hit check excludes `failed: true` entries, so failed chunks are retried on the
+ *    next run rather than permanently skipped.
  *
  * 9. SAVE-DOCUMENT parsedText CAP: parsedText is capped at 3.5MB in save-document.ts
  *    to prevent a single INSERT from exceeding the 4MB gRPC limit.
@@ -139,6 +141,7 @@ export interface PipelineInput {
   runId?: string | null;
   useOpus?: boolean | null;
   numericReport?: { figures: any[]; discrepancies: any[] } | null;
+  numericPartial?: boolean;
 }
 
 export interface PipelineProgress {
@@ -213,7 +216,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   const startTime = Date.now();
   const timeRemaining = () => TIME_BUDGET_MS - (Date.now() - startTime);
 
-  const { dealId, moduleId, useOpus, numericReport } = input;
+  const { dealId, moduleId, useOpus, numericReport, numericPartial } = input;
 
   // Look up prompts for this module
   const subAgentPrompt = SUB_AGENT_PROMPTS[moduleId];
@@ -626,7 +629,9 @@ A "## Numeric Verification Report" section appears in the input below. It contai
 - Treat every figure and discrepancy in that section as factual ground truth
 - Any narrative claim that contradicts a code-verified figure is a CONFIRMED contradiction
 - Cross-doc agreement discrepancies are pre-verified contradictions — report them directly as findings
-- Never re-derive or contradict a code-verified figure based on text reading`;
+- Never re-derive or contradict a code-verified figure based on text reading${numericPartial ? `
+
+⚠️ PARTIAL COVERAGE WARNING: The numeric verification engine ran out of time and could NOT process all documents/tables in this deal. The figures and discrepancies below are correct for the tables that WERE analyzed, but ABSENCE of a discrepancy does NOT prove correctness — unverified tables may contain additional arithmetic errors. Do NOT claim "code-verified" status for any figure that does not explicitly appear in the Numeric Verification Report below.` : ""}`;
     baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_VERIFICATION_BLOCK}}", numericVerifInst);
     baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_TASK_STEP_1}}",
       "**Numeric Contradictions First**: Convert every discrepancy from the Numeric Verification Report into a finding.\n");

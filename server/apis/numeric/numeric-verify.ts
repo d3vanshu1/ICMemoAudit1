@@ -728,6 +728,13 @@ export default api({
     criticalCount: z.number(),
     figures: z.array(FigureSchema),
     discrepancies: z.array(DiscrepancySchema),
+    // Partial-completion metadata — callers MUST check `partial` to know if
+    // numeric grounding is incomplete (time-budget exceeded before all docs/tables loaded).
+    partial: z.boolean(),
+    documentsProcessed: z.number(),
+    documentsTotal: z.number(),
+    tablesLoaded: z.number(),
+    tablesTotal: z.number(),
   }),
 
   async run(ctx, { moduleRunId, documentIds }) {
@@ -739,6 +746,11 @@ export default api({
         criticalCount: 0,
         figures: [],
         discrepancies: [],
+        partial: false,
+        documentsProcessed: 0,
+        documentsTotal: 0,
+        tablesLoaded: 0,
+        tablesTotal: 0,
       };
     }
 
@@ -763,12 +775,14 @@ export default api({
 
     const tableIndex: z.infer<typeof TableIdSchema>[] = [];
     let docsProcessed = 0;
+    let timeBudgetExhaustedAtDocPhase = false;
     for (const docId of documentIds) {
       // Time budget check — need at least 30s to load one document's tables
       if (timeRemaining() < 30_000) {
         ctx.log.warn(
           `[NumericVerify] Time budget exhausted after ${docsProcessed}/${documentIds.length} documents — returning partial results`
         );
+        timeBudgetExhaustedAtDocPhase = true;
         break;
       }
       docsProcessed++;
@@ -795,9 +809,11 @@ export default api({
     }
 
     const allRawRows: z.infer<typeof DocTableSchema>[] = [];
+    let timeBudgetExhaustedAtTableLoad = false;
     for (const meta of loadable) {
       if (timeRemaining() < 20_000) {
         ctx.log.warn(`[NumericVerify] Time budget low — loaded ${allRawRows.length}/${loadable.length} tables`);
+        timeBudgetExhaustedAtTableLoad = true;
         break;
       }
       const rows = await ctx.integrations.db.query(
@@ -826,6 +842,7 @@ export default api({
     for (const meta of oversized) {
       if (timeRemaining() < 20_000) {
         ctx.log.warn(`[NumericVerify] Time budget low — skipping remaining oversized tables`);
+        timeBudgetExhaustedAtTableLoad = true;
         break;
       }
       // Extract row headers + total-row cells via JSONB
@@ -917,6 +934,11 @@ export default api({
         criticalCount: 0,
         figures: [],
         discrepancies: [],
+        partial: timeBudgetExhaustedAtDocPhase || timeBudgetExhaustedAtTableLoad,
+        documentsProcessed: docsProcessed,
+        documentsTotal: documentIds.length,
+        tablesLoaded: 0,
+        tablesTotal: tableIndex.length,
       };
     }
 
@@ -957,6 +979,15 @@ export default api({
 
     const numericReportId = reportRows[0]?.id ?? null;
     const criticalCount = discrepancies.filter((d) => d.severity === "critical").length;
+    const isPartial = timeBudgetExhaustedAtDocPhase || timeBudgetExhaustedAtTableLoad;
+
+    if (isPartial) {
+      ctx.log.warn(
+        `[NumericVerify] PARTIAL report: ${docsProcessed}/${documentIds.length} docs, ` +
+        `${allRawRows.length}/${tableIndex.length} tables loaded. ` +
+        `Downstream modules will be explicitly warned that numeric grounding is incomplete.`
+      );
+    }
 
     return {
       numericReportId,
@@ -965,6 +996,11 @@ export default api({
       criticalCount,
       figures,
       discrepancies,
+      partial: isPartial,
+      documentsProcessed: docsProcessed,
+      documentsTotal: documentIds.length,
+      tablesLoaded: allRawRows.length,
+      tablesTotal: tableIndex.length,
     };
   },
 });

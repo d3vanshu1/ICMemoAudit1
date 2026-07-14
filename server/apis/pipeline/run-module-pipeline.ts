@@ -37,6 +37,8 @@ export default api({
       figures: z.array(z.any()),
       discrepancies: z.array(z.any()),
     }).nullable().optional(),
+    // True when NumericVerify hit its time budget and only processed a subset of tables
+    numericPartial: z.boolean().optional(),
   }),
 
   output: z.object({
@@ -71,6 +73,7 @@ export default api({
       runId: input.runId,
       useOpus: input.useOpus,
       numericReport: input.numericReport,
+      numericPartial: input.numericPartial,
     });
   },
 });
