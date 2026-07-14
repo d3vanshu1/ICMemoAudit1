@@ -1743,6 +1743,20 @@ export default function DealDashboardPage() {
       }
 
       setRunningModules((prev) => new Set(prev).add(moduleId));
+      // Also update statuses so the progress poll effect includes this module
+      // in dbRunningIds (otherwise a prior cancel leaves status as "failed")
+      setStatuses((prev) => {
+        const current = prev[moduleId];
+        return {
+          ...prev,
+          [moduleId]: {
+            ...current,
+            latestRun: current?.latestRun
+              ? { ...current.latestRun, status: "running" as const }
+              : { id: "", deal_id: dealId ?? "", module_id: moduleId, status: "running" as const, triggered_at: new Date().toISOString(), completed_at: null, documents_included: [], findings_count: 0, critical_count: 0 },
+          },
+        };
+      });
       setProgressMap((prev) => ({
         ...prev,
         [moduleId]: { message: "Starting…", detail: null, chunkErrors: [] },
