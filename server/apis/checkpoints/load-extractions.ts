@@ -33,6 +33,7 @@ export default api({
           chunkIndex: z.number(),
           sourceFile: z.string(),
           documentTag: z.string(),
+          failed: z.boolean().optional(),
         }),
       })
     ),
@@ -64,6 +65,7 @@ export default api({
           chunkIndex: Number(ext.chunkIndex ?? row.chunk_index),
           sourceFile: String(ext.sourceFile ?? ""),
           documentTag: String(ext.documentTag ?? "other"),
+          ...(ext.failed ? { failed: true } : {}),
         },
       };
     });

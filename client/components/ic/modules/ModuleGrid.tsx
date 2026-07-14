@@ -31,7 +31,7 @@ export default function ModuleGrid({
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
         {MODULE_DEFINITIONS.map((mod) => {
           const status = moduleStatuses[mod.id] ?? null;
-          const isRunning = runningModules.has(mod.id);
+          const isRunning = runningModules.has(mod.id) || status?.latestRun?.status === "running";
           return (
             <ModuleCard
               key={mod.id}

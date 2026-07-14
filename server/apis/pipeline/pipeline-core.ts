@@ -779,6 +779,15 @@ A "## Numeric Verification Report" section appears in the input below. It contai
     { label: "Mark run completed (guarded)" }
   );
 
+  // Cap mergedText to prevent response payload from exceeding platform limits.
+  // FormatReport truncates to its own context window anyway.
+  const MAX_MERGED_TEXT_CHARS = 150_000;
+  let mergedText = finalNode.text;
+  if (mergedText.length > MAX_MERGED_TEXT_CHARS) {
+    console.warn(`[pipeline] mergedText ${mergedText.length} chars exceeds ${MAX_MERGED_TEXT_CHARS} cap — truncating`);
+    mergedText = mergedText.slice(0, MAX_MERGED_TEXT_CHARS) + "\n\n[…truncated for transport — full content available in DB checkpoints]";
+  }
+
   return {
     status: "completed",
     runId,
@@ -792,7 +801,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
     result: {
       executiveHeader: finalNode.executiveHeader,
       findings: finalFindings,
-      mergedText: finalNode.text,
+      mergedText,
     },
     failedChunks,
     truncatedChunks,

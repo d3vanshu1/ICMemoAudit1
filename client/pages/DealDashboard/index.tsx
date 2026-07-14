@@ -625,6 +625,7 @@ export default function DealDashboardPage() {
                 chunkIndex: row.extraction.chunkIndex,
                 sourceFile: row.extraction.sourceFile,
                 documentTag: row.extraction.documentTag as DocumentTag,
+                ...(row.extraction.failed ? { failed: true } : {}),
               },
             };
           }
@@ -1730,7 +1731,7 @@ export default function DealDashboardPage() {
           toast.warning("Run at least one other module first before generating the Executive Summary.");
           return;
         }
-      } else if (uploadedFiles.length === 0 && docs.length === 0) {
+      } else if (!resumeRunId && uploadedFiles.length === 0 && docs.length === 0) {
         toast.warning("Upload at least one document before running analysis.");
         return;
       }
@@ -1764,10 +1765,18 @@ export default function DealDashboardPage() {
           err && typeof err === "object" && "message" in err
             ? String((err as { message: unknown }).message)
             : String(err);
-        const hint = /timeout|timed out|abort|cancel/i.test(message)
-          ? " Try with fewer or smaller files."
-          : "";
+        const isTimeoutOrNetwork = /timeout|timed out|abort|cancel|failed to fetch|network/i.test(message);
         const displayName = MODULE_MAP[moduleId]?.displayName ?? moduleId;
+
+        if (resumeRunId && isTimeoutOrNetwork) {
+          // Server pipeline is still running — just the client call timed out.
+          // Keep the module in "running" state so the progress poll continues to show updates.
+          toast.info(`[${displayName}] Connection to server pipeline timed out. The analysis continues server-side — progress will update automatically.`);
+          pipelinePollingActive.current.delete(moduleId);
+          return; // Don't clean up runningModules — let the progress poll handle it
+        }
+
+        const hint = isTimeoutOrNetwork ? " Try with fewer or smaller files." : "";
         toast.error(`[${displayName}] Analysis failed: ${message}${hint}`);
       } finally {
         setRunningModules((prev) => {
@@ -1928,8 +1937,6 @@ export default function DealDashboardPage() {
         for (const moduleId of dbRunningIds) {
           // Skip if the pipeline polling loop is now providing real-time progress
           if (pipelinePollingActive.current.has(moduleId)) continue;
-          // Skip if no longer in runningModules (completed/cancelled)
-          if (!runningModules.has(moduleId)) continue;
 
           const run = runs.find((r: { moduleId: string; status: string }) => r.moduleId === moduleId && r.status === "running");
           if (!run) {
@@ -1979,7 +1986,7 @@ export default function DealDashboardPage() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [dealId, statuses, runningModules, getRunProgressApi, refetchModules]);
+  }, [dealId, statuses, getRunProgressApi, refetchModules]);
 
   // ---------------------------------------------------------------------------
   // Document management
