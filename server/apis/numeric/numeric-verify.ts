@@ -742,6 +742,11 @@ export default api({
       };
     }
 
+    // Time budget: leave 30s headroom under the 300s platform limit for DB writes.
+    const TIME_BUDGET_MS = 270_000;
+    const startTime = Date.now();
+    const timeRemaining = () => TIME_BUDGET_MS - (Date.now() - startTime);
+
     // Load doc_tables one row at a time to stay under the gRPC 4MB response limit.
     // First get the list of table IDs + data sizes, then fetch each individually
     // (skipping tables whose data exceeds 2.5 MB — those are customer-detail
@@ -757,7 +762,16 @@ export default api({
     });
 
     const tableIndex: z.infer<typeof TableIdSchema>[] = [];
+    let docsProcessed = 0;
     for (const docId of documentIds) {
+      // Time budget check — need at least 30s to load one document's tables
+      if (timeRemaining() < 30_000) {
+        ctx.log.warn(
+          `[NumericVerify] Time budget exhausted after ${docsProcessed}/${documentIds.length} documents — returning partial results`
+        );
+        break;
+      }
+      docsProcessed++;
       const rows = await ctx.integrations.db.query(
         `SELECT id, document_id, sheet_or_page, caption,
                 length(data::text) AS data_length
@@ -782,6 +796,10 @@ export default api({
 
     const allRawRows: z.infer<typeof DocTableSchema>[] = [];
     for (const meta of loadable) {
+      if (timeRemaining() < 20_000) {
+        ctx.log.warn(`[NumericVerify] Time budget low — loaded ${allRawRows.length}/${loadable.length} tables`);
+        break;
+      }
       const rows = await ctx.integrations.db.query(
         `SELECT id, document_id, sheet_or_page, caption, data
          FROM doc_tables
@@ -806,6 +824,10 @@ export default api({
     });
 
     for (const meta of oversized) {
+      if (timeRemaining() < 20_000) {
+        ctx.log.warn(`[NumericVerify] Time budget low — skipping remaining oversized tables`);
+        break;
+      }
       // Extract row headers + total-row cells via JSONB
       const summaryRows = await ctx.integrations.db.query(
         `WITH tbl AS (

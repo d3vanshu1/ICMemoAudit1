@@ -4,6 +4,50 @@
  * This is a plain exported function (not an api() wrapper) that contains the
  * full analysis → merge → complete flow with checkpointing. Both the client-driven
  * API and the background safety-net call this same code path.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * INVARIANTS — assumptions this code depends on. Breaking any one silently breaks
+ * the pipeline or causes data loss. Update this list when adding new assumptions.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * 1. EXIT-WRITE GUARD: The UPDATE at completion uses
+ *    `WHERE id = $1 AND status = 'running'::module_status`
+ *    so a cancelled/purged run can never be resurrected by a late-finishing pipeline.
+ *
+ * 2. CACHE-HIT EXCLUSION OF FAILED ENTRIES: When checking if an extraction
+ *    already exists (cache hit), entries with `failed: true` MUST be excluded.
+ *    Otherwise the pipeline treats a previous failure as "already done" and
+ *    skips the chunk permanently.
+ *
+ * 3. NUMERIC MODULES REQUIRE A PERSISTED REPORT BEFORE BACKGROUND RESUME:
+ *    `contradiction_check` and `model_assumptions_stress` expect a numeric report
+ *    passed as input. The background runner (ResumeStalePipelines) must verify
+ *    `numeric_report_json IS NOT NULL` before claiming; if absent, skip without
+ *    refreshing `triggered_at` (see item 3 fix — pre-claim check).
+ *
+ * 4. PER-CALL TIMEOUT ON LLM REQUESTS: `callAnthropic` uses a 120s per-call
+ *    timeout via Promise.race. Without this, a single hanging Anthropic call
+ *    blocks the entire time budget and the pipeline never returns `in_progress`.
+ *
+ * 5. TIME_BUDGET_MS MUST BE < PLATFORM TIMEOUT − 60s: The platform hard-kills
+ *    APIs at 300s. TIME_BUDGET_MS = 200s ensures we have headroom for checkpoint
+ *    writes, DB overhead, and the final status update.
+ *
+ * 6. MERGE CHECKPOINT DE-DUPLICATION: When resuming, existing checkpoints for a
+ *    given (run_id, round, group_index) are loaded and skipped. The pipeline must
+ *    never re-process a group that already has a checkpoint row.
+ *
+ * 7. RESPONSE PAYLOAD CAP: `mergedText` is capped at 150K chars before returning
+ *    to prevent exceeding the 4MB gRPC transport limit. FormatReport uses its own
+ *    context-window truncation anyway.
+ *
+ * 8. FAILED EXTRACTIONS NOT PUSHED TO DB: When `universalExtract` fails after
+ *    retries, the extraction is marked `{ failed: true }` locally but NOT saved
+ *    to `extraction_checkpoints`. This prevents poisoning the cache for future runs.
+ *
+ * 9. SAVE-DOCUMENT parsedText CAP: parsedText is capped at 3.5MB in save-document.ts
+ *    to prevent a single INSERT from exceeding the 4MB gRPC limit.
+ * ═══════════════════════════════════════════════════════════════════════════════
  */
 import { z } from "@superblocksteam/sdk-api";
 import { buildMergedText, type MergedFinding } from "../modules/build-merged-text.js";

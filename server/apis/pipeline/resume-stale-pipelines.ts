@@ -94,6 +94,32 @@ export default api({
         break;
       }
 
+      // For numeric-dependent modules, check availability BEFORE claiming
+      // so we don't refresh triggered_at on a run we can't process.
+      if (NUMERIC_MODULES_SET.has(target.module_id)) {
+        let numericAvailable = false;
+        try {
+          const hasNumeric = await ctx.integrations.db.query(
+            `SELECT numeric_report_json IS NOT NULL AS has_report FROM module_runs WHERE id = $1`,
+            z.object({ has_report: z.boolean() }),
+            [target.id],
+            { label: "Pre-claim: check if run has persisted numeric report" }
+          );
+          numericAvailable = hasNumeric.length > 0 && hasNumeric[0].has_report;
+        } catch {
+          // Column doesn't exist yet — treat as unavailable
+        }
+
+        if (!numericAvailable) {
+          processed.push({
+            runId: target.id,
+            moduleId: target.module_id,
+            outcome: "skipped: numeric-dependent module without persisted numeric report (not claimed)",
+          });
+          continue;
+        }
+      }
+
       // Atomically claim this run (CAS on triggered_at to prevent double-pickup)
       const claimed = await ctx.integrations.db.query(
         `UPDATE module_runs
@@ -111,34 +137,7 @@ export default api({
         continue;
       }
 
-      // Skip numeric-dependent modules — we can't provide ground truth here.
-      // Leave them for the client (which has the numeric report).
-      if (NUMERIC_MODULES_SET.has(target.module_id)) {
-        // Load the run's numeric_report_json; if null, skip with a note
-        let numericAvailable = false;
-        try {
-          const hasNumeric = await ctx.integrations.db.query(
-            `SELECT numeric_report_json IS NOT NULL AS has_report FROM module_runs WHERE id = $1`,
-            z.object({ has_report: z.boolean() }),
-            [target.id],
-            { label: "Check if run has persisted numeric report" }
-          );
-          numericAvailable = hasNumeric.length > 0 && hasNumeric[0].has_report;
-        } catch {
-          // Column doesn't exist yet — treat as unavailable
-        }
-
-        if (!numericAvailable) {
-          processed.push({
-            runId: target.id,
-            moduleId: target.module_id,
-            outcome: "skipped: numeric-dependent module without persisted numeric report",
-          });
-          continue;
-        }
-      }
-
-      // Load persisted numeric report if available
+      // Load persisted numeric report if available (already confirmed exists for numeric modules)
       let numericReport: any = null;
       try {
         const numericRow = await ctx.integrations.db.query(

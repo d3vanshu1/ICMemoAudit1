@@ -30,6 +30,20 @@ export default api({
   }),
 
   async run(ctx, { dealId, fileName, fileType, documentTag, documentSource, parsedText }) {
+    // Hard cap on parsedText to stay well under the 4MB gRPC payload limit.
+    // A single INSERT row must fit within a single message — leave margin for
+    // other columns, metadata, and encoding overhead.
+    const MAX_PARSED_TEXT_CHARS = 3_500_000; // ~3.5MB in UTF-8
+    let safeParsedText = parsedText;
+    if (safeParsedText && safeParsedText.length > MAX_PARSED_TEXT_CHARS) {
+      ctx.log.warn(
+        `[SaveDocument] parsedText for "${fileName}" is ${safeParsedText.length} chars — truncating to ${MAX_PARSED_TEXT_CHARS}`
+      );
+      safeParsedText =
+        safeParsedText.slice(0, MAX_PARSED_TEXT_CHARS) +
+        "\n\n[…truncated: original text exceeded storage limit]";
+    }
+
     // Also bump the deal's updated_at
     await ctx.integrations.db.execute(
       `UPDATE deals SET updated_at = now() WHERE id = $1`,
@@ -42,7 +56,7 @@ export default api({
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, file_name, uploaded_at`,
       SavedDocSchema,
-      [dealId, fileName, fileType, documentTag, documentSource ?? null, parsedText],
+      [dealId, fileName, fileType, documentTag, documentSource ?? null, safeParsedText],
       { label: "Insert document" }
     );
 

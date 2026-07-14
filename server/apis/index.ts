@@ -31,6 +31,7 @@ import ResumeStalePipelines from './pipeline/resume-stale-pipelines.js';
 import SetupSchema from './db/setup-schema.js';
 import RunCheckpointMigration from './db/run-checkpoint-migration.js';
 import CreatePipelineTable from './db/create-pipeline-table.js';
+import CheckSchemaHealth from './db/check-schema-health.js';
 
 // Deals CRUD
 import ListDeals from './deals/list-deals.js';
@@ -85,7 +86,7 @@ const apis = {
   // Server-side pipeline
   RunModulePipeline, ResumeStalePipelines,
   // DB setup
-  SetupSchema, RunCheckpointMigration, CreatePipelineTable,
+  SetupSchema, RunCheckpointMigration, CreatePipelineTable, CheckSchemaHealth,
   // Deals
   ListDeals, GetDeal, CreateDeal, UpdateDeal, DeleteDeal,
   // Documents
