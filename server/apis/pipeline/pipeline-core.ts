@@ -178,15 +178,30 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // --- Step 0: Create or resume run ---
   let runId: string = input.runId ?? "";
   if (!runId) {
-    const rows = await ctx.integrations.db.query(
-      `INSERT INTO module_runs (deal_id, module_id, status)
-       VALUES ($1, $2, 'running'::module_status)
-       RETURNING id AS run_id`,
-      RunIdSchema,
-      [dealId, moduleId],
-      { label: "Create pipeline run" }
-    );
-    runId = rows[0].run_id;
+    // Try INSERT with numeric_report_json column (requires DB migration);
+    // fall back to INSERT without it if the column doesn't exist yet.
+    let newRunRows: Array<{ run_id: string }>;
+    try {
+      newRunRows = await ctx.integrations.db.query(
+        `INSERT INTO module_runs (deal_id, module_id, status, numeric_report_json)
+         VALUES ($1, $2, 'running'::module_status, $3::jsonb)
+         RETURNING id AS run_id`,
+        RunIdSchema,
+        [dealId, moduleId, numericReport ? JSON.stringify(numericReport) : null],
+        { label: "Create pipeline run (with numeric report)" }
+      );
+    } catch {
+      // Column doesn't exist yet — insert without it
+      newRunRows = await ctx.integrations.db.query(
+        `INSERT INTO module_runs (deal_id, module_id, status)
+         VALUES ($1, $2, 'running'::module_status)
+         RETURNING id AS run_id`,
+        RunIdSchema,
+        [dealId, moduleId],
+        { label: "Create pipeline run (legacy)" }
+      );
+    }
+    runId = newRunRows[0].run_id;
   } else {
     // Only resume runs that are still in 'running' status.
     // Completed or failed runs must NOT be resurrected — that causes the
@@ -235,11 +250,21 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     }
 
     // Status is 'running' — refresh triggered_at to claim ownership
-    await ctx.integrations.db.execute(
-      `UPDATE module_runs SET triggered_at = now() WHERE id = $1`,
-      [runId],
-      { label: "Resume run — refresh triggered_at" }
-    );
+    // Also persist numeric report if provided (so background job can use it)
+    try {
+      await ctx.integrations.db.execute(
+        `UPDATE module_runs SET triggered_at = now(), numeric_report_json = COALESCE($2::jsonb, numeric_report_json) WHERE id = $1`,
+        [runId, numericReport ? JSON.stringify(numericReport) : null],
+        { label: "Resume run — refresh triggered_at + persist numeric report" }
+      );
+    } catch {
+      // numeric_report_json column may not exist yet — fallback to plain heartbeat
+      await ctx.integrations.db.execute(
+        `UPDATE module_runs SET triggered_at = now() WHERE id = $1`,
+        [runId],
+        { label: "Resume run — refresh triggered_at (legacy)" }
+      );
+    }
   }
 
   // --- Step 1: Load universal extractions + route ---
@@ -279,7 +304,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
   if (routed.length === 0) {
     await ctx.integrations.db.execute(
-      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1`,
+      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
       [runId],
       { label: "Mark run failed — no chunks" }
     );
@@ -439,7 +464,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
   if (analysisResults.length === 0) {
     await ctx.integrations.db.execute(
-      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1`,
+      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
       [runId],
       { label: "Mark run failed — no analysis results" }
     );
@@ -530,7 +555,11 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     }
     if (numericReport.figures.length > 0) {
       numericBlock += `### Verified Figures\n`;
-      for (const f of numericReport.figures.slice(0, 30)) {
+      const MAX_FIGURES = 200;
+      if (numericReport.figures.length > MAX_FIGURES) {
+        console.warn(`[pipeline-core] numeric figures capped at ${MAX_FIGURES} (had ${numericReport.figures.length})`);
+      }
+      for (const f of numericReport.figures.slice(0, MAX_FIGURES)) {
         const fig = f as Record<string, unknown>;
         numericBlock += `- **${String(fig.name)}**: ${fig.recomputed_value} @ ${String(fig.source_cell)}\n`;
       }
@@ -725,15 +754,29 @@ A "## Numeric Verification Report" section appears in the input below. It contai
   // If the final node lost its findings (common in deep trees where the last
   // merge round produces narrative prose but fails to re-extract structured JSON),
   // fall back to the de-duplicated accumulated set from all rounds.
-  const finalFindings = finalNode.findings && finalNode.findings.length > 0
-    ? finalNode.findings
-    : accumulatedFindings;
+  let finalFindings: MergedFinding[];
+  if (finalNode.findings && finalNode.findings.length > 0) {
+    finalFindings = finalNode.findings;
+  } else {
+    // Dedup accumulatedFindings by normalized title to remove overlapping entries
+    // from multiple rounds that the fallback path collected
+    const seen = new Set<string>();
+    const deduped: MergedFinding[] = [];
+    for (const f of accumulatedFindings) {
+      const key = (f.title || "").toLowerCase().trim().replace(/\s+/g, " ");
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(f);
+    }
+    finalFindings = deduped;
+  }
 
   // Mark run completed
+  // Guard: only complete if still running — prevents resurrection after purge/cancel
   await ctx.integrations.db.execute(
-    `UPDATE module_runs SET status = 'completed'::module_status, completed_at = now() WHERE id = $1`,
+    `UPDATE module_runs SET status = 'completed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
     [runId],
-    { label: "Mark run completed" }
+    { label: "Mark run completed (guarded)" }
   );
 
   return {

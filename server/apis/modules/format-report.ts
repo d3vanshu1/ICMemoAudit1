@@ -779,7 +779,11 @@ No deterministic numeric verification was performed for this analysis. All figur
 
       if (numericReport.figures.length > 0) {
         numericBlock += `### Verified Figures (code-recomputed)\n`;
-        for (const f of numericReport.figures.slice(0, 30)) {
+        const MAX_FIGURES = 200;
+        if (numericReport.figures.length > MAX_FIGURES) {
+          console.warn(`[format-report] numeric figures capped at ${MAX_FIGURES} (had ${numericReport.figures.length})`);
+        }
+        for (const f of numericReport.figures.slice(0, MAX_FIGURES)) {
           const fig = f as Record<string, unknown>;
           numericBlock += `- **${String(fig.name)}**: ${fig.recomputed_value} @ ${String(fig.source_cell)}`;
           if (fig.formula) numericBlock += ` [=${String(fig.formula)}]`;

@@ -132,6 +132,8 @@ export interface TaggedExtraction {
   chunkIndex: number;
   sourceFile: string;
   documentTag: DocumentTag;
+  /** When true, extraction failed and this entry should not be cached or routed to modules */
+  failed?: boolean;
 }
 
 /**
@@ -142,12 +144,15 @@ export function getExtractionsForModule(
   allExtractions: TaggedExtraction[],
   moduleId: string
 ): TaggedExtraction[] {
+  // Always exclude failed extractions — they contain error placeholders, not document text
+  const valid = allExtractions.filter((ext) => !ext.failed);
+
   const relevantTags = MODULE_TAG_RELEVANCE[moduleId];
 
   // If module has no routing config, send everything (safe default)
-  if (!relevantTags) return allExtractions;
+  if (!relevantTags) return valid;
 
-  return allExtractions.filter((ext) => relevantTags.has(ext.documentTag));
+  return valid.filter((ext) => relevantTags.has(ext.documentTag));
 }
 
 /**

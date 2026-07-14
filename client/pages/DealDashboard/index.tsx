@@ -151,6 +151,29 @@ export default function DealDashboardPage() {
         };
       }
       setStatuses((prev) => ({ ...prev, ...loaded }));
+
+      // If any module has a "running" status in DB, reflect it in the UI immediately
+      // so the card shows progress state even before the resume logic kicks in
+      const dbRunningModuleIds = Object.entries(loaded)
+        .filter(([, s]) => s.latestRun?.status === "running")
+        .map(([id]) => id);
+      if (dbRunningModuleIds.length > 0) {
+        setRunningModules((prev) => {
+          const next = new Set(prev);
+          dbRunningModuleIds.forEach((id) => next.add(id));
+          return next;
+        });
+        // Set a generic progress message until the resume loop provides real data
+        setProgressMap((prev) => {
+          const updated = { ...prev };
+          for (const id of dbRunningModuleIds) {
+            if (!updated[id]) {
+              updated[id] = { message: "Running (server-side)…", detail: null, chunkErrors: [] };
+            }
+          }
+          return updated;
+        });
+      }
     }
   }, [moduleData, dealId]);
 
@@ -621,8 +644,8 @@ export default function DealDashboardPage() {
         const hash = computeContentHash(chunk.text);
         const cacheHit = cachedByKey[`${docId}:${i}`];
 
-        if (cacheHit && cacheHit.contentHash === hash) {
-          // Cache hit — use stored extraction, apply current tag
+        if (cacheHit && cacheHit.contentHash === hash && !cacheHit.extraction.failed) {
+          // Cache hit — use stored extraction, apply current tag (skip failed entries)
           const tag = tagMap[chunk.sourceFile] ?? "other";
           extractions[i] = { ...cacheHit.extraction, documentTag: tag };
         } else {
@@ -666,12 +689,16 @@ export default function DealDashboardPage() {
 
         const batchPromises = batch.map(async ({ index: i, chunk, docId, hash }) => {
           try {
-            const result = await universalExtract({
-              chunkIndex: i,
-              totalChunks: chunks.length,
-              chunk,
-              model: EXTRACTION_MODEL,
-            });
+            // Fix #1: Retry extraction with exponential backoff (same as callAnthropic / withRetry)
+            const result = await withRetry(
+              () => universalExtract({
+                chunkIndex: i,
+                totalChunks: chunks.length,
+                chunk,
+                model: EXTRACTION_MODEL,
+              }),
+              `extract-chunk-${i}`
+            );
             const tag = tagMap[chunk.sourceFile] ?? "other";
             const tagged: TaggedExtraction = {
               label: result?.label ?? chunk.label,
@@ -687,6 +714,8 @@ export default function DealDashboardPage() {
               newExtractions.push({ documentId: docId, chunkIndex: i, contentHash: hash, extraction: tagged });
             }
           } catch (err) {
+            // Fix #2: Mark failed extractions — do NOT bake error text into extraction content
+            // and do NOT cache them as valid (failed: true excluded from cache-hit check)
             const msg =
               err && typeof err === "object" && "message" in err
                 ? String((err as { message: unknown }).message)
@@ -695,10 +724,11 @@ export default function DealDashboardPage() {
             const tag = tagMap[chunk.sourceFile] ?? "other";
             extractions[i] = {
               label: chunk.label,
-              extraction: `### Universal Extraction from: ${chunk.label}\n\n[Error: ${msg}]`,
+              extraction: "",
               chunkIndex: i,
               sourceFile: chunk.sourceFile,
               documentTag: tag,
+              failed: true,
             };
           } finally {
             completed++;
@@ -721,26 +751,33 @@ export default function DealDashboardPage() {
           }
         }
 
-        // Save batch to DB immediately after each batch completes
+        // Fix #3: Await the extraction checkpoint save and surface failures via toast
         if (dealId && newExtractions.length > 0) {
           const batchToSave = newExtractions.splice(0, newExtractions.length);
-          saveExtractionsApi({
-            dealId,
-            extractions: batchToSave.map((e) => ({
-              documentId: e.documentId,
-              chunkIndex: e.chunkIndex,
-              contentHash: e.contentHash,
-              extraction: {
-                label: e.extraction.label,
-                extraction: e.extraction.extraction,
-                chunkIndex: e.extraction.chunkIndex,
-                sourceFile: e.extraction.sourceFile,
-                documentTag: e.extraction.documentTag,
-              },
-            })),
-          }).catch((err: unknown) =>
-            console.error("Failed to save extraction checkpoint:", err)
-          );
+          try {
+            await saveExtractionsApi({
+              dealId,
+              extractions: batchToSave.map((e) => ({
+                documentId: e.documentId,
+                chunkIndex: e.chunkIndex,
+                contentHash: e.contentHash,
+                extraction: {
+                  label: e.extraction.label,
+                  extraction: e.extraction.extraction,
+                  chunkIndex: e.extraction.chunkIndex,
+                  sourceFile: e.extraction.sourceFile,
+                  documentTag: e.extraction.documentTag,
+                  ...(e.extraction.failed ? { failed: true } : {}),
+                },
+              })),
+            });
+          } catch (err: unknown) {
+            const errMsg = err && typeof err === "object" && "message" in err
+              ? String((err as { message: unknown }).message)
+              : String(err);
+            console.error("Failed to save extraction checkpoint:", err);
+            toast.error(`Extraction checkpoint save failed: ${errMsg}`);
+          }
         }
       }
 
@@ -1555,13 +1592,31 @@ export default function DealDashboardPage() {
         message: resumeRunId ? "Resuming server-side analysis…" : "Starting server-side analysis…",
       });
 
-      let pipelineResult = await runModulePipelineApi({
-        dealId: dealId!,
-        moduleId,
-        runId: resumeRunId ?? undefined,
-        useOpus: useOpus || undefined,
-        numericReport,
-      });
+      // Helper: call RunModulePipeline with network-error retries
+      // The server pipeline runs independently — a fetch timeout doesn't mean it failed
+      const callPipelineWithRetry = async (runIdArg?: string) => {
+        const MAX_RETRIES = 3;
+        for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+          try {
+            return await runModulePipelineApi({
+              dealId: dealId!,
+              moduleId,
+              runId: runIdArg ?? undefined,
+              useOpus: useOpus || undefined,
+              numericReport,
+            });
+          } catch (err) {
+            const msg = err && typeof err === "object" && "message" in err ? String((err as { message: unknown }).message) : String(err);
+            const isNetworkError = /failed to fetch|network|timeout|abort|NETWORK_ERROR/i.test(msg);
+            if (!isNetworkError || attempt === MAX_RETRIES - 1) throw err;
+            // Wait before retry — server pipeline keeps running
+            setModuleProgress(moduleId, { message: `Connection interrupted, retrying (${attempt + 2}/${MAX_RETRIES})…` });
+            await new Promise(r => setTimeout(r, 10_000));
+          }
+        }
+      };
+
+      let pipelineResult = await callPipelineWithRetry(resumeRunId);
 
       if (!pipelineResult) throw new Error("Pipeline returned no result");
 
@@ -1572,6 +1627,12 @@ export default function DealDashboardPage() {
       const POLL_INTERVAL_MS = 5_000;
       const MAX_POLLS = 120; // 10 min max polling (5s × 120)
       let pollCount = 0;
+
+      // Mark that the pipeline polling loop is now active — the progress-poll
+      // effect should stop overwriting progress messages for this module
+      if (pipelineResult.status === "in_progress" || pipelineResult.status === "completed") {
+        pipelinePollingActive.current.add(moduleId);
+      }
 
       while (pipelineResult.status === "in_progress" && pollCount < MAX_POLLS) {
         // Update progress UI
@@ -1606,15 +1667,10 @@ export default function DealDashboardPage() {
         if (cancelledRunsRef.current.has(runId)) return;
 
         // Re-invoke pipeline to continue from checkpoints
-        pipelineResult = await runModulePipelineApi({
-          dealId: dealId!,
-          moduleId,
-          runId,
-          useOpus: useOpus || undefined,
-          numericReport,
-        });
+        const pollResult = await callPipelineWithRetry(runId);
 
-        if (!pipelineResult) throw new Error("Pipeline continuation returned no result");
+        if (!pollResult) throw new Error("Pipeline continuation returned no result");
+        pipelineResult = pollResult;
       }
 
       if (pipelineResult.status === "in_progress") {
@@ -1659,7 +1715,8 @@ export default function DealDashboardPage() {
 
   const handleRunModule = useCallback(
     async (moduleId: string, resumeRunId?: string) => {
-      if (runningModules.has(moduleId)) {
+      // Skip the "already running" guard when resuming — we're reconnecting to an existing run
+      if (!resumeRunId && runningModules.has(moduleId)) {
         toast.info("This module is already running.");
         return;
       }
@@ -1719,6 +1776,7 @@ export default function DealDashboardPage() {
           return next;
         });
         clearModuleProgress(moduleId);
+        pipelinePollingActive.current.delete(moduleId);
         // Clean up cancellation tracking
         const finishedRunId = activeRunIdRef.current[moduleId];
         if (finishedRunId) {
@@ -1816,6 +1874,9 @@ export default function DealDashboardPage() {
   // Resume interrupted runs on deal load
   // ---------------------------------------------------------------------------
   const resumeChecked = useRef(false);
+  // Track whether the pipeline polling loop has taken over progress updates
+  const pipelinePollingActive = useRef<Set<string>>(new Set());
+
   useEffect(() => {
     if (!dealId || resumeChecked.current || !docsInitialized.current) return;
     if (docs.length === 0) return;
@@ -1836,6 +1897,89 @@ export default function DealDashboardPage() {
       }
     })();
   }, [dealId, docs, handleRunModule, getRunProgressApi]);
+
+  // ---------------------------------------------------------------------------
+  // Progress polling for DB-running modules
+  // Keeps UI updated independently of the RunModulePipeline call (which can
+  // take up to 200s to return). Polls GetRunProgress every 15s and shows
+  // checkpoint-based progress until the pipeline polling loop takes over.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!dealId) return;
+
+    // Find modules that are marked running from DB but not yet driven by
+    // the pipeline polling loop (which sets real progress messages)
+    const dbRunningIds = Object.entries(statuses)
+      .filter(([, s]) => s.latestRun?.status === "running")
+      .map(([id]) => id);
+
+    if (dbRunningIds.length === 0) return;
+
+    let cancelled = false;
+
+    const pollProgress = async () => {
+      if (cancelled) return;
+      try {
+        const progress = await getRunProgressApi({ dealId });
+        if (cancelled) return;
+        const runs = progress?.runs ?? [];
+        const extractionCount = progress?.extractionCount ?? 0;
+
+        for (const moduleId of dbRunningIds) {
+          // Skip if the pipeline polling loop is now providing real-time progress
+          if (pipelinePollingActive.current.has(moduleId)) continue;
+          // Skip if no longer in runningModules (completed/cancelled)
+          if (!runningModules.has(moduleId)) continue;
+
+          const run = runs.find((r: { moduleId: string; status: string }) => r.moduleId === moduleId && r.status === "running");
+          if (!run) {
+            // Run is no longer "running" in DB — it completed or failed while
+            // we were polling. Refetch module results to get the final output.
+            refetchModules();
+            setRunningModules((prev) => {
+              const next = new Set(prev);
+              next.delete(moduleId);
+              return next;
+            });
+            setProgressMap((prev) => {
+              const updated = { ...prev };
+              delete updated[moduleId];
+              return updated;
+            });
+            continue;
+          }
+
+          // Derive progress from checkpoint counts
+          let message: string;
+          if (run.mergeCheckpointCount > 0) {
+            message = `Merge phase: ${run.mergeCheckpointCount} nodes merged (server-side)…`;
+          } else if (extractionCount > 0) {
+            message = `Analysis phase: processing ${extractionCount} extractions (server-side)…`;
+          } else {
+            message = "Running (server-side)…";
+          }
+
+          setProgressMap((prev) => {
+            // Don't overwrite if the pipeline loop has set a more detailed message
+            if (prev[moduleId]?.detail) return prev;
+            return { ...prev, [moduleId]: { message, detail: null, chunkErrors: [] } };
+          });
+        }
+      } catch {
+        // Silently continue — poll will retry
+      }
+    };
+
+    // Initial poll immediately
+    pollProgress();
+    // Then every 15s
+    const interval = setInterval(pollProgress, 15_000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [dealId, statuses, runningModules, getRunProgressApi, refetchModules]);
 
   // ---------------------------------------------------------------------------
   // Document management
