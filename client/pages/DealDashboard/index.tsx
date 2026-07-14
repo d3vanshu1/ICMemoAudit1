@@ -1846,13 +1846,26 @@ export default function DealDashboardPage() {
         toast.error("Cancel request failed — the run may still stop on next batch.");
       }
 
-      // Clean up local state
+      // Clean up local state — update statuses so isRunning flips immediately
+      // (statuses is used by ModuleGrid's isRunning check and the progress poll effect)
+      setStatuses((prev) => {
+        const current = prev[moduleId];
+        if (!current?.latestRun) return prev;
+        return {
+          ...prev,
+          [moduleId]: {
+            ...current,
+            latestRun: { ...current.latestRun, status: "failed" as const },
+          },
+        };
+      });
       setRunningModules((prev) => {
         const next = new Set(prev);
         next.delete(moduleId);
         return next;
       });
       clearModuleProgress(moduleId);
+      pipelinePollingActive.current.delete(moduleId);
       delete activeRunIdRef.current[moduleId];
     },
     [cancelModuleRunApi, clearModuleProgress, statuses]
