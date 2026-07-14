@@ -193,8 +193,13 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   }
 
   // --- Step 1: Load universal extractions + route ---
-  // Load in pages to stay under the 4MB gRPC response limit
-  const PAGE_SIZE = 200;
+  // Page sizes tuned per table to stay under the 4MB gRPC response limit.
+  // Row payload varies significantly: extraction_json ~2-4KB, result_json ~3-6KB,
+  // merged_json ~8-20KB. These are conservative interim heuristics — a production
+  // fix would measure actual payload size and back off dynamically.
+  const EXTRACTION_PAGE_SIZE = 200;  // ~2-4KB/row → ~400-800KB/page
+  const ANALYSIS_PAGE_SIZE = 150;    // ~3-6KB/row → ~450-900KB/page
+  const MERGE_CP_PAGE_SIZE = 75;     // ~8-20KB/row → ~600KB-1.5MB/page
   const allExtractions: Array<{ document_id: string; chunk_index: number; extraction_json: any }> = [];
   let offset = 0;
   while (true) {
@@ -203,14 +208,14 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
        FROM universal_extractions
        WHERE deal_id = $1
        ORDER BY document_id, chunk_index
-       LIMIT ${PAGE_SIZE} OFFSET ${offset}`,
+       LIMIT ${EXTRACTION_PAGE_SIZE} OFFSET ${offset}`,
       ExtractionRowSchema,
       [dealId],
       { label: `Load extractions (offset ${offset})` }
     );
     allExtractions.push(...page);
-    if (page.length < PAGE_SIZE) break;
-    offset += PAGE_SIZE;
+    if (page.length < EXTRACTION_PAGE_SIZE) break;
+    offset += EXTRACTION_PAGE_SIZE;
   }
 
   const relevantTags = MODULE_TAG_RELEVANCE[moduleId] ?? new Set(["other"]);
@@ -347,15 +352,23 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   }
 
   // --- Step 3: Load all analysis results for merge ---
-  const allAnalysis = await ctx.integrations.db.query(
-    `SELECT chunk_index, result_json FROM pipeline_analysis
-     WHERE run_id = $1
-     ORDER BY chunk_index
-     LIMIT 1000`,
-    z.object({ chunk_index: z.coerce.number(), result_json: z.any() }),
-    [runId],
-    { label: "Load all analysis for merge" }
-  );
+  // Paginated: result_json holds full chunk analysis text (~3-6KB/row)
+  const allAnalysis: Array<{ chunk_index: number; result_json: any }> = [];
+  let analysisOffset = 0;
+  while (true) {
+    const page = await ctx.integrations.db.query(
+      `SELECT chunk_index, result_json FROM pipeline_analysis
+       WHERE run_id = $1
+       ORDER BY chunk_index
+       LIMIT ${ANALYSIS_PAGE_SIZE} OFFSET ${analysisOffset}`,
+      z.object({ chunk_index: z.coerce.number(), result_json: z.any() }),
+      [runId],
+      { label: `Load analysis for merge (offset ${analysisOffset})` }
+    );
+    allAnalysis.push(...page);
+    if (page.length < ANALYSIS_PAGE_SIZE) break;
+    analysisOffset += ANALYSIS_PAGE_SIZE;
+  }
 
   interface AnalysisNode {
     label: string;
@@ -392,16 +405,24 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     findings: MergedFinding[];
   }
 
-  // Load existing merge checkpoints
-  const mergeCheckpoints = await ctx.integrations.db.query(
-    `SELECT tree_level, node_index, merged_json
-     FROM merge_checkpoints
-     WHERE module_run_id = $1
-     ORDER BY tree_level, node_index`,
-    MergeCheckpointSchema,
-    [runId],
-    { label: "Load merge checkpoints" }
-  );
+  // Load existing merge checkpoints (paginated: merged_json is the largest per-row payload, ~8-20KB)
+  const mergeCheckpoints: Array<{ tree_level: number; node_index: number; merged_json: any }> = [];
+  let mcOffset = 0;
+  while (true) {
+    const page = await ctx.integrations.db.query(
+      `SELECT tree_level, node_index, merged_json
+       FROM merge_checkpoints
+       WHERE module_run_id = $1
+       ORDER BY tree_level, node_index
+       LIMIT ${MERGE_CP_PAGE_SIZE} OFFSET ${mcOffset}`,
+      MergeCheckpointSchema,
+      [runId],
+      { label: `Load merge checkpoints (offset ${mcOffset})` }
+    );
+    mergeCheckpoints.push(...page);
+    if (page.length < MERGE_CP_PAGE_SIZE) break;
+    mcOffset += MERGE_CP_PAGE_SIZE;
+  }
 
   const checkpointMap = new Map<string, MergeNode>();
   for (const cp of mergeCheckpoints) {
