@@ -69,6 +69,7 @@ const MERGE_MAX_TOKENS = 8000;
 const ANALYSIS_CONCURRENCY = 15;
 const MERGE_CONCURRENCY = 10;
 const MERGE_GROUP_SIZE = 4;
+const MAX_MERGE_GROUP_FAILURES = 2; // Skip (use fallback) after this many error checkpoints across invocations
 const TIME_BUDGET_MS = 200_000; // 3m20s — gives 100s headroom under platform's 300s API timeout
 // NOTE: Reduced from 250s because paginated extraction loading, checkpoint saves,
 // and DB overhead were pushing total wall-clock past the 300s platform limit.
@@ -604,10 +605,19 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   }
 
   const checkpointMap = new Map<string, MergeNode>();
+  // Tracks persisted failure count per group — stored inside the error checkpoint JSON
+  // itself (not row count, since ON CONFLICT DO UPDATE means only 1 row exists per group).
+  const errorCountMap = new Map<string, number>();
   for (const cp of mergeCheckpoints) {
     const data = typeof cp.merged_json === "string" ? JSON.parse(cp.merged_json) : cp.merged_json;
-    if (data.error) continue;
-    checkpointMap.set(`${cp.tree_level}:${cp.node_index}`, {
+    const cpKey = `${cp.tree_level}:${cp.node_index}`;
+    if (data.error) {
+      // failureCount is persisted in the JSON; default to 1 for legacy entries written before this field existed
+      const count = typeof data.failureCount === "number" ? data.failureCount : 1;
+      errorCountMap.set(cpKey, count);
+      continue;
+    }
+    checkpointMap.set(cpKey, {
       text: String(data.text ?? ""),
       executiveHeader: String(data.executiveHeader ?? ""),
       findings: (data.findings ?? []) as MergedFinding[],
@@ -720,6 +730,25 @@ A "## Numeric Verification Report" section appears in the input below. It contai
         groupsDone++;
         continue;
       }
+      // Skip groups that have failed too many times — use fallback immediately
+      const priorFailures = errorCountMap.get(cpKey) ?? 0;
+      if (priorFailures >= MAX_MERGE_GROUP_FAILURES) {
+        console.warn(`[pipeline] Skipping group R${currentRound}:G${group.idx} — ${priorFailures} prior failures, using fallback`);
+        const memberFindings = group.members.flatMap(m => m.findings ?? []);
+        accumulatedFindings.push(...memberFindings);
+        const fallback: MergeNode = { text: group.members[0].text, executiveHeader: "Merge skipped (repeated failures)", findings: memberFindings };
+        nextNodes[group.idx] = fallback;
+        groupsDone++;
+        // Save a non-error checkpoint so the group is permanently resolved
+        await ctx.integrations.db.execute(
+          `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json)
+           VALUES ($1, $2, $3, $4::jsonb)
+           ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb`,
+          [runId, currentRound, group.idx, JSON.stringify({ text: fallback.text, executiveHeader: fallback.executiveHeader, findings: fallback.findings, skippedAfterFailures: priorFailures })],
+          { label: `Save fallback checkpoint R${currentRound}:G${group.idx} (skipped after ${priorFailures} failures)` }
+        );
+        continue;
+      }
       pendingGroups.push(group);
     }
 
@@ -738,6 +767,11 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           const setBlocks = group.members.map((m, i) => `## Analysis Set ${i + 1}\n\n${m.text}`);
           const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock;
 
+          // 1 retry universally for merge calls. Worst case = 240s (120s × 2 attempts).
+          // This only fires at the start of an invocation where timeRemaining ≈ 200s,
+          // so the 240s worst-case can overshoot — but the timeRemaining() < 60_000 guard
+          // at the batch loop top ensures we exit gracefully before the platform kills us.
+          // Previous default was 3 retries (360s worst-case) which guaranteed platform death.
           const mergeResult = await callAnthropic(
             ctx,
             {
@@ -746,7 +780,8 @@ A "## Numeric Verification Report" section appears in the input below. It contai
               system: [{ type: "text", text: mergePrompt, cache_control: { type: "ephemeral" } }],
               messages: [{ role: "user", content: mergeInput }],
             },
-            `Merge R${currentRound} G${group.idx + 1}/${totalGroupsThisRound}`
+            `Merge R${currentRound} G${group.idx + 1}/${totalGroupsThisRound}`,
+            1 // single retry — keeps worst-case under platform timeout
           );
 
           const mergeText = mergeResult.content.find((c: { type: string }) => c.type === "text")?.text ?? "";
@@ -821,13 +856,19 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           nextNodes[group.idx] = fallback;
           groupsDone++;
 
-          // Save error checkpoint
+          // Save error checkpoint with incremented failureCount.
+          // ON CONFLICT DO UPDATE overwrites the single row — failureCount inside the JSON
+          // is the durable cross-invocation counter (not row count).
+          const errCpKey = `${currentRound}:${group.idx}`;
+          const prevFailures = errorCountMap.get(errCpKey) ?? 0;
+          const newFailureCount = prevFailures + 1;
+          errorCountMap.set(errCpKey, newFailureCount); // update in-memory for same-invocation re-encounters
           await ctx.integrations.db.execute(
             `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json)
              VALUES ($1, $2, $3, $4::jsonb)
              ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb`,
-            [runId, currentRound, group.idx, JSON.stringify({ error: mergeFirstError })],
-            { label: `Save merge error checkpoint R${currentRound}:G${group.idx}` }
+            [runId, currentRound, group.idx, JSON.stringify({ error: mergeFirstError, failureCount: newFailureCount })],
+            { label: `Save merge error checkpoint R${currentRound}:G${group.idx} (failure #${newFailureCount})` }
           );
         }
       }
