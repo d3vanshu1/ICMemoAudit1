@@ -23,7 +23,9 @@ const MERGE_MAX_TOKENS = 8000;
 const ANALYSIS_CONCURRENCY = 15;
 const MERGE_CONCURRENCY = 10;
 const MERGE_GROUP_SIZE = 4;
-const TIME_BUDGET_MS = 250_000; // 4m10s — must stay under platform's 5min app API limit
+const TIME_BUDGET_MS = 200_000; // 3m20s — gives 100s headroom under platform's 300s API timeout
+// NOTE: Reduced from 250s because paginated extraction loading, checkpoint saves,
+// and DB overhead were pushing total wall-clock past the 300s platform limit.
 
 // ---------------------------------------------------------------------------
 // Chunk Routing (server-side mirror of client/lib/chunkRouting.ts)
