@@ -129,18 +129,25 @@ async function callAnthropic(
   ctx: PipelineContext,
   body: Record<string, unknown>,
   label: string,
-  retries = 3
+  retries = 3,
+  perCallTimeoutMs = 120_000 // 2 minutes per LLM call — prevents hanging indefinitely
 ): Promise<z.infer<typeof MessageResponseSchema>> {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      return await ctx.integrations.ai.apiRequest(
-        { method: "POST", path: "/v1/messages", body },
-        { response: MessageResponseSchema },
-        { label }
-      );
+      const result = await Promise.race([
+        ctx.integrations.ai.apiRequest(
+          { method: "POST", path: "/v1/messages", body },
+          { response: MessageResponseSchema },
+          { label }
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`Anthropic call timed out after ${perCallTimeoutMs / 1000}s: ${label}`)), perCallTimeoutMs)
+        ),
+      ]);
+      return result;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const isRetryable = /503|429|rate.?limit|service.?unavailable|overloaded/i.test(msg);
+      const isRetryable = /503|429|rate.?limit|service.?unavailable|overloaded|timed out/i.test(msg);
       if (!isRetryable || attempt === retries) throw err;
       const delay = Math.min(2000 * Math.pow(2, attempt - 1), 15000);
       await new Promise(r => setTimeout(r, delay));
