@@ -767,11 +767,9 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           const setBlocks = group.members.map((m, i) => `## Analysis Set ${i + 1}\n\n${m.text}`);
           const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock;
 
-          // 1 retry universally for merge calls. Worst case = 240s (120s × 2 attempts).
-          // This only fires at the start of an invocation where timeRemaining ≈ 200s,
-          // so the 240s worst-case can overshoot — but the timeRemaining() < 60_000 guard
-          // at the batch loop top ensures we exit gracefully before the platform kills us.
-          // Previous default was 3 retries (360s worst-case) which guaranteed platform death.
+          // retries=1 → exactly 1 attempt, 0 retries (callAnthropic loop: attempt <= retries).
+          // Worst case = ~120s (single timeout). Previous default was retries=3 (3 attempts,
+          // 360s worst-case) which guaranteed platform death on persistent timeouts.
           const mergeResult = await callAnthropic(
             ctx,
             {
@@ -781,7 +779,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
               messages: [{ role: "user", content: mergeInput }],
             },
             `Merge R${currentRound} G${group.idx + 1}/${totalGroupsThisRound}`,
-            1 // single retry — keeps worst-case under platform timeout
+            1 // 1 attempt, 0 retries
           );
 
           const mergeText = mergeResult.content.find((c: { type: string }) => c.type === "text")?.text ?? "";
