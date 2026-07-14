@@ -245,7 +245,7 @@ export default api({
       figures: z.array(z.any()),
       discrepancies: z.array(z.any()),
     }).nullable().optional(),
-    numericPartial: z.boolean().optional(),
+    numericPartial: z.boolean().nullable().optional(),
   }),
 
   output: z.object({

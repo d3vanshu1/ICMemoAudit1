@@ -141,7 +141,7 @@ export interface PipelineInput {
   runId?: string | null;
   useOpus?: boolean | null;
   numericReport?: { figures: any[]; discrepancies: any[] } | null;
-  numericPartial?: boolean;
+  numericPartial?: boolean | null;
 }
 
 export interface PipelineProgress {

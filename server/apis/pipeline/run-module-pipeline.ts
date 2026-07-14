@@ -38,7 +38,7 @@ export default api({
       discrepancies: z.array(z.any()),
     }).nullable().optional(),
     // True when NumericVerify hit its time budget and only processed a subset of tables
-    numericPartial: z.boolean().optional(),
+    numericPartial: z.boolean().nullable().optional(),
   }),
 
   output: z.object({
