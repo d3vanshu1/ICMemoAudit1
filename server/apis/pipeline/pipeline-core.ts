@@ -232,30 +232,73 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // --- Step 0: Create or resume run ---
   let runId: string = input.runId ?? "";
   if (!runId) {
-    // Try INSERT with numeric_report_json column (requires DB migration);
-    // fall back to INSERT without it if the column doesn't exist yet.
+    // Guard: prevent concurrent runs of the same module for the same deal.
+    // Uses a CTE with an existence check so the INSERT only fires when no
+    // running row exists. This is the app-level equivalent of a partial
+    // unique index (deal_id, module_id) WHERE status = 'running'.
     let newRunRows: Array<{ run_id: string }>;
     try {
       newRunRows = await ctx.integrations.db.query(
-        `INSERT INTO module_runs (deal_id, module_id, status, numeric_report_json)
-         VALUES ($1, $2, 'running'::module_status, $3::jsonb)
+        `WITH guard AS (
+           SELECT 1 FROM module_runs
+           WHERE deal_id = $1 AND module_id = $2 AND status = 'running'::module_status
+           LIMIT 1
+         )
+         INSERT INTO module_runs (deal_id, module_id, status, numeric_report_json)
+         SELECT $1, $2, 'running'::module_status, $3::jsonb
+         WHERE NOT EXISTS (SELECT 1 FROM guard)
          RETURNING id AS run_id`,
         RunIdSchema,
         [dealId, moduleId, numericReport ? JSON.stringify(numericReport) : null],
-        { label: "Create pipeline run (with numeric report)" }
+        { label: "Create pipeline run (guarded, with numeric report)" }
       );
     } catch {
-      // Column doesn't exist yet — insert without it
+      // Column doesn't exist yet — insert without numeric_report_json
       newRunRows = await ctx.integrations.db.query(
-        `INSERT INTO module_runs (deal_id, module_id, status)
-         VALUES ($1, $2, 'running'::module_status)
+        `WITH guard AS (
+           SELECT 1 FROM module_runs
+           WHERE deal_id = $1 AND module_id = $2 AND status = 'running'::module_status
+           LIMIT 1
+         )
+         INSERT INTO module_runs (deal_id, module_id, status)
+         SELECT $1, $2, 'running'::module_status
+         WHERE NOT EXISTS (SELECT 1 FROM guard)
          RETURNING id AS run_id`,
         RunIdSchema,
         [dealId, moduleId],
-        { label: "Create pipeline run (legacy)" }
+        { label: "Create pipeline run (guarded, legacy)" }
       );
     }
-    runId = newRunRows[0].run_id;
+
+    if (newRunRows.length === 0) {
+      // A running row already exists — return the existing run's ID so the
+      // caller can poll progress instead of starting a parallel run.
+      const existingRun = await ctx.integrations.db.query(
+        `SELECT id AS run_id FROM module_runs
+         WHERE deal_id = $1 AND module_id = $2 AND status = 'running'::module_status
+         ORDER BY triggered_at DESC LIMIT 1`,
+        RunIdSchema,
+        [dealId, moduleId],
+        { label: "Find existing running run (concurrent guard)" }
+      );
+      if (existingRun.length > 0) {
+        runId = existingRun[0].run_id;
+      } else {
+        // Race: the other run just completed between our check and this query.
+        // Retry with a plain insert (no guard needed anymore).
+        const retryRows = await ctx.integrations.db.query(
+          `INSERT INTO module_runs (deal_id, module_id, status)
+           VALUES ($1, $2, 'running'::module_status)
+           RETURNING id AS run_id`,
+          RunIdSchema,
+          [dealId, moduleId],
+          { label: "Create pipeline run (retry after guard race)" }
+        );
+        runId = retryRows[0].run_id;
+      }
+    } else {
+      runId = newRunRows[0].run_id;
+    }
   } else {
     // Only resume runs that are still in 'running' status.
     // Completed or failed runs must NOT be resurrected — that causes the

@@ -32,6 +32,7 @@ import SetupSchema from './db/setup-schema.js';
 import RunCheckpointMigration from './db/run-checkpoint-migration.js';
 import CreatePipelineTable from './db/create-pipeline-table.js';
 import CheckSchemaHealth from './db/check-schema-health.js';
+import AddConcurrentRunIndex from './db/add-concurrent-run-index.js';
 
 // Deals CRUD
 import ListDeals from './deals/list-deals.js';
@@ -86,7 +87,7 @@ const apis = {
   // Server-side pipeline
   RunModulePipeline, ResumeStalePipelines,
   // DB setup
-  SetupSchema, RunCheckpointMigration, CreatePipelineTable, CheckSchemaHealth,
+  SetupSchema, RunCheckpointMigration, CreatePipelineTable, CheckSchemaHealth, AddConcurrentRunIndex,
   // Deals
   ListDeals, GetDeal, CreateDeal, UpdateDeal, DeleteDeal,
   // Documents

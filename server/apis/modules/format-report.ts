@@ -815,36 +815,73 @@ No deterministic numeric verification was performed for this analysis. All figur
       `**REMINDER: Your report must contain exactly ${sanitizedFindings.length} fully detailed write-ups — one per finding.**\n\n` +
       `${findingsJson}${sanitizeBraces(numericBlock)}`;
 
-    const result = await ctx.integrations.ai.apiRequest(
-      {
-        method: "POST",
-        path: "/v1/messages",
-        body: {
-          model: useOpus ? OPUS_MODEL : SONNET_MODEL,
-          max_tokens: REPORT_MAX_TOKENS,
-          system: [
-            {
-              type: "text",
-              text: reportPrompt,
-              cache_control: { type: "ephemeral" },
-            },
-          ],
-          messages: [{ role: "user", content: reportInput }],
-        },
-      },
-      { response: MessageResponseSchema },
-      { label: "Coordinator Step 2: format detailed report" }
-    );
+    // --- Report generation with continuation on truncation ---
+    const MAX_CONTINUATIONS = 2;
+    const selectedModel = useOpus ? OPUS_MODEL : SONNET_MODEL;
+    let accumulated = "";
+    let truncated = false;
 
-    const textBlock = result.content.find(
-      (c: { type: string }) => c.type === "text"
-    );
-    if (!textBlock || textBlock.type !== "text") {
-      throw new Error("No text content in report response");
+    const messages: Array<{ role: string; content: string }> = [
+      { role: "user", content: reportInput },
+    ];
+
+    for (let attempt = 0; attempt <= MAX_CONTINUATIONS; attempt++) {
+      const result = await ctx.integrations.ai.apiRequest(
+        {
+          method: "POST",
+          path: "/v1/messages",
+          body: {
+            model: selectedModel,
+            max_tokens: REPORT_MAX_TOKENS,
+            system: [
+              {
+                type: "text",
+                text: reportPrompt,
+                cache_control: { type: "ephemeral" },
+              },
+            ],
+            messages,
+          },
+        },
+        { response: MessageResponseSchema },
+        { label: `Format report${attempt > 0 ? ` (continuation ${attempt})` : ""}` }
+      );
+
+      const textBlock = result.content.find(
+        (c: { type: string }) => c.type === "text"
+      );
+      if (!textBlock || textBlock.type !== "text") {
+        if (accumulated.length > 0) break; // partial is better than nothing
+        throw new Error("No text content in report response");
+      }
+
+      accumulated += textBlock.text;
+
+      if (result.stop_reason !== "max_tokens") {
+        // Completed normally
+        truncated = false;
+        break;
+      }
+
+      // Hit token limit — continue from where we left off
+      truncated = true;
+      if (attempt < MAX_CONTINUATIONS) {
+        // Add assistant's partial response + user continuation prompt
+        messages.push({ role: "assistant", content: accumulated });
+        messages.push({
+          role: "user",
+          content: "Your response was cut off. Continue the report EXACTLY where you left off — do not repeat any text already written. Pick up mid-sentence if necessary.",
+        });
+      }
+    }
+
+    // If still truncated after all continuations, append a visible notice
+    if (truncated) {
+      accumulated += `\n\n---\n\n> ⚠️ **Report Truncated** — This report exceeded the maximum generation length (${REPORT_MAX_TOKENS} tokens × ${MAX_CONTINUATIONS + 1} passes). Some findings at the end may be missing or incomplete. Re-run with fewer documents or contact support.`;
     }
 
     // Prepend coverage line to the final report output
-    let fullReport = textBlock.text;
+    let fullReport = accumulated;
     if (coverageLine) {
       fullReport = `> **Coverage:** ${coverageLine}\n\n${fullReport}`;
     }
