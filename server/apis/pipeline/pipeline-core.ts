@@ -381,7 +381,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // Backs up original text to parsed_text_backups table before any writes.
   const cleanResult = await runCleanParsedTextPhase(ctx.integrations.db, {
     dealId,
-    dryRun: true, // GATED: flip to false only after sheet-count verification confirms no extraction gaps
+    dryRun: false,
   });
   if (cleanResult.corruptedCount > 0) {
     console.log(`[Step 0.4] Cleaned ${cleanResult.corruptedCount} document(s), saved ${(cleanResult.totalBytesSaved / 1_000_000).toFixed(1)}MB`);
