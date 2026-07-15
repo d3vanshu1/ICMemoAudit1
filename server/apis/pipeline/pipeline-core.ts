@@ -913,7 +913,9 @@ A "## Numeric Verification Report" section appears in the input below. It contai
   // LLM-generated findings that claim summation or reconciliation discrepancies are
   // unreliable (ad-hoc arithmetic on raw text). Suppress them entirely.
   // Only findings grounded in NumericVerify's deterministic output are trustworthy.
+  // Validated against 6 acceptance cases: see pipeline/__tests__/reconciliation-filter.test.ts
   const FABRICATED_ARITHMETIC_PATTERNS = [
+    // Original patterns (catch "Fails to Reconcile...sum", "Do Not Reconcile...sum", etc.)
     /\breconcil(?:e|iation|ing)\b.*\b(?:sum|total|add|subtotal)\b/i,
     /\b(?:sum|total|add(?:s|ing)?|subtotal)\b.*\b(?:does not|doesn't|don't|do not)\s+(?:match|equal|reconcile|agree)\b/i,
     /\b(?:adds? up to|sums? to|totals? to)\b.*\b(?:but|however|yet|whereas)\b/i,
@@ -921,6 +923,12 @@ A "## Numeric Verification Report" section appears in the input below. It contai
     /\barithmetic(?:al)?\s+(?:error|discrepancy|mismatch|inconsistency)\b/i,
     /\bmanual(?:ly)?\s+(?:sum|add|calculat|total|reconcil)/i,
     /\bcolumn[s]?\s+(?:sum|total|add)\b.*\b(?:variance|differ|mismatch|disagree)/i,
+    // Second-pass patterns (catch "Irreconcilable", "cannot be reconciled", phrasing variants)
+    /\birreconcil/i,
+    /\bcannot\s+be\s+reconciled\b/i,
+    /\bfails?\s+to\s+reconcile\b/i,
+    /\bsum(?:s|ming)?\s+to\b.*\b(?:gap|shortfall|unexplained)\b/i,
+    /\bdo\s+not\s+reconcile\b/i,
   ];
 
   const preSuppressCount = finalFindings.length;
