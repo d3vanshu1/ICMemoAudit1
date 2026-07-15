@@ -59,6 +59,8 @@ import { MERGE_PROMPTS, FINDINGS_RULE_FINAL, FINDINGS_RULE_INTERMEDIATE } from "
 import { runPostCompletionAudit } from "./post-completion-audit.js";
 import { runExtractionPhase } from "./extraction-phase.js";
 import { runDocTablesPhase } from "./doc-tables-phase.js";
+import { runNumericVerifyInline } from "./numeric-verify-inline.js";
+import type { NumericVerifyResult } from "./numeric-verify-inline.js";
 
 // ---------------------------------------------------------------------------
 // Models & Config
@@ -220,7 +222,11 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   const startTime = Date.now();
   const timeRemaining = () => TIME_BUDGET_MS - (Date.now() - startTime);
 
-  const { dealId, moduleId, useOpus, numericReport, numericPartial } = input;
+  const { dealId, moduleId, useOpus } = input;
+  // numericReport and numericPartial are mutable — they get recomputed by Step 0.7
+  // (inline numeric verification) after doc_tables backfill, closing the two-run bug.
+  let numericReport = input.numericReport ?? null;
+  let numericPartial = input.numericPartial ?? null;
 
   // Look up prompts for this module
   const subAgentPrompt = SUB_AGENT_PROMPTS[moduleId];
@@ -396,6 +402,52 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   const docTablesResult = await runDocTablesPhase(ctx, dealId);
   if (docTablesResult.needed && docTablesResult.warnings.length > 0) {
     console.log(`[DocTablesPhase] Warnings: ${docTablesResult.warnings.join("; ")}`);
+  }
+
+  // --- Step 0.7: Inline numeric verification (recomputes after backfill) ---
+  // For numeric modules, run the arithmetic engine NOW — after doc_tables is
+  // guaranteed populated — and use the fresh result regardless of what the
+  // client may have passed in. This closes the two-run bug where client-side
+  // NumericVerify ran before backfill and found nothing.
+  if (NUMERIC_MODULES.has(moduleId)) {
+    // Time budget for numeric: give it up to 60s from whatever remains,
+    // but never less than 15s (at which point it's not worth starting).
+    const numericTimeBudget = Math.min(60_000, Math.max(0, timeRemaining() - 60_000));
+    if (numericTimeBudget >= 15_000) {
+      try {
+        const inlineResult: NumericVerifyResult = await runNumericVerifyInline(
+          ctx.integrations.db,
+          dealId,
+          numericTimeBudget
+        );
+
+        // Replace the input-provided report with the fresh server-side result
+        if (inlineResult.figures.length > 0 || inlineResult.discrepancies.length > 0) {
+          numericReport = {
+            figures: inlineResult.figures,
+            discrepancies: inlineResult.discrepancies,
+          };
+          numericPartial = inlineResult.partial;
+          console.log(
+            `[NumericInline] Replaced client report: ${inlineResult.figures.length} figures, ` +
+            `${inlineResult.discrepancies.length} discrepancies, partial=${inlineResult.partial}`
+          );
+        } else if (!numericReport) {
+          // No data from inline either — ensure downstream knows
+          numericReport = null;
+          numericPartial = null;
+          console.log(`[NumericInline] No numeric data found for this deal.`);
+        }
+        // If inline returned nothing but client had data, keep client data
+        // (edge case: doc_tables exist but are all oversized/unparseable)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[NumericInline] Failed (non-fatal, keeping client report if any): ${msg}`);
+        // Keep whatever numericReport the client provided as fallback
+      }
+    } else {
+      console.log(`[NumericInline] Skipped — insufficient time budget (${numericTimeBudget}ms remaining)`);
+    }
   }
 
   // --- Step 1: Load universal extractions + route ---
