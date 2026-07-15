@@ -25,14 +25,23 @@ export default api({
   }),
 
   async run(ctx, { dealId, runId }) {
-    // 1. Mark the stalled run as failed
-    await ctx.integrations.db.execute(
+    // 1. Mark the stalled run as failed — check affected row count
+    const updateResult = await ctx.integrations.db.execute(
       `UPDATE module_runs
        SET status = 'failed', completed_at = now()
        WHERE id = $1 AND status = 'running'`,
       [runId],
       { label: "Kill stalled run" }
     );
+
+    // If the UPDATE didn't match any row, the runId is wrong/stale or already
+    // completed — refuse to purge extraction data to avoid silent data loss.
+    if (updateResult.rowCount === 0) {
+      return {
+        runReset: false,
+        extractionsPurged: 0,
+      };
+    }
 
     // 2. Count extractions before purge
     const countRows = await ctx.integrations.db.query(

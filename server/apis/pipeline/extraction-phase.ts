@@ -400,10 +400,27 @@ export async function runExtractionPhase(
     }
 
     const batch = allChunks.slice(i, i + EXTRACTION_CONCURRENCY);
-    await processBatch(batch);
 
-    // Post-batch check: if any call inside the batch detected budget exhaustion,
-    // return partial immediately rather than starting another batch.
+    // Race the batch against remaining budget. Even if individual calls aren't
+    // erroring (just slow first attempts running toward 120s), this ensures we
+    // abandon the batch once the pipeline's time budget is exhausted rather than
+    // waiting the full duration of the slowest in-flight call.
+    const remainingMs = EXTRACTION_TIME_BUDGET_MS - (Date.now() - startTime);
+    const deadlineTimer = new Promise<"DEADLINE">((resolve) =>
+      setTimeout(() => resolve("DEADLINE"), remainingMs)
+    );
+
+    const raceResult = await Promise.race([
+      processBatch(batch).then(() => "BATCH_DONE" as const),
+      deadlineTimer,
+    ]);
+
+    if (raceResult === "DEADLINE") {
+      budgetExhausted = true;
+    }
+
+    // Post-batch check: if any call inside the batch detected budget exhaustion
+    // OR the deadline timer fired, return partial immediately.
     if (budgetExhausted) {
       return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
     }
