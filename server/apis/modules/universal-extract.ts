@@ -1,4 +1,9 @@
 import { api, z, anthropic } from "@superblocksteam/sdk-api";
+import {
+  UNIVERSAL_EXTRACTION_PROMPT,
+  injectClaimIds,
+  sanitizeBraces,
+} from "../pipeline/extraction-prompt.js";
 
 // ---------------------------------------------------------------------------
 // Integration
@@ -28,146 +33,9 @@ const ChunkSchema = z.object({
   pageImages: z.array(PageImageSchema),
 });
 
-// ---------------------------------------------------------------------------
-// Universal Extraction Prompt
-//
-// This single prompt consolidates the extraction needs of ALL 8 analysis
-// modules. Each chunk is processed ONCE instead of 8 times. The per-module
-// merge prompts then receive the relevant sections of this extraction.
-// ---------------------------------------------------------------------------
-const UNIVERSAL_EXTRACTION_PROMPT = `You are a senior private equity due diligence analyst performing a comprehensive extraction on a document chunk from a deal data room. You must extract ALL information relevant to investment committee (IC) review in a single pass.
+// Prompt imported from shared module: ../pipeline/extraction-prompt.ts
 
-You will receive BOTH page images AND extracted text. Use both for thorough analysis.
-
-## Extraction Framework
-
-Extract everything relevant across ALL of the following dimensions simultaneously. Be comprehensive — downstream analysis modules depend on the completeness of your extraction.
-
-### 1. Document Classification
-- Document type (CIM, IC_MEMO, CUSTOMER_DATA, CONSULTANT_REPORT, FINANCIAL_MODEL, LEGAL, OTHER)
-- Source perspective (deal_team, management, third_party, unclear)
-
-### 2. Key Claims & Assertions
-For each claim found, capture:
-- The claim itself (precise statement)
-- Claim type: "thesis" | "risk_mitigant" | "explicit_assumption" | "implicit_assumption" | "narrative" | "data_point" | "weak_point"
-- Source type: "narrative" (CIM, IC memo, management presentation) or "data" (financial model, customer data, consultant report, QoE)
-- Location within the document (section, page, table name)
-- Confidence in your extraction accuracy ("high" | "medium" | "low")
-- Which PE diligence dimension it relates to: "commercial" | "financial" | "management" | "technology" | "legal" | "competitive" | "customer" | "operational" | "exit" | "esg" | "multiple"
-
-### 3. Quantitative Data Points
-For each metric/data point:
-- Metric name
-- Value (exact figure)
-- Context (why this matters)
-- Category: "revenue" | "margin" | "customer" | "cost" | "capital" | "financing" | "entry_exit" | "returns" | "operational" | "other"
-- Whether stated explicitly or derived
-- Perspective: "deal_team" | "management" | "unclear"
-
-### 4. Flags & Risks
-For each flag identified:
-- Type: "risk" | "gap" | "contradiction" | "assumption" | "omission"
-- Description (direct statement of the issue)
-- Severity: "critical" | "moderate" | "low"
-
-### 5. Omissions & Missing Information
-- Missing data, sections, time periods, benchmarks, or risk factors that should be present
-- Cross-reference against PE checklist: customer concentration, churn/retention, key man risk, revenue recognition, regulatory exposure, competitive response, management incentives, exit assumptions, QoE items, capex requirements
-
-### 6. Competitive & Market Context
-- Named competitors and positioning claims
-- Market size/TAM figures and their basis
-- Industry trend narratives
-
-### 7. Management & Leadership
-- Named individuals, titles, background claims
-- Key person dependencies
-- Retention arrangements
-
-### 8. Customer & Revenue Details
-- Named customers, concentration data
-- Contract durations, churn/retention figures
-- NPS, CSAT, or satisfaction scores
-
-### 9. Reputation & Social Signals
-- Social media or web presence references
-- Employee/culture claims (headcount, satisfaction, Glassdoor mentions)
-- Brand/marketing claims
-- Any acknowledged reputation risks
-
-### 10. Legal & Regulatory
-- Compliance status, pending litigation
-- Regulatory risk, licensing requirements
-
-## Output Rules
-
-Return ONLY a valid JSON object. No text before or after.
-
-Be precise and dense — every word should carry information:
-- Each claim should be a single clear statement — no filler, no restating context.
-- "claim" states WHAT is claimed. "location" states WHERE. Do not repeat one in the other.
-- "description" in flags states the gap directly — do not explain why it matters.
-
-Required top-level keys:
-- "document_name" (string)
-- "document_type" (string): CIM | IC_MEMO | CUSTOMER_DATA | CONSULTANT_REPORT | FINANCIAL_MODEL | LEGAL | OTHER
-- "source_perspective" (string): deal_team | management | third_party | unclear
-- "key_claims" (array): each with "id" (leave as empty string — will be assigned post-extraction), "claim", "claim_type", "source_type", "location", "confidence", "dimension"
-- "data_points" (array): each with "metric", "value", "context", "category", "stated_or_derived", "perspective"
-- "flags" (array): each with "type", "description", "severity"
-- "omissions" (array of strings): missing items relative to PE diligence standards
-- "competitive_market" (array): each with "claim", "named_competitors" (string[]), "figures_cited" (string or null)
-- "management_leadership" (array): each with "name", "title", "background_claims" (string or null), "retention_detail" (string or null)
-- "customer_revenue" (array): each with "customer" (string or null), "revenue_share" (string or null), "contract_detail" (string or null), "metric_cited" (string or null)
-- "reputation_social" (array): each with "claim", "platform_or_source" (string or null), "metric_cited" (string or null)
-- "legal_regulatory" (array): each with "topic", "detail"
-- "stated_risks" (array): each with "risk", "mitigant_offered" (string or null)
-- "raw_summary" (string): 3-4 dense sentences covering the most material findings`;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Inject stable claim IDs into the extraction JSON.
- * Format: "c{chunkIndex}-{claimIndex}" (0-based).
- * This happens post-extraction so IDs are deterministic and don't depend on
- * the model remembering to output them.
- */
-function injectClaimIds(rawJson: string, chunkIndex: number): string {
-  try {
-    // Strip markdown code fences if present (```json ... ```)
-    // The model may output prose before the fence, so search for it anywhere
-    let jsonStr = rawJson.trim();
-    const fenceMatch = jsonStr.match(/```(?:json)?\s*\n([\s\S]*?)\n\s*```/);
-    if (fenceMatch) {
-      jsonStr = fenceMatch[1].trim();
-    } else if (jsonStr.startsWith("```")) {
-      // Fallback: fence without closing (shouldn't happen, but be safe)
-      jsonStr = jsonStr.replace(/^```(?:json)?\s*\n?/, "");
-    }
-
-    const parsed = JSON.parse(jsonStr);
-    if (Array.isArray(parsed.key_claims)) {
-      parsed.key_claims = parsed.key_claims.map(
-        (claim: Record<string, unknown>, idx: number) => ({
-          ...claim,
-          id: `c${chunkIndex}-${idx}`,
-        })
-      );
-    }
-    return JSON.stringify(parsed);
-  } catch {
-    // If JSON parsing fails, return as-is — downstream will handle the error
-    return rawJson;
-  }
-}
-
-function sanitizeBraces(text: string): string {
-  if (!text) return text;
-  return text.replace(/\{/g, "\uFE5B").replace(/\}/g, "\uFE5C");
-}
+// injectClaimIds, sanitizeBraces imported from shared module
 
 function buildMultimodalContent(
   chunk: z.infer<typeof ChunkSchema>

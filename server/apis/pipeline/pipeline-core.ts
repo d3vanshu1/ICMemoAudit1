@@ -57,6 +57,7 @@ import { NUMERIC_MODULES } from "../modules/constants.js";
 import { SUB_AGENT_PROMPTS } from "../modules/analyze-chunk.js";
 import { MERGE_PROMPTS, FINDINGS_RULE_FINAL, FINDINGS_RULE_INTERMEDIATE } from "../modules/merge-findings.js";
 import { runPostCompletionAudit } from "./post-completion-audit.js";
+import { runExtractionPhase } from "./extraction-phase.js";
 
 // ---------------------------------------------------------------------------
 // Models & Config
@@ -364,6 +365,28 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
         { label: "Resume run — refresh triggered_at (legacy)" }
       );
     }
+  }
+
+  // --- Step 0.5: Ensure extractions exist (self-sufficient extraction phase) ---
+  const extractionResult = await runExtractionPhase(ctx, dealId, startTime);
+  if (extractionResult.needed && !extractionResult.completed) {
+    // Time budget consumed by extraction — return in_progress so caller re-invokes
+    return {
+      status: "in_progress",
+      runId,
+      phase: "extraction",
+      progress: {
+        analysisTotal: extractionResult.totalChunks,
+        analysisCompleted: extractionResult.extractedSoFar,
+        mergeRound: 0,
+        mergeTotal: 0,
+      },
+      result: null,
+      failedChunks: 0,
+      truncatedChunks: 0,
+      truncatedMerges: 0,
+      firstError: null,
+    };
   }
 
   // --- Step 1: Load universal extractions + route ---
