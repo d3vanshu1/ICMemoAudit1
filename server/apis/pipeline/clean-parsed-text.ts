@@ -17,7 +17,10 @@
  * and live mode (writes cleaned text back to documents.parsed_text).
  */
 
-import type { PostgresClient } from "@superblocksteam/sdk-api";
+/** Minimal DB interface matching ctx.integrations.db at runtime */
+interface DbClient {
+  query: (sql: string, schema: z.ZodType<any>, params: unknown[], meta?: { label: string }) => Promise<any[]>;
+}
 import { z } from "@superblocksteam/sdk-api";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -104,7 +107,7 @@ const TextSliceSchema = z.object({ text_slice: z.string() });
 const SpreadsheetDocSchema = z.object({ id: z.string(), file_name: z.string() });
 
 async function loadParsedText(
-  db: PostgresClient,
+  db: DbClient,
   documentId: string
 ): Promise<string> {
   // Get length first
@@ -404,7 +407,7 @@ export interface CleanupInput {
  * and optionally writes cleaned text back.
  */
 export async function runCleanParsedTextPhase(
-  db: PostgresClient,
+  db: DbClient,
   input: CleanupInput
 ): Promise<CleanupPhaseResult> {
   const { dealId, dryRun } = input;
@@ -466,13 +469,39 @@ export async function runCleanParsedTextPhase(
 
       // Write back if not dry-run
       if (!dryRun) {
+        // Ensure backup table exists (idempotent)
+        await db.query(
+          `CREATE TABLE IF NOT EXISTS parsed_text_backups (
+            id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+            document_id UUID NOT NULL,
+            original_text TEXT NOT NULL,
+            original_size INTEGER NOT NULL,
+            cleaned_size INTEGER NOT NULL,
+            cleaned_at TIMESTAMPTZ DEFAULT now(),
+            CONSTRAINT fk_document FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+          )`,
+          z.object({}),
+          [],
+          { label: "Ensure backup table exists" }
+        );
+
+        // Backup original parsed_text before overwriting
+        await db.query(
+          `INSERT INTO parsed_text_backups (document_id, original_text, original_size, cleaned_size)
+           SELECT $1, parsed_text, $2, $3 FROM documents WHERE id = $1`,
+          z.object({}),
+          [documentId, originalSize, cleanedSize],
+          { label: `Backup original text: ${fileName}` }
+        );
+
+        // Now write the cleaned text
         await db.query(
           `UPDATE documents SET parsed_text = $2 WHERE id = $1`,
           z.object({}),
           [documentId, cleanedText],
           { label: `Write cleaned text: ${fileName}` }
         );
-        console.log(`[clean-parsed-text] Wrote cleaned text for ${fileName}: ${(originalSize / 1_000_000).toFixed(1)}MB → ${(cleanedSize / 1_000_000).toFixed(1)}MB (saved ${(bytesSaved / 1_000_000).toFixed(1)}MB)`);
+        console.log(`[clean-parsed-text] Backed up & wrote cleaned text for ${fileName}: ${(originalSize / 1_000_000).toFixed(1)}MB → ${(cleanedSize / 1_000_000).toFixed(1)}MB (saved ${(bytesSaved / 1_000_000).toFixed(1)}MB)`);
       } else {
         console.log(`[clean-parsed-text] DRY RUN — would clean ${fileName}: ${(originalSize / 1_000_000).toFixed(1)}MB → ${(cleanedSize / 1_000_000).toFixed(1)}MB (save ${(bytesSaved / 1_000_000).toFixed(1)}MB)`);
       }
