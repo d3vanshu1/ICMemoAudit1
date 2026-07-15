@@ -65,12 +65,13 @@ const REQUIRED_COLUMNS: [string, string, string][] = [
   ["numeric_reports", "module_run_id", "FK to module_runs"],
   ["numeric_reports", "figures", "JSONB"],
   ["numeric_reports", "discrepancies", "JSONB"],
-  // Q&A
+  // Q&A (full-text search only — embedding/pgvector intentionally unused)
   ["document_chunks", "id", "PK"],
   ["document_chunks", "document_id", "FK to documents"],
   ["document_chunks", "chunk_index", ""],
   ["document_chunks", "content", ""],
-  ["document_chunks", "embedding", "vector — requires pgvector extension"],
+  // NOTE: document_chunks.embedding exists in some environments but is NOT used.
+  // Q&A uses tsv + websearch_to_tsquery (full-text search). No pgvector dependency.
   // Run coverage
   ["run_coverage", "id", "PK"],
   ["run_coverage", "module_run_id", "FK to module_runs"],

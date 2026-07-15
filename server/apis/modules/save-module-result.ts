@@ -1,4 +1,5 @@
 import { api, z, postgres } from "@superblocksteam/sdk-api";
+import { upsertModuleOutput } from "./upsert-module-output.js";
 
 const IC_DILIGENCE_DB = "ba09e2b9-2715-4460-8131-896f50b0c414";
 
@@ -67,44 +68,14 @@ export default api({
       effectiveRunId = runRows[0].run_id;
     }
 
-    // Check if output already exists for this run (no unique index available)
-    const existing = await ctx.integrations.db.query(
-      `SELECT id AS output_id FROM module_outputs WHERE module_run_id = $1 LIMIT 1`,
-      z.object({ output_id: z.string() }),
-      [effectiveRunId],
-      { label: "Check existing module_output" }
-    );
-
-    let outputId: string;
-    if (existing.length > 0) {
-      // Update existing (e.g. ResumeStalePipelines wrote a stub, client now has the formatted report)
-      outputId = existing[0].output_id;
-      await ctx.integrations.db.execute(
-        `UPDATE module_outputs
-         SET executive_header = $2, findings = $3::jsonb, full_report_markdown = $4
-         WHERE id = $1`,
-        [outputId, executiveHeader, JSON.stringify(findings), fullReport],
-        { label: "Update module output" }
-      );
-    } else {
-      // Insert new output
-      const outputRows = await ctx.integrations.db.query(
-        `INSERT INTO module_outputs (module_run_id, executive_header, findings, full_report_markdown)
-         VALUES ($1, $2, $3::jsonb, $4)
-         RETURNING id AS output_id`,
-        z.object({ output_id: z.string() }),
-        [effectiveRunId, executiveHeader, JSON.stringify(findings), fullReport],
-        { label: "Insert module output" }
-      );
-      outputId = outputRows[0].output_id;
-    }
-
-    // Bump deal updated_at
-    await ctx.integrations.db.execute(
-      `UPDATE deals SET updated_at = now() WHERE id = $1`,
-      [dealId],
-      { label: "Bump deal updated_at" }
-    );
+    // Upsert output via shared helper
+    const { outputId } = await upsertModuleOutput(ctx.integrations.db, {
+      runId: effectiveRunId,
+      dealId,
+      executiveHeader,
+      findings,
+      fullReport,
+    });
 
     return { result: { run_id: effectiveRunId, output_id: outputId } };
   },

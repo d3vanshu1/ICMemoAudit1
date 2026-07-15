@@ -56,6 +56,7 @@ import { buildMergedText, type MergedFinding } from "../modules/build-merged-tex
 import { NUMERIC_MODULES } from "../modules/constants.js";
 import { SUB_AGENT_PROMPTS } from "../modules/analyze-chunk.js";
 import { MERGE_PROMPTS, FINDINGS_RULE_FINAL, FINDINGS_RULE_INTERMEDIATE } from "../modules/merge-findings.js";
+import { runPostCompletionAudit } from "./post-completion-audit.js";
 
 // ---------------------------------------------------------------------------
 // Models & Config
@@ -930,6 +931,18 @@ A "## Numeric Verification Report" section appears in the input below. It contai
     [runId],
     { label: "Mark run completed (guarded)" }
   );
+
+  // Post-completion framing audit (non-blocking, logs warnings)
+  try {
+    runPostCompletionAudit({
+      runId,
+      moduleId,
+      reportText: finalNode.text,
+      findings: finalFindings,
+    });
+  } catch (auditErr) {
+    console.warn(`[pipeline] Post-completion audit failed (non-fatal):`, auditErr);
+  }
 
   // Cap mergedText to prevent response payload from exceeding platform limits.
   // FormatReport truncates to its own context window anyway.

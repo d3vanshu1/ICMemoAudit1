@@ -1,4 +1,5 @@
 import { api, z, postgres } from "@superblocksteam/sdk-api";
+import { upsertModuleOutput } from "../modules/upsert-module-output.js";
 
 const IC_DILIGENCE_DB = "ba09e2b9-2715-4460-8131-896f50b0c414";
 
@@ -121,37 +122,21 @@ export default api({
     // Step 3: Build a placeholder report from findings
     const reportPlaceholder = `# ${executiveHeader ?? moduleId}\n\n_Report formatting pending — findings recovered from merge checkpoints._\n\n## Key Findings (${findings.length})\n\n${findings.slice(0, 20).map((f: any, i: number) => `${i + 1}. **${f.title ?? f.claim ?? "Finding"}** — ${f.detail ?? f.summary ?? f.evidence ?? ""}`).join("\n")}${findings.length > 20 ? `\n\n_...and ${findings.length - 20} more findings._` : ""}`;
 
-    // Step 4: Save to module_outputs (keyed by module_run_id)
-    // Check if output already exists for this run
-    const existing = await ctx.integrations.db.query(
-      `SELECT id AS output_id FROM module_outputs WHERE module_run_id = $1 LIMIT 1`,
-      z.object({ output_id: z.string() }),
-      [runId],
-      { label: "Check existing module_output" }
-    );
+    // Step 4: Save to module_outputs via shared helper
+    await upsertModuleOutput(ctx.integrations.db, {
+      runId,
+      dealId,
+      executiveHeader: executiveHeader ?? moduleId,
+      findings,
+      fullReport: reportPlaceholder,
+    });
 
-    if (existing.length > 0) {
-      await ctx.integrations.db.execute(
-        `UPDATE module_outputs
-         SET executive_header = $2, findings = $3::jsonb, full_report_markdown = $4
-         WHERE id = $1`,
-        [existing[0].output_id, executiveHeader, JSON.stringify(findings), reportPlaceholder],
-        { label: "Update reconciled module output" }
-      );
-    } else {
-      await ctx.integrations.db.execute(
-        `INSERT INTO module_outputs (module_run_id, executive_header, findings, full_report_markdown)
-         VALUES ($1, $2, $3::jsonb, $4)`,
-        [runId, executiveHeader, JSON.stringify(findings), reportPlaceholder],
-        { label: "Insert reconciled module output" }
-      );
-    }
-
-    // Bump deal updated_at
+    // Mark run completed (guarded — only transitions running → completed)
     await ctx.integrations.db.execute(
-      `UPDATE deals SET updated_at = now() WHERE id = $1`,
-      [dealId],
-      { label: "Bump deal updated_at" }
+      `UPDATE module_runs SET status = 'completed'::module_status, completed_at = now()
+       WHERE id = $1 AND status = 'running'::module_status`,
+      [runId],
+      { label: "Mark reconciled run completed" }
     );
 
     return {

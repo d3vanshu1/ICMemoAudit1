@@ -508,81 +508,6 @@ async function processPdfFile(
 }
 
 // ---------------------------------------------------------------------------
-// Process an Excel file → one or more text chunks
-// ---------------------------------------------------------------------------
-async function processExcelFile(file: File): Promise<DocumentChunk[]> {
-  const arrayBuffer = await file.arrayBuffer();
-  const parsedText = parseExcel(arrayBuffer);
-
-  if (!parsedText.trim()) {
-    console.warn(`[pdfProcessor] ${file.name} produced no readable content.`);
-    return [];
-  }
-
-  const sanitized = sanitizeBraces(parsedText);
-
-  // Spreadsheets are text-only (no images), so we can use much larger chunks.
-  // 40K chars ≈ ~10K tokens — well within Sonnet's context window.
-  const EXCEL_CHUNK_CHARS = 40_000;
-  const lines = sanitized.split("\n");
-  const chunks: DocumentChunk[] = [];
-  let currentLines: string[] = [];
-  let currentLen = 0;
-  let chunkIdx = 0;
-
-  for (const line of lines) {
-    if (currentLen + line.length > EXCEL_CHUNK_CHARS && currentLines.length > 0) {
-      chunkIdx++;
-      chunks.push({
-        label: sanitizeBraces(
-          chunks.length === 0 && lines.length - currentLines.length <= EXCEL_CHUNK_CHARS
-            ? file.name
-            : `${file.name} [part ${chunkIdx}]`
-        ),
-        sourceFile: sanitizeBraces(file.name),
-        text: currentLines.join("\n"),
-        pageImages: [],
-      });
-      currentLines = [];
-      currentLen = 0;
-    }
-    currentLines.push(line);
-    currentLen += line.length + 1;
-  }
-
-  // Flush remaining
-  if (currentLines.length > 0) {
-    chunkIdx++;
-    const label =
-      chunks.length === 0
-        ? file.name
-        : `${file.name} [part ${chunkIdx}]`;
-    chunks.push({
-      label: sanitizeBraces(label),
-      sourceFile: sanitizeBraces(file.name),
-      text: currentLines.join("\n"),
-      pageImages: [],
-    });
-  }
-
-  return chunks;
-}
-
-// ---------------------------------------------------------------------------
-// Process a CSV file → text chunk
-// ---------------------------------------------------------------------------
-async function processCsvFile(file: File): Promise<DocumentChunk> {
-  const rawText = await file.text();
-  const parsedText = parseCsv(rawText);
-  return {
-    label: sanitizeBraces(file.name),
-    sourceFile: sanitizeBraces(file.name),
-    text: sanitizeBraces(parsedText),
-    pageImages: [],
-  };
-}
-
-// ---------------------------------------------------------------------------
 // Process a plain-text / unknown file → single text chunk
 // ---------------------------------------------------------------------------
 async function processTextFile(file: File): Promise<DocumentChunk> {
@@ -825,34 +750,8 @@ export async function processAllFiles(
           filesExcluded.push({ fileName: file.name, reason: "parse_failure", detail });
         }
       }
-    } else if (category === "excel") {
-      try {
-        const chunks = await processExcelFile(file);
-        if (chunks.length === 0) {
-          console.warn(`[pdfProcessor] ${file.name} produced no content, excluding.`);
-          filesExcluded.push({ fileName: file.name, reason: "parse_failure", detail: "Empty content after parsing" });
-        } else {
-          for (const chunk of chunks) {
-            allChunks.push(chunk);
-          }
-          filesProcessed.push({ fileName: file.name, chunkCount: chunks.length, pageCount: 0 });
-        }
-      } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        console.warn(`[pdfProcessor] Failed to parse Excel ${file.name}:`, err);
-        filesExcluded.push({ fileName: file.name, reason: "parse_failure", detail });
-      }
-    } else if (category === "csv") {
-      try {
-        const chunk = await processCsvFile(file);
-        allChunks.push(chunk);
-        filesProcessed.push({ fileName: file.name, chunkCount: 1, pageCount: 0 });
-      } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        console.warn(`[pdfProcessor] Failed to parse CSV ${file.name}:`, err);
-        filesExcluded.push({ fileName: file.name, reason: "parse_failure", detail });
-      }
     } else {
+      // Non-PDF, non-spreadsheet text files (e.g. .txt, .md, .docx plain text)
       try {
         const chunk = await processTextFile(file);
         allChunks.push(chunk);

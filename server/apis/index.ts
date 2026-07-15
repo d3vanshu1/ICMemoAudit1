@@ -78,8 +78,7 @@ import ResurrectModuleRun from './checkpoints/resurrect-module-run.js';
 import ReconcileFindings from './checkpoints/reconcile-findings.js';
 import GetExtractionStatus from './checkpoints/get-extraction-status.js';
 
-// Audit (temporary)
-import ReportLanguageAudit from './audit/report-language-audit.js';
+// Audit
 import ExtractReportSnippets from './audit/extract-report-snippets.js';
 import FramingPatternAudit from './audit/framing-pattern-audit.js';
 
@@ -105,7 +104,7 @@ const apis = {
   UpdateRunStatus, GetRunProgress, SaveRunCoverage, LoadRunCoverage,
   CancelModuleRun, CheckRunCancelled, PurgeStaleRuns, ResurrectModuleRun, ReconcileFindings, GetExtractionStatus,
   // Audit
-  ReportLanguageAudit, ExtractReportSnippets, FramingPatternAudit,
+  ExtractReportSnippets, FramingPatternAudit,
 } as const;
 
 export default apis;

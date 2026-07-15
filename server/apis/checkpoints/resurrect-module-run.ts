@@ -20,10 +20,10 @@ export default api({
   }),
 
   async run(ctx, { runId }) {
-    // Read current status first — only resurrect failed/cancelled runs
+    // Read current status + deal/module context
     const rows = await ctx.integrations.db.query(
-      `SELECT status FROM module_runs WHERE id = $1 LIMIT 1`,
-      z.object({ status: z.string() }),
+      `SELECT status, deal_id, module_id FROM module_runs WHERE id = $1 LIMIT 1`,
+      z.object({ status: z.string(), deal_id: z.string(), module_id: z.string() }),
       [runId],
       { label: `Check status of run ${runId}` }
     );
@@ -32,9 +32,23 @@ export default api({
       return { resurrected: false, previousStatus: null };
     }
 
-    const previousStatus = rows[0].status;
+    const { status: previousStatus, deal_id, module_id } = rows[0];
     if (previousStatus !== "failed" && previousStatus !== "cancelled") {
       // Only resurrect terminated runs — don't touch running or completed
+      return { resurrected: false, previousStatus };
+    }
+
+    // Guard: ensure no sibling run is already in-flight for the same deal + module
+    const siblings = await ctx.integrations.db.query(
+      `SELECT id FROM module_runs
+       WHERE deal_id = $1 AND module_id = $2 AND status = 'running'::module_status AND id != $3
+       LIMIT 1`,
+      z.object({ id: z.string() }),
+      [deal_id, module_id, runId],
+      { label: "Check for already-running sibling" }
+    );
+
+    if (siblings.length > 0) {
       return { resurrected: false, previousStatus };
     }
 

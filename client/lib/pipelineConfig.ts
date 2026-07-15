@@ -14,7 +14,7 @@
  * - Production: ~5,000 chars (fine-grained extraction)
  * - Testing: ~45,000 chars (fewer chunks, faster pipeline)
  */
-export const CHUNK_CHARS = 45_000;
+export const CHUNK_CHARS = 5_000;
 
 // ---------------------------------------------------------------------------
 // Extraction concurrency
@@ -26,7 +26,7 @@ export const CHUNK_CHARS = 45_000;
  * - Production: 10–15
  * - Testing: 25 (max throughput)
  */
-export const CHUNK_CONCURRENCY = 25;
+export const CHUNK_CONCURRENCY = 12;
 
 // ---------------------------------------------------------------------------
 // Extraction model
@@ -37,7 +37,7 @@ export const CHUNK_CONCURRENCY = 25;
  * - Production: "claude-sonnet-4-6" (highest quality)
  * - Testing: "claude-haiku-4-5-20251001" (fastest/cheapest)
  */
-export const EXTRACTION_MODEL = "claude-haiku-4-5-20251001";
+export const EXTRACTION_MODEL = "claude-sonnet-4-6";
 
 // ---------------------------------------------------------------------------
 // File type filtering
