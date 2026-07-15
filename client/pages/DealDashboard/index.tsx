@@ -1648,7 +1648,12 @@ export default function DealDashboardPage() {
         const failInfo = (pipelineResult as { failedChunks?: number; firstError?: string | null }).failedChunks
           ? ` (${(pipelineResult as { failedChunks?: number }).failedChunks} failed)`
           : "";
-        if (phase === "analysis") {
+        if (phase === "extraction") {
+          setModuleProgress(moduleId, {
+            message: `Extracting documents… ${prog.analysisCompleted}/${prog.analysisTotal}${failInfo}`,
+            detail: { current: prog.analysisCompleted, total: prog.analysisTotal, phase: "analyzing" },
+          });
+        } else if (phase === "analysis") {
           setModuleProgress(moduleId, {
             message: `Analyzing chunks (server)… ${prog.analysisCompleted}/${prog.analysisTotal}${failInfo}`,
             detail: { current: prog.analysisCompleted, total: prog.analysisTotal, phase: "analyzing" },

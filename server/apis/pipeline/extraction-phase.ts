@@ -75,7 +75,7 @@ const MessageResponseSchema = z.object({
 export type ExtractionPhaseResult =
   | { needed: false }
   | { needed: true; completed: true; totalChunks: number }
-  | { needed: true; completed: false; extractedSoFar: number; totalChunks: number };
+  | { needed: true; completed: false; extractedSoFar: number; totalChunks: number; failedChunks: number; firstError: string | null };
 
 // ---------------------------------------------------------------------------
 // LLM call with retry + truncation detection
@@ -270,6 +270,8 @@ export async function runExtractionPhase(
 
   // --- Step D: Process missing chunks in batches with concurrency ---
   let extractedSoFar = successfulCount;
+  let failedChunks = 0;
+  let firstError: string | null = null;
 
   const processBatch = async (batch: TextChunk[]): Promise<void> => {
     const results = await Promise.allSettled(
@@ -299,7 +301,7 @@ export async function runExtractionPhase(
               { label: `Save truncated extraction ${chunk.chunkIndex}` }
             );
             // Count as processed (not successful) — won't be retried this invocation
-            return false;
+            return { success: false, error: `Truncated (max_tokens): ${chunk.label}` };
           }
 
           const idTaggedText = injectClaimIds(rawText, chunk.chunkIndex);
@@ -324,9 +326,10 @@ export async function runExtractionPhase(
             [dealId, chunk.documentId, chunk.chunkIndex, chunk.contentHash, JSON.stringify(extractionJson)],
             { label: `Save extraction ${chunk.chunkIndex}` }
           );
-          return true;
+          return { success: true, error: null };
         } catch (err) {
           // Save failed extraction so it can be retried on next invocation
+          const errMsg = err instanceof Error ? err.message : String(err);
           const tag = tagByDocId[chunk.documentId] ?? "other";
           const failedJson = {
             label: sanitizeBraces(chunk.label),
@@ -348,12 +351,25 @@ export async function runExtractionPhase(
               { label: `Save failed extraction ${chunk.chunkIndex}` }
             );
           } catch { /* best effort */ }
-          return false;
+          return { success: false, error: errMsg };
         }
       })
     );
 
-    extractedSoFar += results.filter(r => r.status === "fulfilled" && r.value === true).length;
+    for (const r of results) {
+      if (r.status === "fulfilled") {
+        if (r.value.success) {
+          extractedSoFar++;
+        } else {
+          failedChunks++;
+          if (!firstError && r.value.error) firstError = r.value.error;
+        }
+      } else {
+        // Promise itself rejected (shouldn't happen with inner try/catch, but guard)
+        failedChunks++;
+        if (!firstError) firstError = r.reason instanceof Error ? r.reason.message : String(r.reason);
+      }
+    }
   };
 
   // Process in batches of EXTRACTION_CONCURRENCY
@@ -361,7 +377,7 @@ export async function runExtractionPhase(
     // Time budget check
     const elapsed = Date.now() - startTime;
     if (elapsed >= EXTRACTION_TIME_BUDGET_MS) {
-      return { needed: true, completed: false, extractedSoFar, totalChunks };
+      return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
     }
 
     const batch = allChunks.slice(i, i + EXTRACTION_CONCURRENCY);

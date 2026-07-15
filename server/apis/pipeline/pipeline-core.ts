@@ -382,10 +382,10 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
         mergeTotal: 0,
       },
       result: null,
-      failedChunks: 0,
+      failedChunks: extractionResult.failedChunks,
       truncatedChunks: 0,
       truncatedMerges: 0,
-      firstError: null,
+      firstError: extractionResult.firstError,
     };
   }
 
