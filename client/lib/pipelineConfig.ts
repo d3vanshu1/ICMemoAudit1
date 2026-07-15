@@ -13,6 +13,10 @@
  * Maximum characters per document chunk before splitting.
  * - Production: ~5,000 chars (fine-grained extraction)
  * - Testing: ~45,000 chars (fewer chunks, faster pipeline)
+ *
+ * ⚠️  KEEP IN SYNC with server/apis/pipeline/extraction-prompt.ts CHUNK_CHARS.
+ *     Client and server cannot share an import across the build boundary.
+ *     If these diverge, chunk-index mismatches corrupt the extraction cache.
  */
 export const CHUNK_CHARS = 5_000;
 

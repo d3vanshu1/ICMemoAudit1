@@ -1,14 +1,13 @@
 /**
  * Extraction Phase — ensures universal_extractions exist for a deal.
  *
- * If the deal already has extractions in the DB, this is a no-op.
- * If not, it loads documents, chunks them, runs the LLM extraction prompt
- * on each chunk (with concurrency + time budget), and saves results
- * incrementally to `universal_extractions`.
+ * Loads documents, chunks them, identifies gaps against existing extractions
+ * in the DB, and runs the LLM extraction prompt on missing chunks
+ * (with concurrency + time budget), saving results incrementally.
  *
  * Returns:
- *  - { needed: false } if extractions already exist
- *  - { needed: true, completed: true, totalChunks } if all chunks extracted in this call
+ *  - { needed: false } if all expected chunks are already extracted
+ *  - { needed: true, completed: true, totalChunks } if all gaps filled in this call
  *  - { needed: true, completed: false, extractedSoFar, totalChunks } if time budget ran out
  */
 import { z } from "@superblocksteam/sdk-api";
@@ -33,6 +32,9 @@ const EXTRACTION_MAX_TOKENS = 8000;
 /** How much time budget the extraction phase is allowed to consume (ms) */
 const EXTRACTION_TIME_BUDGET_MS = 180_000; // 3 minutes
 
+/** Page size for loading existing extraction keys (small rows: ~80 bytes each) */
+const EXTRACTION_KEYS_PAGE_SIZE = 5000;
+
 // ---------------------------------------------------------------------------
 // Schemas
 // ---------------------------------------------------------------------------
@@ -54,6 +56,7 @@ const ExistingChunkSchema = z.object({
   document_id: z.string(),
   chunk_index: z.coerce.number(),
   is_failed: z.coerce.boolean(),
+  is_truncated: z.coerce.boolean(),
 });
 
 const MessageResponseSchema = z.object({
@@ -75,14 +78,19 @@ export type ExtractionPhaseResult =
   | { needed: true; completed: false; extractedSoFar: number; totalChunks: number };
 
 // ---------------------------------------------------------------------------
-// LLM call with retry
+// LLM call with retry + truncation detection
 // ---------------------------------------------------------------------------
+interface ExtractionLLMResult {
+  text: string;
+  truncated: boolean;
+}
+
 async function callExtractionLLM(
   ctx: PipelineContext,
   chunk: TextChunk,
   totalChunks: number,
   retries = 3
-): Promise<string> {
+): Promise<ExtractionLLMResult> {
   const label = `Extract: ${sanitizeBraces(chunk.label)} (${chunk.chunkIndex + 1}/${totalChunks})`;
   const body = {
     model: EXTRACTION_MODEL,
@@ -116,7 +124,12 @@ async function callExtractionLLM(
       ]);
       const textBlock = result.content.find((c: { type: string }) => c.type === "text");
       if (!textBlock) throw new Error(`No text in response for ${chunk.label}`);
-      return textBlock.text.trim();
+
+      // Truncation detection: stop_reason === "max_tokens" means the response
+      // was cut off mid-generation. The text may be incomplete/invalid JSON.
+      const truncated = result.stop_reason === "max_tokens";
+
+      return { text: textBlock.text.trim(), truncated };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const isRetryable = /503|429|rate.?limit|service.?unavailable|overloaded|timed out/i.test(msg);
@@ -163,39 +176,42 @@ export async function runExtractionPhase(
     return { needed: true, completed: true, totalChunks: 0 };
   }
 
-  // --- Step B: Compute expected total chunks and compare to existing ---
-  const expectedTotal = docMetas.reduce(
-    (sum, d) => sum + Math.ceil(d.text_length / CHUNK_CHARS),
-    0
-  );
+  // --- Step B: Load existing extraction keys (paginated) ---
+  // Each row is small (~80 bytes: UUID + int + two bools), but row count can
+  // grow unboundedly across re-processing cycles. Page to stay under 4MB gRPC cap.
+  const existingRows: Array<{ document_id: string; chunk_index: number; is_failed: boolean; is_truncated: boolean }> = [];
+  let keysOffset = 0;
 
-  // Load existing extraction keys (document_id + chunk_index) to identify gaps
-  const existingRows = await ctx.integrations.db.query(
-    `SELECT document_id, chunk_index,
-            COALESCE((extraction_json->>'failed')::boolean, false) AS is_failed
-     FROM universal_extractions
-     WHERE deal_id = $1`,
-    ExistingChunkSchema,
-    [dealId],
-    { label: "Load existing extraction keys" }
-  );
+  while (true) {
+    const page = await ctx.integrations.db.query(
+      `SELECT document_id, chunk_index,
+              COALESCE((extraction_json->>'failed')::boolean, false) AS is_failed,
+              COALESCE((extraction_json->>'truncated')::boolean, false) AS is_truncated
+       FROM universal_extractions
+       WHERE deal_id = $1
+       ORDER BY document_id, chunk_index
+       LIMIT ${EXTRACTION_KEYS_PAGE_SIZE} OFFSET ${keysOffset}`,
+      ExistingChunkSchema,
+      [dealId],
+      { label: `Load existing extraction keys (offset ${keysOffset})` }
+    );
+    existingRows.push(...page);
+    if (page.length < EXTRACTION_KEYS_PAGE_SIZE) break;
+    keysOffset += EXTRACTION_KEYS_PAGE_SIZE;
+  }
 
-  // Build a set of successfully-extracted (doc_id, chunk_index) pairs
+  // Build a set of successfully-extracted (doc_id, chunk_index) pairs.
+  // Exclude failed AND truncated extractions — they need to be re-done.
   const extractedSet = new Set<string>();
   for (const row of existingRows) {
-    if (!row.is_failed) {
+    if (!row.is_failed && !row.is_truncated) {
       extractedSet.add(`${row.document_id}:${row.chunk_index}`);
     }
   }
 
-  // Count successful extractions
-  const successfulCount = extractedSet.size;
-  if (successfulCount >= expectedTotal) {
-    // All chunks already extracted — skip
-    return { needed: false };
-  }
-
-  // --- Step C: Load text & chunk only for documents with missing extractions ---
+  // --- Step C: Per-document gap detection ---
+  // Do NOT use an aggregate short-circuit here. A surplus in one document
+  // can numerically mask a deficit in another. Check each document individually.
   const allChunks: TextChunk[] = [];
   const tagByDocId: Record<string, string> = {};
 
@@ -220,7 +236,7 @@ export async function runExtractionPhase(
       );
       parsedText = rows[0]?.segment ?? "";
     } else {
-      let pos = 1;
+      let pos = 1; // SQL SUBSTRING is 1-indexed
       while (pos <= doc.text_length) {
         const rows = await ctx.integrations.db.query(
           `SELECT SUBSTRING(parsed_text FROM ${pos} FOR ${TEXT_SEGMENT_SIZE}) AS segment FROM documents WHERE id = $1`,
@@ -245,20 +261,47 @@ export async function runExtractionPhase(
     }
   }
 
+  const successfulCount = extractedSet.size;
   const totalChunks = allChunks.length + successfulCount; // total = pending + already done
   if (allChunks.length === 0) {
-    // Edge case: all chunks accounted for (rounding matched)
+    // All documents fully covered
     return { needed: false };
   }
 
   // --- Step D: Process missing chunks in batches with concurrency ---
   let extractedSoFar = successfulCount;
 
-  const processBatch = async (batch: TextChunk[]): Promise<boolean> => {
+  const processBatch = async (batch: TextChunk[]): Promise<void> => {
     const results = await Promise.allSettled(
       batch.map(async (chunk) => {
         try {
-          const rawText = await callExtractionLLM(ctx, chunk, totalChunks);
+          const { text: rawText, truncated } = await callExtractionLLM(ctx, chunk, totalChunks);
+
+          // If truncated, mark it so future runs will retry this chunk
+          if (truncated) {
+            const tag = tagByDocId[chunk.documentId] ?? "other";
+            const truncatedJson = {
+              label: sanitizeBraces(chunk.label),
+              extraction: "",
+              chunkIndex: chunk.chunkIndex,
+              sourceFile: sanitizeBraces(chunk.sourceFile),
+              documentTag: tag,
+              truncated: true,
+            };
+            await ctx.integrations.db.execute(
+              `INSERT INTO universal_extractions (deal_id, document_id, chunk_index, content_hash, extraction_json)
+               VALUES ($1, $2, $3, $4, $5::jsonb)
+               ON CONFLICT (deal_id, document_id, chunk_index)
+               DO UPDATE SET content_hash = EXCLUDED.content_hash,
+                             extraction_json = EXCLUDED.extraction_json,
+                             created_at = now()`,
+              [dealId, chunk.documentId, chunk.chunkIndex, chunk.contentHash, JSON.stringify(truncatedJson)],
+              { label: `Save truncated extraction ${chunk.chunkIndex}` }
+            );
+            // Count as processed (not successful) — won't be retried this invocation
+            return false;
+          }
+
           const idTaggedText = injectClaimIds(rawText, chunk.chunkIndex);
           const tag = tagByDocId[chunk.documentId] ?? "other";
 
@@ -310,8 +353,7 @@ export async function runExtractionPhase(
       })
     );
 
-    extractedSoFar += results.filter(r => r.status === "fulfilled").length;
-    return true;
+    extractedSoFar += results.filter(r => r.status === "fulfilled" && r.value === true).length;
   };
 
   // Process in batches of EXTRACTION_CONCURRENCY

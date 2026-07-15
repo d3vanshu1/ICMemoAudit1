@@ -180,6 +180,9 @@ export const EXTRACTION_CONCURRENCY = 12;
 
 // ---------------------------------------------------------------------------
 // Chunking
+// ⚠️  KEEP IN SYNC with client/lib/pipelineConfig.ts CHUNK_CHARS.
+//     Client and server cannot share an import across the build boundary.
+//     If these diverge, chunk-index mismatches corrupt the extraction cache.
 // ---------------------------------------------------------------------------
 export const CHUNK_CHARS = 5_000;
 
