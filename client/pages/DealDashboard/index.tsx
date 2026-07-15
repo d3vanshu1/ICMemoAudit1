@@ -42,17 +42,6 @@ type MergeNode = {
   }>;
 };
 
-// Research modules that require web search loops
-const WEB_RESEARCH_MODULES = new Set(["external_risk_overlay", "social_reputation"]);
-
-// Config for web research loops
-const EXTERNAL_RISK_MAX_ITERATIONS = 7;
-const EXTERNAL_RISK_CONFIDENCE_THRESHOLD = 8;
-const EXTERNAL_RISK_CONSECUTIVE_THRESHOLD = 2;
-const SOCIAL_REPUTATION_MAX_ITERATIONS = 9;
-const SOCIAL_REPUTATION_CONFIDENCE_THRESHOLD = 8;
-const SOCIAL_REPUTATION_CONSECUTIVE_THRESHOLD = 2;
-
 // Concurrency imported from @/lib/pipelineConfig
 
 /** Combined chunk-processing result with coverage tracking */
@@ -201,7 +190,6 @@ export default function DealDashboardPage() {
   const { run: universalExtract } = useApi("UniversalExtract");
   const { run: mergeFindings } = useApi("MergeFindings");
   const { run: formatReport } = useApi("FormatReport");
-  const { run: webResearch } = useApi("WebResearch");
   const { run: saveModuleResultApi } = useApi("SaveModuleResult");
   const { run: saveDocumentApi } = useApi("SaveDocument");
   const { run: updateDocumentApi } = useApi("UpdateDocument");
@@ -1314,193 +1302,6 @@ export default function DealDashboardPage() {
   );
 
   // ---------------------------------------------------------------------------
-  // Web research module pipeline:
-  //   chunk → analyze → research loop → combine → tree-merge → report
-  // ---------------------------------------------------------------------------
-
-  const runWebResearchModule = useCallback(
-    async (moduleId: string) => {
-      // Phase 1: Get or reuse universal extractions
-      const allExtractions = await getOrRunUniversalExtractions(moduleId);
-      if (allExtractions.length === 0) {
-        toast.error("No processable content found. Check your files.");
-        return;
-      }
-
-      // Route to relevant chunks for this web research module
-      const routed = getExtractionsForModule(allExtractions, moduleId);
-
-      // Build context summaries for the research agent from routed extractions
-      const dealName = deal?.name ?? "Unknown Company";
-      const dealContext = [
-        `Company: ${dealName}`,
-        deal?.description ? `Description: ${deal.description}` : "",
-        deal?.sector ? `Sector: ${deal.sector}` : "",
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      const docContext = routed
-        .map((ext) => `Document: ${ext.label}\n${ext.extraction}`)
-        .join("\n\n");
-
-      // Phase 2: Web research loop
-      const maxIterations =
-        moduleId === "social_reputation"
-          ? SOCIAL_REPUTATION_MAX_ITERATIONS
-          : EXTERNAL_RISK_MAX_ITERATIONS;
-      const confidenceThreshold =
-        moduleId === "social_reputation"
-          ? SOCIAL_REPUTATION_CONFIDENCE_THRESHOLD
-          : EXTERNAL_RISK_CONFIDENCE_THRESHOLD;
-      const consecutiveThreshold =
-        moduleId === "social_reputation"
-          ? SOCIAL_REPUTATION_CONSECUTIVE_THRESHOLD
-          : EXTERNAL_RISK_CONSECUTIVE_THRESHOLD;
-
-      // Build research categories for social_reputation
-      let researchCategories: string | undefined;
-      if (moduleId === "social_reputation") {
-        const cats = [
-          `GLASSDOOR: Search for "${dealName} Glassdoor reviews". Find overall star rating, review count, CEO approval %, common themes.`,
-          `INDEED: Search for "${dealName} Indeed reviews". Compare to Glassdoor findings.`,
-          `LINKEDIN: Search for "${dealName} LinkedIn company". Note employee count, growth signals, recent hires/departures.`,
-          `X/TWITTER: Search for "${dealName} Twitter". Note follower count, engagement quality, customer interactions.`,
-          `INSTAGRAM: Search for "${dealName} Instagram". Note follower count, posting frequency, content quality.`,
-          `FACEBOOK: Search for "${dealName} Facebook page". Note follower count, page rating, review scores.`,
-          `CUSTOMER REVIEWS: Search for "${dealName} reviews" on Trustpilot, BBB, G2, or industry-specific platforms.`,
-          `REDDIT & FORUMS: Search for "${dealName} Reddit". Look for unfiltered employee and customer sentiment.`,
-          `NEWS: Search for recent news about "${dealName}". Focus on layoffs, lawsuits, executive changes, controversies.`,
-          `C-SUITE: Search for "${dealName} CEO" and "${dealName} leadership team". Find executive backgrounds and reputation.`,
-        ];
-        researchCategories = cats.map((c, i) => `${i + 1}. ${c}`).join("\n");
-      }
-
-      const iterations: Array<{
-        iteration: number;
-        query: string;
-        finding: string;
-        confidence: number;
-        platform?: string;
-      }> = [];
-      let consecutiveHighConfidence = 0;
-
-      setModuleProgress(moduleId, {
-        message: "Starting web research…",
-        detail: { current: 0, total: maxIterations, phase: "researching" },
-      });
-
-      for (let i = 1; i <= maxIterations; i++) {
-        setModuleProgress(moduleId, {
-          message: `Research iteration ${i}/${maxIterations}…`,
-          detail: { current: i, total: maxIterations, phase: "researching" },
-        });
-
-        const previousFindings = iterations
-          .map(
-            (it) =>
-              `Iteration ${it.iteration}: Searched "${it.query}" → ${it.finding} (confidence: ${it.confidence}/10)`
-          )
-          .join("\n");
-
-        const result = await webResearch({
-          moduleId: moduleId as "external_risk_overlay" | "social_reputation",
-          iteration: i,
-          dealContext,
-          docContext,
-          previousFindings,
-          researchCategories: researchCategories ?? "",
-        });
-
-        if (!result) continue;
-        iterations.push(result);
-
-        // Confidence-based early stopping
-        if (result.confidence >= confidenceThreshold) {
-          consecutiveHighConfidence++;
-        } else {
-          consecutiveHighConfidence = 0;
-        }
-
-        if (consecutiveHighConfidence >= consecutiveThreshold) {
-          setModuleProgress(moduleId, {
-            message: `Research complete after ${i} iterations (confidence threshold reached).`,
-          });
-          break;
-        }
-
-        // Diminishing returns early stopping: if last 2 iterations both LOW materiality, stop
-        if (
-          iterations.length >= 3 &&
-          (iterations[iterations.length - 1] as Record<string, unknown>).materiality?.toString().toUpperCase() === "LOW" &&
-          (iterations[iterations.length - 2] as Record<string, unknown>).materiality?.toString().toUpperCase() === "LOW"
-        ) {
-          setModuleProgress(moduleId, {
-            message: `Research complete after ${i} iterations (diminishing returns).`,
-          });
-          break;
-        }
-      }
-
-      // Phase 3: Build research extractions for tree-merge
-      // IMPORTANT: Only research iterations go into the tree-reduce.
-      // Document extractions are passed as reference context, NOT as peer nodes.
-      const researchLabel = moduleId === "social_reputation" ? "Social Research" : "External Research";
-      const researchExtractions = iterations.map((it, idx) => {
-        const itAny = it as Record<string, unknown>;
-        const sources = Array.isArray(itAny.sources) ? itAny.sources : [];
-        const sourcesStr = sources.length ? `\nSources: ${sources.join(", ")}` : "";
-        const categoryStr = itAny.category ? `\nCategory: ${itAny.category}` : "";
-        const materialityStr = itAny.materiality ? `\nMateriality: ${itAny.materiality}` : "";
-        return {
-          label: `[${researchLabel}] Iteration ${it.iteration}: "${it.query}"`,
-          extraction: `### ${researchLabel} Iteration ${it.iteration}\n\nQuery: ${it.query}${categoryStr}${materialityStr}\nFinding: ${it.finding}${sourcesStr}\nConfidence: ${it.confidence}/10`,
-          chunkIndex: idx,
-        };
-      });
-
-      // Build a condensed document context string for the merge prompt
-      const docContextForMerge = routed
-        .map((ext) => `[${ext.label}]: ${ext.extraction.slice(0, 500)}`)
-        .join("\n\n");
-      const docContextPrefix = docContextForMerge
-        ? `## Document Context (REFERENCE ONLY — do not treat as findings)\n\n${docContextForMerge}\n\n---\n\n`
-        : "";
-
-      // Prepend doc context to each research extraction so every merge pair has it
-      const contextualExtractions = researchExtractions.map((ext) => ({
-        ...ext,
-        extraction: docContextPrefix + ext.extraction,
-      }));
-
-      // Phase 4: Tree-reduce merge (only research findings, with doc context as reference)
-      const finalMerge = await treeMerge(moduleId, contextualExtractions);
-
-      // Phase 5: Format report (with coverage line)
-      const coverageLine = buildCoverageLine();
-      const totalMergeRounds = Math.ceil(Math.log2(Math.max(contextualExtractions.length, 2)));
-      const fullReport = await generateReport(moduleId, finalMerge, totalMergeRounds + 1, coverageLine);
-
-      await saveModuleResult(moduleId, {
-        executiveHeader: finalMerge.executiveHeader,
-        findings: finalMerge.findings,
-        fullReport,
-      });
-
-      const displayName = MODULE_MAP[moduleId]?.displayName ?? moduleId;
-      toast.success(`${displayName} complete!`);
-    },
-    [
-      deal,
-      getOrRunUniversalExtractions,
-      webResearch,
-      treeMerge,
-      generateReport,
-      saveModuleResult,
-    ]
-  );
-
-  // ---------------------------------------------------------------------------
   // Executive Summary pipeline: uses prior module outputs
   // ---------------------------------------------------------------------------
 
@@ -1658,6 +1459,11 @@ export default function DealDashboardPage() {
             message: `Extracting documents… ${prog.analysisCompleted}/${prog.analysisTotal}${failInfo}`,
             detail: { current: prog.analysisCompleted, total: prog.analysisTotal, phase: "analyzing" },
           });
+        } else if (phase === "web_research") {
+          setModuleProgress(moduleId, {
+            message: `Web research… iteration ${prog.analysisCompleted}/${prog.analysisTotal}${failInfo}`,
+            detail: { current: prog.analysisCompleted, total: prog.analysisTotal, phase: "researching" },
+          });
         } else if (phase === "analysis") {
           setModuleProgress(moduleId, {
             message: `Analyzing chunks (server)… ${prog.analysisCompleted}/${prog.analysisTotal}${failInfo}`,
@@ -1781,10 +1587,9 @@ export default function DealDashboardPage() {
       try {
         if (moduleId === "executive_summary") {
           await runExecutiveSummary();
-        } else if (WEB_RESEARCH_MODULES.has(moduleId)) {
-          await runWebResearchModule(moduleId);
         } else if (dealId) {
           // Server-side pipeline: survives tab closure, checkpointed
+          // (web research modules now use the same server pipeline path)
           await runServerPipeline(moduleId, resumeRunId);
         } else {
           // Fallback: client-side pipeline (no-deal edge case)
@@ -1832,7 +1637,6 @@ export default function DealDashboardPage() {
       dealId,
       runStandardModule,
       runServerPipeline,
-      runWebResearchModule,
       runExecutiveSummary,
       clearModuleProgress,
     ]
@@ -1949,7 +1753,7 @@ export default function DealDashboardPage() {
         if (inProgressRuns.length === 0) return;
         toast.info(`Resuming ${inProgressRuns.length} interrupted run(s)…`);
         for (const run of inProgressRuns) {
-          if (WEB_RESEARCH_MODULES.has(run.moduleId) || run.moduleId === "executive_summary") continue;
+          if (run.moduleId === "executive_summary") continue;
           handleRunModule(run.moduleId, run.runId);
         }
       } catch (err) {

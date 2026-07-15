@@ -61,6 +61,7 @@ import { runExtractionPhase } from "./extraction-phase.js";
 import { runDocTablesPhase } from "./doc-tables-phase.js";
 import { runNumericVerifyInline } from "./numeric-verify-inline.js";
 import { runCleanParsedTextPhase } from "./clean-parsed-text.js";
+import { runWebResearchPhase } from "./web-research-phase.js";
 import type { NumericVerifyResult } from "./numeric-verify-inline.js";
 
 // ---------------------------------------------------------------------------
@@ -79,6 +80,9 @@ const MAX_MERGE_GROUP_FAILURES = 2; // Skip (use fallback) after this many error
 const TIME_BUDGET_MS = 200_000; // 3m20s — gives 100s headroom under platform's 300s API timeout
 // NOTE: Reduced from 250s because paginated extraction loading, checkpoint saves,
 // and DB overhead were pushing total wall-clock past the 300s platform limit.
+
+/** Modules that go through the web research phase instead of direct analysis */
+const WEB_RESEARCH_MODULES = new Set(["external_risk_overlay", "social_reputation"]);
 
 // ---------------------------------------------------------------------------
 // Chunk Routing (server-side mirror of client/lib/chunkRouting.ts)
@@ -533,10 +537,101 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
       phase: "routing",
       progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
       result: null,
+      firstError: "No extraction chunks matched this module's document tags (check document tagging)",
     };
   }
 
+  // --- Step 1.5: Web Research Phase (for web research modules only) ---
+  // Runs the iterative web search loop server-side with checkpointing.
+  // If incomplete (budget exhausted), returns in_progress with phase "web_research".
+  // If complete, iterations are loaded later and converted to analysis-compatible format.
+  if (WEB_RESEARCH_MODULES.has(moduleId)) {
+    const webResearchResult = await runWebResearchPhase(
+      ctx,
+      dealId,
+      moduleId,
+      runId,
+      startTime,
+      TIME_BUDGET_MS,
+      routed
+    );
+
+    if (webResearchResult.needed && !webResearchResult.completed) {
+      // Time budget consumed — return in_progress so caller re-invokes
+      return {
+        status: "in_progress",
+        runId,
+        phase: "web_research",
+        progress: {
+          analysisTotal: webResearchResult.totalIterations,
+          analysisCompleted: webResearchResult.iterationCount,
+          mergeRound: 0,
+          mergeTotal: 0,
+        },
+        result: null,
+        firstError: webResearchResult.firstError,
+      };
+    }
+    // If completed, fall through — inject iterations as synthetic analysis checkpoints
+    // so the merge step picks them up identically to normal analysis results.
+    const iterRows = await ctx.integrations.db.query(
+      `SELECT iteration, query, finding, confidence, platform, category, sources, materiality
+       FROM web_research_iterations
+       WHERE run_id = $1 AND status = 'completed'
+       ORDER BY iteration`,
+      z.object({
+        iteration: z.coerce.number(),
+        query: z.string().nullable(),
+        finding: z.string().nullable(),
+        confidence: z.coerce.number().nullable(),
+        platform: z.string().nullable(),
+        category: z.string().nullable(),
+        sources: z.any().nullable(),
+        materiality: z.string().nullable(),
+      }),
+      [runId],
+      { label: "Load completed iterations for merge injection" }
+    );
+
+    // Check if analysis checkpoints already exist (idempotent resume)
+    const existingAnalysis = await ctx.integrations.db.query(
+      `SELECT chunk_index FROM pipeline_analysis WHERE run_id = $1 LIMIT 1`,
+      z.object({ chunk_index: z.coerce.number() }),
+      [runId],
+      { label: "Check if iteration analysis already injected" }
+    );
+
+    if (existingAnalysis.length === 0 && iterRows.length > 0) {
+      // Inject each iteration as a synthetic analysis checkpoint
+      for (const row of iterRows) {
+        const label = `${moduleId} iteration ${row.iteration}: ${row.query ?? "research"}`;
+        const extraction = [
+          `### Web Research Finding (Iteration ${row.iteration})`,
+          "",
+          `**Query:** ${row.query ?? "research"}`,
+          row.category ? `**Category:** ${row.category}` : (row.platform ? `**Platform:** ${row.platform}` : ""),
+          row.materiality ? `**Materiality:** ${row.materiality}` : "",
+          `**Confidence:** ${row.confidence ?? 0}/10`,
+          row.sources ? `**Sources:** ${(Array.isArray(row.sources) ? row.sources : []).join(", ")}` : "",
+          "",
+          row.finding ?? "No finding recorded",
+        ].filter(Boolean).join("\n");
+
+        await ctx.integrations.db.execute(
+          `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json)
+           VALUES ($1, $2, $3::jsonb)
+           ON CONFLICT (run_id, chunk_index) DO NOTHING`,
+          [runId, row.iteration - 1, JSON.stringify({ label, extraction, chunkIndex: row.iteration - 1 })],
+          { label: `Inject iteration ${row.iteration} as analysis` }
+        );
+      }
+      console.log(`[WebResearch] Injected ${iterRows.length} iterations as analysis checkpoints`);
+    }
+  }
+
   // --- Step 2: Sub-agent analysis (with checkpointing) ---
+  // For web research modules, iterations have already been injected as analysis
+  // checkpoints above — this step will see them all as "already analyzed" and skip.
   const analyzedRows = await ctx.integrations.db.query(
     `SELECT chunk_index FROM pipeline_analysis
      WHERE run_id = $1
@@ -547,7 +642,11 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   );
   const analyzedSet = new Set(analyzedRows.map(r => r.chunk_index));
 
-  const pendingChunks = routed.filter((_, i) => !analyzedSet.has(i));
+  // For web research modules, analysis is synthetic (injected from iterations).
+  // Skip the normal sub-agent loop entirely — pendingChunks is empty.
+  const pendingChunks = WEB_RESEARCH_MODULES.has(moduleId)
+    ? []
+    : routed.filter((_, i) => !analyzedSet.has(i));
   let analysisCompleted = analyzedSet.size;
   let failedChunks = 0;
   let truncatedChunks = 0;

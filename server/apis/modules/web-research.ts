@@ -12,6 +12,13 @@ const RESEARCH_MODEL = "claude-sonnet-4-6";
 const RESEARCH_MAX_TOKENS = 4096;
 const WEB_SEARCH_MAX_USES = 10;
 
+/** Per-call timeout for the Anthropic web_search request (ms) */
+const PER_CALL_TIMEOUT_MS = 90_000; // 90s — adjustable once real timing data exists
+
+/** Retry config */
+const MAX_RETRIES = 3;
+const BACKOFF_BASE_MS = 2000; // 2s, 4s, 8s
+
 // ---------------------------------------------------------------------------
 // Schemas
 // ---------------------------------------------------------------------------
@@ -24,6 +31,8 @@ const ResearchIterationSchema = z.object({
   category: z.string().optional(),
   sources: z.array(z.string()).optional(),
   materiality: z.string().optional(),
+  truncated: z.boolean().optional(),
+  failed: z.boolean().optional(),
 });
 
 // Anthropic response with tool_use support
@@ -59,59 +68,110 @@ function sanitizeBraces(text: string): string {
 }
 
 /**
+ * Internal result shape for the raw LLM call.
+ */
+interface WebSearchRawResult {
+  text: string;
+  truncated: boolean;
+}
+
+/**
  * Run one web search iteration using Anthropic's built-in web_search tool.
- * The web_search_20250305 tool is SERVER-SIDE: Anthropic executes the search
- * and returns results all in a single API response. No multi-turn tool_result
- * round-trip is needed.
+ * Includes retry with exponential backoff and per-call timeout via Promise.race.
+ *
+ * Budget-check-per-retry: the caller passes `deadlineMs` (wall-clock ms since
+ * epoch by which we must stop). Before each retry attempt we check remaining
+ * budget — if less than 30s remains, bail early rather than starting a call
+ * that will almost certainly exceed the overall budget.
  */
 async function runWebSearchIteration(
   ai: { apiRequest: Function },
   systemPrompt: string,
-  iterationPrompt: string
-): Promise<string> {
-  const response = await ai.apiRequest(
-    {
-      method: "POST",
-      path: "/v1/messages",
-      body: {
-        model: RESEARCH_MODEL,
-        max_tokens: RESEARCH_MAX_TOKENS,
-        system: [
-          {
-            type: "text",
-            text: systemPrompt,
-            cache_control: { type: "ephemeral" },
-          },
-        ],
-        messages: [{ role: "user", content: iterationPrompt }],
-        tools: [
-          {
-            type: "web_search_20250305" as string,
-            name: "web_search",
-            max_uses: WEB_SEARCH_MAX_USES,
-          },
-        ],
-      },
-    },
-    { response: ToolUseResponseSchema },
-    { label: "Web search iteration" }
-  );
+  iterationPrompt: string,
+  deadlineMs: number | null, // null = no deadline (for legacy client-side calls)
+  label: string = "Web search iteration"
+): Promise<WebSearchRawResult> {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    // Budget check before each attempt (lesson from callExtractionLLM)
+    if (deadlineMs !== null) {
+      const remaining = deadlineMs - Date.now();
+      if (remaining < 30_000) {
+        throw new Error(
+          `Budget exhausted mid-retry (attempt ${attempt}/${MAX_RETRIES}, ${Math.round(remaining / 1000)}s left): ${label}`
+        );
+      }
+    }
 
-  // Collect all text blocks from the single response
-  let text = "";
-  for (const block of response.content) {
-    if (block.type === "text" && block.text) {
-      text += block.text;
+    try {
+      // Race against per-call timeout
+      const timeoutMs = deadlineMs !== null
+        ? Math.min(PER_CALL_TIMEOUT_MS, deadlineMs - Date.now())
+        : PER_CALL_TIMEOUT_MS;
+
+      const response = await Promise.race([
+        ai.apiRequest(
+          {
+            method: "POST",
+            path: "/v1/messages",
+            body: {
+              model: RESEARCH_MODEL,
+              max_tokens: RESEARCH_MAX_TOKENS,
+              system: [
+                {
+                  type: "text",
+                  text: systemPrompt,
+                  cache_control: { type: "ephemeral" },
+                },
+              ],
+              messages: [{ role: "user", content: iterationPrompt }],
+              tools: [
+                {
+                  type: "web_search_20250305" as string,
+                  name: "web_search",
+                  max_uses: WEB_SEARCH_MAX_USES,
+                },
+              ],
+            },
+          },
+          { response: ToolUseResponseSchema },
+          { label }
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`Web search timed out after ${Math.round(timeoutMs / 1000)}s: ${label}`)),
+            timeoutMs
+          )
+        ),
+      ]);
+
+      // Collect all text blocks from the single response
+      let text = "";
+      for (const block of response.content) {
+        if (block.type === "text" && block.text) {
+          text += block.text;
+        }
+      }
+
+      // Truncation detection: stop_reason === "max_tokens" means the response
+      // was cut off mid-generation. The text may be incomplete/invalid JSON.
+      const truncated = response.stop_reason === "max_tokens";
+
+      return { text, truncated };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isRetryable = /503|429|rate.?limit|service.?unavailable|overloaded|timed out/i.test(msg);
+      if (!isRetryable || attempt === MAX_RETRIES) throw err;
+      const delay = Math.min(BACKOFF_BASE_MS * Math.pow(2, attempt - 1), 15_000);
+      await new Promise(r => setTimeout(r, delay));
     }
   }
-
-  return text;
+  throw new Error("Unreachable");
 }
 
 /**
  * Parse a JSON iteration result from the research response text.
  */
-function parseIterationResult(
+export function parseIterationResult(
   responseText: string,
   iteration: number
 ): {
@@ -153,11 +213,11 @@ function parseIterationResult(
 }
 
 // ---------------------------------------------------------------------------
-// Research prompt builders
+// Research prompt builders (exported for use by web-research-phase.ts)
 // ---------------------------------------------------------------------------
 
 // System prompt for the external risk research agent
-const EXTERNAL_RISK_SYSTEM_PROMPT = `You are an elite external risk research agent conducting due diligence for a private equity acquisition. Your job is to uncover risks that the deal team may have missed, understated, or not yet considered.
+export const EXTERNAL_RISK_SYSTEM_PROMPT = `You are an elite external risk research agent conducting due diligence for a private equity acquisition. Your job is to uncover risks that the deal team may have missed, understated, or not yet considered.
 
 Use the web_search tool aggressively — search for specific companies, executives, regulations, competitors, and market dynamics. Cross-reference what you find against the deal documents provided.
 
@@ -165,7 +225,9 @@ Do NOT research social media reputation, employee sentiment, or brand perception
 
 Be thorough but creative. The best diligence uncovers what nobody thought to ask about.`;
 
-function buildExternalRiskIterationPrompt(
+export const SOCIAL_REPUTATION_SYSTEM_PROMPT = "You are a reputation and social intelligence research agent conducting due diligence for a private equity acquisition. Use the web_search tool to research social signals, employee sentiment, customer perception, and brand reputation. Focus ONLY on public external sources.";
+
+export function buildExternalRiskIterationPrompt(
   dealContext: string,
   docContext: string,
   previousFindings: string
@@ -222,7 +284,7 @@ function buildExternalRiskIterationPrompt(
     .join("\n");
 }
 
-function buildSocialReputationIterationPrompt(
+export function buildSocialReputationIterationPrompt(
   dealContext: string,
   docContext: string,
   previousFindings: string,
@@ -264,13 +326,25 @@ function buildSocialReputationIterationPrompt(
     .join("\n");
 }
 
+// Social reputation research categories (exported for web-research-phase.ts)
+export const SOCIAL_REPUTATION_CATEGORIES = [
+  "GLASSDOOR & INDEED: Employee reviews, ratings trends, management approval",
+  "LINKEDIN: Employee growth/decline, sentiment in posts, talent retention signals",
+  "TWITTER/X: Brand mentions, customer complaints, viral incidents",
+  "INSTAGRAM & FACEBOOK: Brand engagement, customer comments, ad transparency",
+  "CUSTOMER REVIEWS: G2, Trustpilot, BBB, industry-specific review platforms",
+  "REDDIT: Employee throwaway accounts, customer complaints, competitive comparisons",
+  "NEWS MEDIA: PR crises, leadership controversies, corporate culture exposés",
+  "C-SUITE: Executive social presence, thought leadership, public statements",
+].join("\n");
+
 // ---------------------------------------------------------------------------
-// API — Run one web research iteration
+// API — Run one web research iteration (hardened with retry + timeout)
 // ---------------------------------------------------------------------------
 export default api({
   name: "WebResearch",
   description:
-    "Runs one web research iteration using Anthropic web_search tool",
+    "Runs one web research iteration using Anthropic web_search tool with retry and timeout",
 
   integrations: {
     ai: anthropic(ANTHROPIC_ID),
@@ -283,6 +357,7 @@ export default api({
     docContext: z.string(),
     previousFindings: z.string(),
     researchCategories: z.string().nullable().optional(),
+    deadlineMs: z.number().nullable().optional(), // Wall-clock deadline (epoch ms); null = no deadline
   }),
 
   output: ResearchIterationSchema,
@@ -296,6 +371,7 @@ export default api({
       docContext,
       previousFindings,
       researchCategories,
+      deadlineMs,
     }
   ) {
     let iterationPrompt: string;
@@ -305,7 +381,7 @@ export default api({
         sanitizeBraces(dealContext),
         sanitizeBraces(docContext),
         sanitizeBraces(previousFindings),
-        sanitizeBraces(researchCategories ?? "")
+        sanitizeBraces(researchCategories ?? SOCIAL_REPUTATION_CATEGORIES)
       );
     } else {
       iterationPrompt = buildExternalRiskIterationPrompt(
@@ -318,27 +394,35 @@ export default api({
     // Pick the system prompt based on module
     const systemPrompt =
       moduleId === "social_reputation"
-        ? "You are a reputation and social intelligence research agent conducting due diligence for a private equity acquisition. Use the web_search tool to research social signals, employee sentiment, customer perception, and brand reputation. Focus ONLY on public external sources."
+        ? SOCIAL_REPUTATION_SYSTEM_PROMPT
         : EXTERNAL_RISK_SYSTEM_PROMPT;
 
+    const label = `Web search: ${moduleId} iteration ${iteration}`;
+
     try {
-      const responseText = await runWebSearchIteration(
+      const { text, truncated } = await runWebSearchIteration(
         ctx.integrations.ai,
         systemPrompt,
-        iterationPrompt
+        iterationPrompt,
+        deadlineMs ?? null,
+        label
       );
 
-      const result = parseIterationResult(responseText, iteration);
+      const result = parseIterationResult(text, iteration);
 
       return {
         iteration,
         query: result.query,
-        finding: result.finding,
+        finding: truncated
+          ? `[TRUNCATED] ${result.finding}`
+          : result.finding,
         confidence: result.confidence,
         platform: result.platform,
         category: result.category,
         sources: result.sources,
         materiality: result.materiality,
+        truncated,
+        failed: false,
       };
     } catch (err) {
       const msg =
@@ -348,7 +432,12 @@ export default api({
         query: "error",
         finding: `Research iteration failed: ${msg}`,
         confidence: 1,
+        truncated: false,
+        failed: true,
       };
     }
   },
 });
+
+// Re-export the raw iteration runner for use by web-research-phase.ts (server-side loop)
+export { runWebSearchIteration, PER_CALL_TIMEOUT_MS, MAX_RETRIES, BACKOFF_BASE_MS };
