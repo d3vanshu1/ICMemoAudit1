@@ -26,6 +26,8 @@ import GetRunOutput from './modules/get-run-output.js';
 // Server-side pipeline
 import RunModulePipeline from './pipeline/run-module-pipeline.js';
 import ResumeStalePipelines from './pipeline/resume-stale-pipelines.js';
+import DiagnoseParsedText from './pipeline/diagnose-parsed-text.js';
+import CleanParsedTextDryRun from './pipeline/clean-parsed-text-api.js';
 
 // Database setup
 import SetupSchema from './db/setup-schema.js';
@@ -88,7 +90,7 @@ const apis = {
   AnalyzeChunk, UniversalExtract, MergeFindings, FormatReport, WebResearch,
   SaveModuleResult, LoadModuleResults, GetRunHistory, GetRunOutput,
   // Server-side pipeline
-  RunModulePipeline, ResumeStalePipelines,
+  RunModulePipeline, ResumeStalePipelines, DiagnoseParsedText, CleanParsedTextDryRun,
   // DB setup
   SetupSchema, RunCheckpointMigration, CreatePipelineTable, CheckSchemaHealth, AddConcurrentRunIndex,
   // Deals
