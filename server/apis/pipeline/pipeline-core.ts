@@ -58,6 +58,7 @@ import { SUB_AGENT_PROMPTS } from "../modules/analyze-chunk.js";
 import { MERGE_PROMPTS, FINDINGS_RULE_FINAL, FINDINGS_RULE_INTERMEDIATE } from "../modules/merge-findings.js";
 import { runPostCompletionAudit } from "./post-completion-audit.js";
 import { runExtractionPhase } from "./extraction-phase.js";
+import { runDocTablesPhase } from "./doc-tables-phase.js";
 
 // ---------------------------------------------------------------------------
 // Models & Config
@@ -387,6 +388,14 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
       truncatedMerges: 0,
       firstError: extractionResult.firstError,
     };
+  }
+
+  // --- Step 0.6: Ensure doc_tables is populated for spreadsheet documents ---
+  // Same self-sufficiency pattern as extraction phase. Pure CPU (no LLM calls),
+  // completes in seconds. If doc_tables is already populated, this is a no-op.
+  const docTablesResult = await runDocTablesPhase(ctx, dealId);
+  if (docTablesResult.needed && docTablesResult.warnings.length > 0) {
+    console.log(`[DocTablesPhase] Warnings: ${docTablesResult.warnings.join("; ")}`);
   }
 
   // --- Step 1: Load universal extractions + route ---
