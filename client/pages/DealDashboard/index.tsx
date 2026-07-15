@@ -1648,7 +1648,12 @@ export default function DealDashboardPage() {
         const failInfo = (pipelineResult as { failedChunks?: number; firstError?: string | null }).failedChunks
           ? ` (${(pipelineResult as { failedChunks?: number }).failedChunks} failed)`
           : "";
-        if (phase === "extraction") {
+        if (phase === "cleanup") {
+          setModuleProgress(moduleId, {
+            message: `Cleaning documents… ${prog.analysisCompleted}/${prog.analysisTotal}`,
+            detail: { current: prog.analysisCompleted, total: prog.analysisTotal, phase: "analyzing" },
+          });
+        } else if (phase === "extraction") {
           setModuleProgress(moduleId, {
             message: `Extracting documents… ${prog.analysisCompleted}/${prog.analysisTotal}${failInfo}`,
             detail: { current: prog.analysisCompleted, total: prog.analysisTotal, phase: "analyzing" },

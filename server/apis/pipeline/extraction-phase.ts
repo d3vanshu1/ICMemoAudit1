@@ -89,6 +89,7 @@ async function callExtractionLLM(
   ctx: PipelineContext,
   chunk: TextChunk,
   totalChunks: number,
+  startTime: number,
   retries = 3
 ): Promise<ExtractionLLMResult> {
   const label = `Extract: ${sanitizeBraces(chunk.label)} (${chunk.chunkIndex + 1}/${totalChunks})`;
@@ -111,6 +112,13 @@ async function callExtractionLLM(
   };
 
   for (let attempt = 1; attempt <= retries; attempt++) {
+    // Budget check before each attempt (not just the first).
+    // A single call can take up to 120s; if less than that remains, bail early.
+    const remaining = EXTRACTION_TIME_BUDGET_MS - (Date.now() - startTime);
+    if (remaining < 30_000) {
+      throw new Error(`Budget exhausted mid-retry (attempt ${attempt}/${retries}, ${Math.round(remaining / 1000)}s left): ${label}`);
+    }
+
     try {
       const result = await Promise.race([
         ctx.integrations.ai.apiRequest(
@@ -286,7 +294,7 @@ export async function runExtractionPhase(
         }
 
         try {
-          const { text: rawText, truncated } = await callExtractionLLM(ctx, chunk, totalChunks);
+          const { text: rawText, truncated } = await callExtractionLLM(ctx, chunk, totalChunks, startTime);
 
           // If truncated, mark it so future runs will retry this chunk
           if (truncated) {

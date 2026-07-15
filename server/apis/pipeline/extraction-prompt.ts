@@ -176,7 +176,7 @@ export function computeContentHash(text: string): string {
 export const EXTRACTION_MODEL = "claude-sonnet-4-6";
 
 /** Number of concurrent LLM extraction calls per batch. */
-export const EXTRACTION_CONCURRENCY = 12;
+export const EXTRACTION_CONCURRENCY = 8; // Reduced from 12 to limit account-level rate-limit pressure
 
 // ---------------------------------------------------------------------------
 // Chunking
