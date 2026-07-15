@@ -25,6 +25,9 @@ export default api({
     corruptedCount: z.number(),
     totalBytesSaved: z.number(),
     applied: z.boolean(),
+    partial: z.boolean(),
+    documentsProcessed: z.number(),
+    documentsTotal: z.number(),
     documents: z.array(z.object({
       documentId: z.string(),
       fileName: z.string(),
@@ -45,9 +48,12 @@ export default api({
   }),
 
   async run(ctx, { dealId, dryRun }) {
+    // Diagnostic API — give it a generous budget (no pipeline constraints)
     const result = await runCleanParsedTextPhase(ctx.integrations.db, {
       dealId,
       dryRun,
+      startTime: Date.now(),
+      timeBudgetMs: 250_000, // 4m10s — generous for standalone diagnostic use
     });
 
     return result;

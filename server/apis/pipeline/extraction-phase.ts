@@ -30,7 +30,7 @@ import type { PipelineContext } from "./pipeline-core.js";
 const EXTRACTION_MAX_TOKENS = 8000;
 
 /** How much time budget the extraction phase is allowed to consume (ms) */
-const EXTRACTION_TIME_BUDGET_MS = 180_000; // 3 minutes
+const EXTRACTION_TIME_BUDGET_MS = 150_000; // 2.5 minutes — leaves headroom for Steps 0.4/0.6/0.7 + platform 300s limit
 
 /** Page size for loading existing extraction keys (small rows: ~80 bytes each) */
 const EXTRACTION_KEYS_PAGE_SIZE = 5000;
@@ -272,10 +272,19 @@ export async function runExtractionPhase(
   let extractedSoFar = successfulCount;
   let failedChunks = 0;
   let firstError: string | null = null;
+  let budgetExhausted = false;
 
   const processBatch = async (batch: TextChunk[]): Promise<void> => {
     const results = await Promise.allSettled(
       batch.map(async (chunk) => {
+        // Per-call budget check: skip if we've already exceeded the extraction budget.
+        // This prevents a batch of 12 calls from all firing when only 20s remain.
+        const elapsedBeforeCall = Date.now() - startTime;
+        if (elapsedBeforeCall >= EXTRACTION_TIME_BUDGET_MS) {
+          budgetExhausted = true;
+          return { success: false, error: "budget_skip" };
+        }
+
         try {
           const { text: rawText, truncated } = await callExtractionLLM(ctx, chunk, totalChunks);
 
@@ -360,6 +369,8 @@ export async function runExtractionPhase(
       if (r.status === "fulfilled") {
         if (r.value.success) {
           extractedSoFar++;
+        } else if (r.value.error === "budget_skip") {
+          // Not a failure — just skipped due to time budget. Don't count it.
         } else {
           failedChunks++;
           if (!firstError && r.value.error) firstError = r.value.error;
@@ -374,7 +385,7 @@ export async function runExtractionPhase(
 
   // Process in batches of EXTRACTION_CONCURRENCY
   for (let i = 0; i < allChunks.length; i += EXTRACTION_CONCURRENCY) {
-    // Time budget check
+    // Time budget check — before starting batch
     const elapsed = Date.now() - startTime;
     if (elapsed >= EXTRACTION_TIME_BUDGET_MS) {
       return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
@@ -382,6 +393,12 @@ export async function runExtractionPhase(
 
     const batch = allChunks.slice(i, i + EXTRACTION_CONCURRENCY);
     await processBatch(batch);
+
+    // Post-batch check: if any call inside the batch detected budget exhaustion,
+    // return partial immediately rather than starting another batch.
+    if (budgetExhausted) {
+      return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
+    }
   }
 
   return { needed: true, completed: true, totalChunks };

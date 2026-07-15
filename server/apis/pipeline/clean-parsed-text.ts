@@ -15,6 +15,10 @@
  *
  * This module supports dry-run mode (reports what would change without writing)
  * and live mode (writes cleaned text back to documents.parsed_text).
+ *
+ * TIME-BUDGET AWARE: Accepts startTime and timeBudgetMs. Checks between documents
+ * and returns partial=true if the budget is exceeded. Naturally resumable since
+ * cleaned docs are skipped on subsequent invocations (idempotent).
  */
 
 /** Minimal DB interface matching ctx.integrations.db at runtime */
@@ -62,6 +66,12 @@ export interface CleanupPhaseResult {
   totalBytesSaved: number;
   /** Whether changes were written (false in dry-run) */
   applied: boolean;
+  /** True if the phase stopped early due to time budget */
+  partial: boolean;
+  /** How many documents were processed before stopping */
+  documentsProcessed: number;
+  /** Total documents that need checking */
+  documentsTotal: number;
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -399,18 +409,27 @@ export interface CleanupInput {
   dealId: string;
   /** If true, only reports what would change without writing */
   dryRun: boolean;
+  /** Pipeline start time (Date.now() at pipeline entry). Used for time-budget checks. */
+  startTime: number;
+  /** Time budget in ms from startTime. The phase will stop between documents if exceeded. */
+  timeBudgetMs: number;
 }
 
 /**
  * Run the parsed_text cleanup phase.
  * Detects corruption in spreadsheet documents, trims phantom columns,
  * and optionally writes cleaned text back.
+ *
+ * TIME-BUDGET AWARE: Checks elapsed time between documents and returns
+ * partial=true if the budget is exceeded. Naturally resumable because
+ * cleaned docs are idempotent (no corruption detected on re-run).
  */
 export async function runCleanParsedTextPhase(
   db: DbClient,
   input: CleanupInput
 ): Promise<CleanupPhaseResult> {
-  const { dealId, dryRun } = input;
+  const { dealId, dryRun, startTime, timeBudgetMs } = input;
+  const timeRemaining = () => timeBudgetMs - (Date.now() - startTime);
 
   // Step 1: Find spreadsheet documents for this deal
   const docs = await db.query(
@@ -429,8 +448,24 @@ export async function runCleanParsedTextPhase(
   const results: DocCleanupResult[] = [];
   let corruptedCount = 0;
   let totalBytesSaved = 0;
+  let documentsProcessed = 0;
 
   for (const doc of docs) {
+    // ─── Time-budget check between documents ─────────────────────────────
+    // Reserve 30s headroom so we don't start a multi-MB load that can't finish.
+    if (timeRemaining() < 30_000) {
+      console.log(`[Step 0.4] Time budget exhausted after ${documentsProcessed}/${docs.length} documents — returning partial`);
+      return {
+        documents: results,
+        corruptedCount,
+        totalBytesSaved,
+        applied: !dryRun,
+        partial: true,
+        documentsProcessed,
+        documentsTotal: docs.length,
+      };
+    }
+
     const documentId = doc.id;
     const fileName = doc.file_name;
 
@@ -518,6 +553,8 @@ export async function runCleanParsedTextPhase(
       bytesSaved,
       hadCorruption: docHadCorruption,
     });
+
+    documentsProcessed++;
   }
 
   return {
@@ -525,5 +562,8 @@ export async function runCleanParsedTextPhase(
     corruptedCount,
     totalBytesSaved,
     applied: !dryRun,
+    partial: false,
+    documentsProcessed,
+    documentsTotal: docs.length,
   };
 }
