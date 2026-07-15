@@ -169,6 +169,16 @@ export function computeContentHash(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Extraction settings (single source of truth for server-side extraction)
+// ---------------------------------------------------------------------------
+
+/** Claude model used for universal extraction. */
+export const EXTRACTION_MODEL = "claude-sonnet-4-6";
+
+/** Number of concurrent LLM extraction calls per batch. */
+export const EXTRACTION_CONCURRENCY = 12;
+
+// ---------------------------------------------------------------------------
 // Chunking
 // ---------------------------------------------------------------------------
 export const CHUNK_CHARS = 5_000;

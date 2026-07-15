@@ -19,6 +19,8 @@ import {
   isSpreadsheetFile,
   chunkDocument,
   CHUNK_CHARS,
+  EXTRACTION_MODEL,
+  EXTRACTION_CONCURRENCY,
   type TextChunk,
 } from "./extraction-prompt.js";
 import type { PipelineContext } from "./pipeline-core.js";
@@ -26,9 +28,7 @@ import type { PipelineContext } from "./pipeline-core.js";
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-const EXTRACTION_MODEL = "claude-sonnet-4-6";
 const EXTRACTION_MAX_TOKENS = 8000;
-const EXTRACTION_CONCURRENCY = 12;
 
 /** How much time budget the extraction phase is allowed to consume (ms) */
 const EXTRACTION_TIME_BUDGET_MS = 180_000; // 3 minutes
