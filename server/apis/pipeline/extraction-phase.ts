@@ -32,6 +32,10 @@ const EXTRACTION_MAX_TOKENS = 8000;
 /** How much time budget the extraction phase is allowed to consume (ms) */
 const EXTRACTION_TIME_BUDGET_MS = 150_000; // 2.5 minutes — leaves headroom for Steps 0.4/0.6/0.7 + platform 300s limit
 
+/** Inter-call stagger delay within a batch (ms). Spreads 8 calls over ~1.75s
+ *  instead of firing all simultaneously, reducing 429 bursts. */
+const STAGGER_DELAY_MS = 250;
+
 /** Page size for loading existing extraction keys (small rows: ~80 bytes each) */
 const EXTRACTION_KEYS_PAGE_SIZE = 5000;
 
@@ -283,10 +287,17 @@ export async function runExtractionPhase(
   let budgetExhausted = false;
 
   const processBatch = async (batch: TextChunk[]): Promise<void> => {
-    const results = await Promise.allSettled(
-      batch.map(async (chunk) => {
+    // Stagger launches: each call starts STAGGER_DELAY_MS after the previous one.
+    // All calls still run concurrently once launched — only the start is spread out.
+    const promises: Promise<{ success: boolean; error: string | null }>[] = [];
+    for (let idx = 0; idx < batch.length; idx++) {
+      const chunk = batch[idx];
+      // Delay each call (first fires immediately)
+      const staggeredCall = (async () => {
+        if (idx > 0) await new Promise(r => setTimeout(r, idx * STAGGER_DELAY_MS));
+
         // Per-call budget check: skip if we've already exceeded the extraction budget.
-        // This prevents a batch of 12 calls from all firing when only 20s remain.
+        // This prevents a batch of 8 calls from all firing when only 20s remain.
         const elapsedBeforeCall = Date.now() - startTime;
         if (elapsedBeforeCall >= EXTRACTION_TIME_BUDGET_MS) {
           budgetExhausted = true;
@@ -370,8 +381,11 @@ export async function runExtractionPhase(
           } catch { /* best effort */ }
           return { success: false, error: errMsg };
         }
-      })
-    );
+      })();
+      promises.push(staggeredCall);
+    }
+
+    const results = await Promise.allSettled(promises);
 
     for (const r of results) {
       if (r.status === "fulfilled") {
