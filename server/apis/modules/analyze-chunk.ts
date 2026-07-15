@@ -42,7 +42,16 @@ Be precise and dense — every word should carry information:
 - "claim" states WHAT is claimed. "location" states WHERE. Do not repeat one in the other.
 - "description" in flags states the gap directly — do not explain why it matters.
 - "context" in data_points notes WHY this data point is relevant, in one phrase.
-- "raw_summary": 2-3 dense sentences.`;
+- "raw_summary": 2-3 dense sentences.
+
+## CRITICAL: No Ad-Hoc Arithmetic
+
+Do NOT perform any summation, reconciliation, or arithmetic verification on raw numbers in the text.
+Do NOT add up periodic values (monthly, quarterly, yearly) to check against totals.
+Do NOT compare computed sums to stated subtotals or variance columns.
+Do NOT flag "discrepancies" based on your own calculations — LLM arithmetic is unreliable.
+All numeric verification is handled by a separate deterministic system (NumericVerify).
+Your role is EXTRACTION ONLY: report what the document states, not whether the numbers add up.`;
 
 export const SUB_AGENT_PROMPTS: Record<string, string> = {
   // ---- Omission Audit ----

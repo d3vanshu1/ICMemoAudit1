@@ -257,6 +257,51 @@ function csvEscape(value: string): string {
 }
 
 /**
+ * Compute the true populated bounds of a sheet by scanning actual cell content.
+ * sheet["!ref"] can report a vastly inflated range (e.g. 16,000+ columns) when
+ * the file was saved with phantom columns. This function walks the sheet's keys
+ * to find the real last row/column containing data.
+ */
+function getPopulatedRange(sheet: XLSX.WorkSheet): XLSX.Range {
+  const ref = sheet["!ref"];
+  const reported = ref ? XLSX.utils.decode_range(ref) : { s: { r: 0, c: 0 }, e: { r: 0, c: 0 } };
+
+  let maxR = reported.s.r;
+  let maxC = reported.s.c;
+  let minR = reported.e.r;
+  let minC = reported.e.c;
+  let foundAny = false;
+
+  // Iterate sheet keys — cell addresses are strings like "A1", "B2", etc.
+  // Skip special keys that start with "!"
+  for (const key of Object.keys(sheet)) {
+    if (key.startsWith("!")) continue;
+    const cell = sheet[key] as XLSX.CellObject | undefined;
+    if (!cell) continue;
+    // Skip truly empty cells (type 'z' = blank, or no value and no formula)
+    if (cell.t === "z" && !cell.f) continue;
+    if (cell.v == null && cell.w == null && !cell.f) continue;
+
+    const { r, c } = XLSX.utils.decode_cell(key);
+    if (!foundAny) {
+      minR = r; maxR = r; minC = c; maxC = c;
+      foundAny = true;
+    } else {
+      if (r < minR) minR = r;
+      if (r > maxR) maxR = r;
+      if (c < minC) minC = c;
+      if (c > maxC) maxC = c;
+    }
+  }
+
+  if (!foundAny) {
+    return { s: { r: 0, c: 0 }, e: { r: 0, c: 0 } };
+  }
+
+  return { s: { r: minR, c: minC }, e: { r: maxR, c: maxC } };
+}
+
+/**
  * Parse an Excel buffer into compact CSV text.
  * Processes every sheet and concatenates the output.
  *
@@ -270,6 +315,8 @@ function csvEscape(value: string): string {
  *    cells without cached values are still visible as [=FORMULA] text
  *  - Entirely blank rows are skipped
  *  - Header-row detection scans the first 5 rows to skip title/blank rows
+ *  - Uses getPopulatedRange() to compute true bounds from actual cell content,
+ *    avoiding phantom columns from inflated sheet["!ref"]
  */
 function parseExcel(buffer: ArrayBuffer): string {
   const workbook = XLSX.read(buffer, { type: "array", cellDates: true });
@@ -279,7 +326,8 @@ function parseExcel(buffer: ArrayBuffer): string {
     const sheet = workbook.Sheets[sheetName];
     if (!sheet || !sheet["!ref"]) continue;
 
-    const range = XLSX.utils.decode_range(sheet["!ref"]);
+    // Use true populated bounds instead of trusting sheet["!ref"]
+    const range = getPopulatedRange(sheet);
 
     // Build a 2D array of cell display values by reading cells directly.
     const allRows: string[][] = [];
@@ -588,7 +636,8 @@ export function parseExcelToTables(buffer: ArrayBuffer, fileName: string): Struc
     const sheet = workbook.Sheets[sheetName];
     if (!sheet || !sheet["!ref"]) continue;
 
-    const range = XLSX.utils.decode_range(sheet["!ref"]);
+    // Use true populated bounds instead of trusting sheet["!ref"]
+    const range = getPopulatedRange(sheet);
 
     // Build raw grid
     const allRows: Array<{ raw: (XLSX.CellObject | undefined)[]; display: string[] }> = [];

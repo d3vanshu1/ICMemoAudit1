@@ -909,6 +909,30 @@ A "## Numeric Verification Report" section appears in the input below. It contai
     finalFindings = deduped;
   }
 
+  // --- Post-processing: suppress fabricated arithmetic/reconciliation findings ---
+  // LLM-generated findings that claim summation or reconciliation discrepancies are
+  // unreliable (ad-hoc arithmetic on raw text). Suppress them entirely.
+  // Only findings grounded in NumericVerify's deterministic output are trustworthy.
+  const FABRICATED_ARITHMETIC_PATTERNS = [
+    /\breconcil(?:e|iation|ing)\b.*\b(?:sum|total|add|subtotal)\b/i,
+    /\b(?:sum|total|add(?:s|ing)?|subtotal)\b.*\b(?:does not|doesn't|don't|do not)\s+(?:match|equal|reconcile|agree)\b/i,
+    /\b(?:adds? up to|sums? to|totals? to)\b.*\b(?:but|however|yet|whereas)\b/i,
+    /\bperiodic values?\b.*\b(?:sum|total)\b.*\b(?:discrepan|mismatch|inconsisten)/i,
+    /\barithmetic(?:al)?\s+(?:error|discrepancy|mismatch|inconsistency)\b/i,
+    /\bmanual(?:ly)?\s+(?:sum|add|calculat|total|reconcil)/i,
+    /\bcolumn[s]?\s+(?:sum|total|add)\b.*\b(?:variance|differ|mismatch|disagree)/i,
+  ];
+
+  const preSuppressCount = finalFindings.length;
+  finalFindings = finalFindings.filter(f => {
+    const text = `${f.title} ${f.detail} ${f.full_analysis}`;
+    return !FABRICATED_ARITHMETIC_PATTERNS.some(pat => pat.test(text));
+  });
+  const suppressedCount = preSuppressCount - finalFindings.length;
+  if (suppressedCount > 0) {
+    console.log(`[pipeline] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
+  }
+
   // Mark run completed
   // Guard: only complete if still running — prevents resurrection after purge/cancel
   await ctx.integrations.db.execute(
