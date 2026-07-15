@@ -16,7 +16,8 @@ export default api({
 
   input: z.object({
     dealId: z.string(),
-    runId: z.string(),
+    runId: z.string().optional(),
+    forcePurge: z.boolean().optional(),
   }),
 
   output: z.object({
@@ -24,23 +25,30 @@ export default api({
     extractionsPurged: z.number(),
   }),
 
-  async run(ctx, { dealId, runId }) {
-    // 1. Mark the stalled run as failed — check affected row count
-    const updateResult = await ctx.integrations.db.execute(
-      `UPDATE module_runs
-       SET status = 'failed', completed_at = now()
-       WHERE id = $1 AND status = 'running'`,
-      [runId],
-      { label: "Kill stalled run" }
-    );
+  async run(ctx, { dealId, runId, forcePurge }) {
+    // If forcePurge is set, skip run-matching entirely and go straight to purge.
+    if (!forcePurge) {
+      if (!runId) {
+        throw new Error("runId is required when forcePurge is not set");
+      }
 
-    // If the UPDATE didn't match any row, the runId is wrong/stale or already
-    // completed — refuse to purge extraction data to avoid silent data loss.
-    if (updateResult.rowCount === 0) {
-      return {
-        runReset: false,
-        extractionsPurged: 0,
-      };
+      // 1. Mark the stalled run as failed — check affected row count
+      const updateResult = await ctx.integrations.db.execute(
+        `UPDATE module_runs
+         SET status = 'failed', completed_at = now()
+         WHERE id = $1 AND status = 'running'`,
+        [runId],
+        { label: "Kill stalled run" }
+      );
+
+      // If the UPDATE didn't match any row, the runId is wrong/stale or already
+      // completed — refuse to purge extraction data to avoid silent data loss.
+      if (updateResult.rowCount === 0) {
+        return {
+          runReset: false,
+          extractionsPurged: 0,
+        };
+      }
     }
 
     // 2. Count extractions before purge
