@@ -55,25 +55,8 @@ const MUST_PRESERVE = [
   },
 ];
 
-// --- Pattern set under test ---
-
-const FABRICATED_ARITHMETIC_PATTERNS: RegExp[] = [
-  // Existing patterns (from first pass)
-  /\breconcil(?:e|iation|ing)\b.*\b(?:sum|total|add|subtotal)\b/i,
-  /\b(?:sum|total|add(?:s|ing)?|subtotal)\b.*\b(?:does not|doesn't|don't|do not)\s+(?:match|equal|reconcile|agree)\b/i,
-  /\b(?:adds? up to|sums? to|totals? to)\b.*\b(?:but|however|yet|whereas)\b/i,
-  /\bperiodic values?\b.*\b(?:sum|total)\b.*\b(?:discrepan|mismatch|inconsisten)/i,
-  /\barithmetic(?:al)?\s+(?:error|discrepancy|mismatch|inconsistency)\b/i,
-  /\bmanual(?:ly)?\s+(?:sum|add|calculat|total|reconcil)/i,
-  /\bcolumn[s]?\s+(?:sum|total|add)\b.*\b(?:variance|differ|mismatch|disagree)/i,
-
-  // New patterns (second pass — covers phrasing variants)
-  /\birreconcil/i,
-  /\bcannot\s+be\s+reconciled\b/i,
-  /\bfails?\s+to\s+reconcile\b/i,
-  /\bsum(?:s|ming)?\s+to\b.*\b(?:gap|shortfall|unexplained)\b/i,
-  /\bdo\s+not\s+reconcile\b/i,
-];
+// --- Pattern set under test (imported from production code) ---
+import { FABRICATED_ARITHMETIC_PATTERNS } from "../fabricated-arithmetic-patterns.js";
 
 // --- Test runner ---
 
@@ -114,4 +97,4 @@ for (const c of MUST_PRESERVE) {
 }
 
 console.log(`\n=== ${allPass ? "ALL PASS ✅" : "FAILED ❌"} ===`);
-process.exit(allPass ? 0 : 1);
+if (!allPass) throw new Error("Acceptance test failed");
