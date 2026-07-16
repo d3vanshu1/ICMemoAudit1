@@ -47,6 +47,16 @@ const MAX_GAPS_PER_INVOCATION = 16; // 2 full batches of 8
  *  rate limiter time to recover between batches. */
 const INTER_BATCH_COOLDOWN_MS = 5_000;
 
+/** When remaining gap-fill chunks are ≤ this count, drop concurrency to 1 ("solo"
+ *  mode) so each call gets the full time budget rather than sharing it.
+ *  Set to match EXTRACTION_CONCURRENCY: if the gaps fit in one batch anyway,
+ *  there's no throughput cost to running them sequentially with full budgets. */
+const SMALL_TAIL_THRESHOLD = 8;
+
+/** Budget floor for the solo path (ms). Solo calls only bail when less than
+ *  this much time remains — keeps a 10s safety margin for DB writes. */
+const SOLO_BUDGET_CHECK_MS = 10_000;
+
 /** Page size for loading existing extraction keys (small rows: ~80 bytes each) */
 const EXTRACTION_KEYS_PAGE_SIZE = 5000;
 
@@ -112,7 +122,8 @@ async function callExtractionLLM(
   chunk: TextChunk,
   totalChunks: number,
   startTime: number,
-  retries = 3
+  retries = 3,
+  solo = false
 ): Promise<ExtractionLLMResult> {
   const label = `Extract: ${sanitizeBraces(chunk.label)} (${chunk.chunkIndex + 1}/${totalChunks})`;
   const body = {
@@ -141,7 +152,8 @@ async function callExtractionLLM(
     // Budget check before each attempt (not just the first).
     // A single call can take up to 120s; if less than that remains, bail early.
     const remaining = EXTRACTION_TIME_BUDGET_MS - (Date.now() - startTime);
-    if (remaining < 30_000) {
+    const budgetFloor = solo ? SOLO_BUDGET_CHECK_MS : 30_000;
+    if (remaining < budgetFloor) {
       const priorErrors = attemptErrors.length > 0
         ? ` | prior_errors: [${attemptErrors.join("; ")}]`
         : "";
@@ -149,6 +161,9 @@ async function callExtractionLLM(
     }
 
     try {
+      const callTimeout = solo
+        ? remaining - 10_000          // Solo: uncapped — ~140s on fresh budget
+        : Math.min(120_000, remaining - 5_000); // Concurrent: capped at 120s
       const result = await Promise.race([
         ctx.integrations.ai.apiRequest(
           { method: "POST", path: "/v1/messages", body },
@@ -156,7 +171,9 @@ async function callExtractionLLM(
           { label }
         ),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`Extraction LLM timed out: ${label}`)), 120_000)
+          setTimeout(() => reject(new Error(
+            `Extraction LLM timed out after ${Math.round(callTimeout / 1000)}s: ${label}`
+          )), callTimeout)
         ),
       ]);
       const textBlock = result.content.find((c: { type: string }) => c.type === "text");
@@ -350,7 +367,7 @@ export async function runExtractionPhase(
         }
 
         try {
-          const { text: rawText, truncated } = await callExtractionLLM(ctx, chunk, totalChunks, startTime);
+          const { text: rawText, truncated } = await callExtractionLLM(ctx, chunk, totalChunks, startTime, 3, isSolo);
 
           // If truncated, mark it so future runs will retry this chunk
           if (truncated) {
@@ -472,7 +489,15 @@ export async function runExtractionPhase(
     skippedDueToBudget: chunksToProcess.length - attemptedThisPass,
   });
 
-  for (let i = 0; i < chunksToProcess.length; i += EXTRACTION_CONCURRENCY) {
+  // When only a few chunks remain, run them one-at-a-time (solo) so each
+  // call gets the full budget (~140s) instead of sharing it across 8 concurrent
+  // calls that all race the same 150s clock.
+  const effectiveConcurrency = chunksToProcess.length <= SMALL_TAIL_THRESHOLD
+    ? 1
+    : EXTRACTION_CONCURRENCY;
+  const isSolo = effectiveConcurrency === 1;
+
+  for (let i = 0; i < chunksToProcess.length; i += effectiveConcurrency) {
     // Time budget check — before starting batch
     const elapsed = Date.now() - startTime;
     if (elapsed >= EXTRACTION_TIME_BUDGET_MS) {
@@ -484,7 +509,7 @@ export async function runExtractionPhase(
       await new Promise(r => setTimeout(r, INTER_BATCH_COOLDOWN_MS));
     }
 
-    const batch = chunksToProcess.slice(i, i + EXTRACTION_CONCURRENCY);
+    const batch = chunksToProcess.slice(i, i + effectiveConcurrency);
 
     // Race the batch against remaining budget. Even if individual calls aren't
     // erroring (just slow first attempts running toward 120s), this ensures we
