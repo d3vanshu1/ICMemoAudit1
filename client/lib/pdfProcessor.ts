@@ -3,6 +3,7 @@ import workerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
 import * as XLSX from "xlsx";
 import Papa from "papaparse";
 import { isSpreadsheetFile } from "@/lib/pipelineConfig";
+import { extractFormulasFromXlsx } from "@/lib/ooxmlFormulaExtractor";
 
 // Use local worker file (required for pdfjs-dist v5 with Vite)
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
@@ -561,9 +562,15 @@ export function parseExcelToTables(buffer: ArrayBuffer, fileName: string): Struc
   const workbook = XLSX.read(buffer, { type: "array", cellDates: true });
   const tables: StructuredTable[] = [];
 
+  // Extract formulas directly from OOXML (bypasses SheetJS shared-formula bug)
+  const ooxmlFormulas = extractFormulasFromXlsx(buffer);
+
   for (const sheetName of workbook.SheetNames) {
     const sheet = workbook.Sheets[sheetName];
     if (!sheet || !sheet["!ref"]) continue;
+
+    // Get the OOXML formula map for this sheet (address → formula string)
+    const sheetFormulas = ooxmlFormulas.get(sheetName);
 
     // Use true populated bounds instead of trusting sheet["!ref"]
     const range = getPopulatedRange(sheet);
@@ -644,8 +651,15 @@ export function parseExcelToTables(buffer: ArrayBuffer, fileName: string): Struc
               : rawCell.v != null ? String(rawCell.v) : null;
           }
 
-          // Preserve formula
-          if (rawCell.f) {
+          // Preserve formula — use OOXML extraction (handles shared formulas correctly)
+          // Fall back to SheetJS rawCell.f only if OOXML didn't capture it
+          const absRow = nonEmptyRows[ri].absRowIdx;
+          const absCol = range.s.c + ci;
+          const cellAddr = XLSX.utils.encode_cell({ r: absRow, c: absCol });
+          const ooxmlFormula = sheetFormulas?.get(cellAddr);
+          if (ooxmlFormula) {
+            formula = ooxmlFormula;
+          } else if (rawCell.f) {
             formula = rawCell.f;
           }
         } else {

@@ -63,6 +63,8 @@ import GetDocTablesSummary from './documents/get-doc-tables-summary.js';
 import NumericVerify from './numeric/numeric-verify.js';
 import GetNumericReport from './numeric/get-numeric-report.js';
 import SearchNumericFindings from './numeric/search-numeric-findings.js';
+import DiagSharedFormulas from './numeric/diag-shared-formulas.js';
+import DiagFormulaExtraction from './numeric/diag-formula-extraction.js';
 
 // Q&A
 import IndexDocumentChunks from './qa/index-document-chunks.js';
@@ -105,7 +107,7 @@ const apis = {
   ListDocuments, SaveDocument, UpdateDocument, DeleteDocument, GetDocumentTexts,
   SaveDocTables, GetDocTables, BackfillDocTablesFromText, GetDocTablesSummary,
   // Numeric verification
-  NumericVerify, GetNumericReport, SearchNumericFindings,
+  NumericVerify, GetNumericReport, SearchNumericFindings, DiagSharedFormulas, DiagFormulaExtraction,
   // Q&A
   IndexDocumentChunks, SearchChunks, AskDataRoom,
   // Checkpoints
