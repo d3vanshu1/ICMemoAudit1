@@ -76,7 +76,8 @@ const MERGE_MAX_TOKENS = 8000;
 const ANALYSIS_CONCURRENCY = 15;
 const MERGE_CONCURRENCY = 10;
 const MERGE_GROUP_SIZE = 4;
-const MAX_MERGE_GROUP_FAILURES = 2; // Skip (use fallback) after this many error checkpoints across invocations
+const MAX_MERGE_GROUP_FAILURES = 3; // Skip (use fallback) after this many error checkpoints across invocations
+const MERGE_NODE_TEXT_CAP = 5000; // Max chars per node's text in merge input — prevents token overflow
 const TIME_BUDGET_MS = 200_000; // 3m20s — gives 100s headroom under platform's 300s API timeout
 // NOTE: Reduced from 250s because paginated extraction loading, checkpoint saves,
 // and DB overhead were pushing total wall-clock past the 300s platform limit.
@@ -194,7 +195,7 @@ async function callAnthropic(
   body: Record<string, unknown>,
   label: string,
   retries = 3,
-  perCallTimeoutMs = 120_000 // 2 minutes per LLM call — prevents hanging indefinitely
+  perCallTimeoutMs = 150_000 // 2.5 minutes per LLM call — prevents hanging indefinitely
 ): Promise<z.infer<typeof MessageResponseSchema>> {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -224,6 +225,56 @@ function extractTag(text: string, tag: string): string {
   const regex = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "i");
   const match = text.match(regex);
   return match ? match[1].trim() : "";
+}
+
+/**
+ * Truncate a merge node's text to MERGE_NODE_TEXT_CAP chars.
+ * Strategy: if text is a fenced JSON block, parse it and keep the most valuable
+ * fields (flags, key_claims, raw_summary) while trimming data_points.
+ * Falls back to simple char truncation with a marker.
+ */
+function truncateMergeNodeText(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+
+  // Try to parse structured JSON extraction (```json\n{...}\n```)
+  const jsonMatch = text.match(/```json\s*\n([\s\S]*?)\n```/);
+  if (jsonMatch) {
+    try {
+      const obj = JSON.parse(jsonMatch[1]);
+      // Priority order for fields to keep: flags > key_claims > raw_summary > data_points
+      // Remove data_points first (usually largest and least critical for merge synthesis)
+      if (obj.data_points && Array.isArray(obj.data_points)) {
+        // Progressively trim data_points until under cap
+        const dpCount = obj.data_points.length;
+        for (let keep = Math.floor(dpCount / 2); keep >= 0; keep -= Math.max(1, Math.floor(dpCount / 4))) {
+          obj.data_points = obj.data_points.slice(0, keep);
+          const rebuilt = text.replace(jsonMatch[0], "```json\n" + JSON.stringify(obj, null, 2) + "\n```");
+          if (rebuilt.length <= cap) {
+            const trimNote = keep < dpCount
+              ? `\n\n[NOTE: ${dpCount - keep} data_points trimmed for brevity — flags and claims preserved in full]`
+              : "";
+            return rebuilt + trimNote;
+          }
+        }
+        // data_points fully removed, still too long — trim key_claims
+        delete obj.data_points;
+        if (obj.key_claims && Array.isArray(obj.key_claims)) {
+          const claimCount = obj.key_claims.length;
+          obj.key_claims = obj.key_claims.slice(0, Math.ceil(claimCount / 2));
+          const rebuilt = text.replace(jsonMatch[0], "```json\n" + JSON.stringify(obj, null, 2) + "\n```");
+          if (rebuilt.length <= cap) {
+            return rebuilt + `\n\n[NOTE: Trimmed to ${obj.key_claims.length}/${claimCount} claims, removed data_points — flags preserved]`;
+          }
+        }
+        // If still too long after structured trimming, fall through to hard truncation
+      }
+    } catch {
+      // JSON parse failed — fall through to hard truncation
+    }
+  }
+
+  // Hard truncation fallback
+  return text.slice(0, cap) + `\n\n[...TRUNCATED from ${text.length} chars to ${cap} — full text available in extraction checkpoint]`;
 }
 
 // ---------------------------------------------------------------------------
@@ -841,6 +892,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // Tracks persisted failure count per group — stored inside the error checkpoint JSON
   // itself (not row count, since ON CONFLICT DO UPDATE means only 1 row exists per group).
   const errorCountMap = new Map<string, number>();
+  const errorMessageMap = new Map<string, string>(); // Preserves last error for diagnostics
   for (const cp of mergeCheckpoints) {
     const data = typeof cp.merged_json === "string" ? JSON.parse(cp.merged_json) : cp.merged_json;
     const cpKey = `${cp.tree_level}:${cp.node_index}`;
@@ -848,6 +900,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
       // failureCount is persisted in the JSON; default to 1 for legacy entries written before this field existed
       const count = typeof data.failureCount === "number" ? data.failureCount : 1;
       errorCountMap.set(cpKey, count);
+      errorMessageMap.set(cpKey, String(data.error));
       continue;
     }
     checkpointMap.set(cpKey, {
@@ -966,7 +1019,8 @@ A "## Numeric Verification Report" section appears in the input below. It contai
       // Skip groups that have failed too many times — use fallback immediately
       const priorFailures = errorCountMap.get(cpKey) ?? 0;
       if (priorFailures >= MAX_MERGE_GROUP_FAILURES) {
-        console.warn(`[pipeline] Skipping group R${currentRound}:G${group.idx} — ${priorFailures} prior failures, using fallback`);
+        const lastError = errorMessageMap.get(cpKey) ?? "unknown";
+        console.warn(`[pipeline] Skipping group R${currentRound}:G${group.idx} — ${priorFailures} prior failures (last: ${lastError.slice(0, 120)}), using fallback`);
         const memberFindings = group.members.flatMap(m => m.findings ?? []);
         accumulatedFindings.push(...memberFindings);
         const fallback: MergeNode = { text: group.members[0].text, executiveHeader: "Merge skipped (repeated failures)", findings: memberFindings };
@@ -977,7 +1031,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json)
            VALUES ($1, $2, $3, $4::jsonb)
            ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb`,
-          [runId, currentRound, group.idx, JSON.stringify({ text: fallback.text, executiveHeader: fallback.executiveHeader, findings: fallback.findings, skippedAfterFailures: priorFailures })],
+          [runId, currentRound, group.idx, JSON.stringify({ text: fallback.text, executiveHeader: fallback.executiveHeader, findings: fallback.findings, skippedAfterFailures: priorFailures, lastError })],
           { label: `Save fallback checkpoint R${currentRound}:G${group.idx} (skipped after ${priorFailures} failures)` }
         );
         continue;
@@ -997,12 +1051,11 @@ A "## Numeric Verification Report" section appears in the input below. It contai
 
       const results = await Promise.allSettled(
         batch.map(async (group) => {
-          const setBlocks = group.members.map((m, i) => `## Analysis Set ${i + 1}\n\n${m.text}`);
+          const setBlocks = group.members.map((m, i) => `## Analysis Set ${i + 1}\n\n${truncateMergeNodeText(m.text, MERGE_NODE_TEXT_CAP)}`);
           const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock;
 
-          // retries=1 → exactly 1 attempt, 0 retries (callAnthropic loop: attempt <= retries).
-          // Worst case = ~120s (single timeout). Previous default was retries=3 (3 attempts,
-          // 360s worst-case) which guaranteed platform death on persistent timeouts.
+          // retries=2 → 2 attempts (1 retry). Worst case = ~300s (2 × 150s timeout).
+          // Balanced: tolerates one transient timeout without risking platform death.
           const mergeResult = await callAnthropic(
             ctx,
             {
@@ -1012,7 +1065,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
               messages: [{ role: "user", content: mergeInput }],
             },
             `Merge R${currentRound} G${group.idx + 1}/${totalGroupsThisRound}`,
-            1 // 1 attempt, 0 retries
+            2 // 2 attempts, 1 retry
           );
 
           const mergeText = mergeResult.content.find((c: { type: string }) => c.type === "text")?.text ?? "";
