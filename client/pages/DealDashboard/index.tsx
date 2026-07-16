@@ -1768,46 +1768,80 @@ export default function DealDashboardPage() {
   }, [dealId, docs, handleRunModule, getRunProgressApi]);
 
   // ---------------------------------------------------------------------------
-  // Tab visibility: auto-resume pipeline when user returns from another tab.
-  // The pipeline polling loop dies when the browser throttles/aborts background
-  // tab connections. This listener detects when the tab regains focus and
-  // re-invokes handleRunModule for any module still running in DB but no longer
-  // driven by the active polling loop.
+  // Auto-resume: re-invokes orphaned pipelines (no active polling loop) when
+  // the tab regains focus OR periodically via heartbeat. Covers:
+  //   - Tab switch (visibilitychange hidden→visible)
+  //   - Laptop sleep/wake (visibilitychange in most browsers)
+  //   - Long-running foreground tab where the loop died silently (heartbeat)
+  //
+  // Guards against double-fire:
+  //   - resumingModules ref tracks which modules are currently being resumed
+  //   - pipelinePollingActive check before invoking (set by handleRunModule)
+  //   - Modules removed from resumingModules only after handleRunModule settles
+  //
+  // This is a CLIENT-SIDE improvement. The permanent browser-independent fix
+  // is a Superblocks Workflow (server-side cron) — this is complementary UX.
   // ---------------------------------------------------------------------------
+  const resumingModulesRef = useRef<Set<string>>(new Set());
+
   useEffect(() => {
     if (!dealId) return;
 
-    const handleVisibility = async () => {
-      if (document.visibilityState !== "visible") return;
-
+    const attemptResume = async () => {
       // Find modules that DB says are running but the pipeline loop is NOT driving
       const dbRunningIds = Object.entries(statuses)
         .filter(([, s]) => s.latestRun?.status === "running")
         .map(([id]) => id);
 
       const orphanedModules = dbRunningIds.filter(
-        (id) => !pipelinePollingActive.current.has(id)
+        (id) =>
+          !pipelinePollingActive.current.has(id) &&
+          !resumingModulesRef.current.has(id)
       );
 
       if (orphanedModules.length === 0) return;
 
-      // Small delay to let the browser fully wake up connections
+      // Small delay to let browser connections stabilize after wake
       await new Promise((r) => setTimeout(r, 1_000));
 
       for (const moduleId of orphanedModules) {
         if (moduleId === "executive_summary") continue;
-        // Get the run ID from statuses
         const runId = statuses[moduleId]?.latestRun?.id;
         if (!runId) continue;
-        // Only resume if not already being driven
+        // Re-check guards after the delay (another resume may have started)
         if (pipelinePollingActive.current.has(moduleId)) continue;
-        console.log(`[visibility] Resuming orphaned pipeline: ${moduleId} (run ${runId})`);
-        handleRunModule(moduleId, runId);
+        if (resumingModulesRef.current.has(moduleId)) continue;
+
+        resumingModulesRef.current.add(moduleId);
+        console.log(`[auto-resume] Re-invoking orphaned pipeline: ${moduleId} (run ${runId})`);
+        // Fire-and-forget: handleRunModule manages its own state
+        handleRunModule(moduleId, runId).finally(() => {
+          resumingModulesRef.current.delete(moduleId);
+        });
       }
     };
 
+    // Visibility change: covers tab switch + most sleep/wake scenarios
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        attemptResume();
+      }
+    };
+
+    // Heartbeat: catches the edge case where the tab stays foreground but
+    // the polling loop died (e.g., laptop sleep without visibility change,
+    // or a silent network disconnect that killed the API call)
+    const heartbeatInterval = setInterval(() => {
+      if (document.visibilityState === "visible") {
+        attemptResume();
+      }
+    }, 30_000);
+
     document.addEventListener("visibilitychange", handleVisibility);
-    return () => document.removeEventListener("visibilitychange", handleVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+      clearInterval(heartbeatInterval);
+    };
   }, [dealId, statuses, handleRunModule]);
 
   // ---------------------------------------------------------------------------
