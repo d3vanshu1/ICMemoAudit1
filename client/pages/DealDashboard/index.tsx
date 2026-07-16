@@ -1829,8 +1829,6 @@ export default function DealDashboardPage() {
           }
 
           setProgressMap((prev) => {
-            // Don't overwrite if the pipeline loop has set a more detailed message
-            if (prev[moduleId]?.detail) return prev;
             return { ...prev, [moduleId]: { message, detail: null, chunkErrors: [] } };
           });
         }
