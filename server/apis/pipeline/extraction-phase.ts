@@ -360,14 +360,21 @@ export async function runExtractionPhase(
 
         // Per-call budget check: skip if we've already exceeded the extraction budget.
         // This prevents a batch of 8 calls from all firing when only 20s remain.
-        const elapsedBeforeCall = Date.now() - startTime;
-        if (elapsedBeforeCall >= EXTRACTION_TIME_BUDGET_MS) {
-          budgetExhausted = true;
-          return { success: false, error: "budget_skip" };
+        // In solo mode, skip this check — solo chunks get their own fresh clock.
+        if (!isSolo) {
+          const elapsedBeforeCall = Date.now() - startTime;
+          if (elapsedBeforeCall >= EXTRACTION_TIME_BUDGET_MS) {
+            budgetExhausted = true;
+            return { success: false, error: "budget_skip" };
+          }
         }
 
         try {
-          const { text: rawText, truncated } = await callExtractionLLM(ctx, chunk, totalChunks, startTime, 3, isSolo);
+          // Solo chunks get a fresh startTime so their internal timeout is a full
+          // ~140s (EXTRACTION_TIME_BUDGET_MS - 10_000) rather than whatever's left
+          // after doc loading consumed the front of the pipeline's clock.
+          const chunkStart = isSolo ? Date.now() : startTime;
+          const { text: rawText, truncated } = await callExtractionLLM(ctx, chunk, totalChunks, chunkStart, 3, isSolo);
 
           // If truncated, mark it so future runs will retry this chunk
           if (truncated) {
@@ -511,22 +518,29 @@ export async function runExtractionPhase(
 
     const batch = chunksToProcess.slice(i, i + effectiveConcurrency);
 
-    // Race the batch against remaining budget. Even if individual calls aren't
-    // erroring (just slow first attempts running toward 120s), this ensures we
-    // abandon the batch once the pipeline's time budget is exhausted rather than
-    // waiting the full duration of the slowest in-flight call.
-    const remainingMs = EXTRACTION_TIME_BUDGET_MS - (Date.now() - startTime);
-    const deadlineTimer = new Promise<"DEADLINE">((resolve) =>
-      setTimeout(() => resolve("DEADLINE"), remainingMs)
-    );
+    if (isSolo) {
+      // Solo: each chunk gets its own fresh budget clock (~140s internal timeout).
+      // No deadline race — the chunk's internal timeout is the sole time bound.
+      // This lets solo chunks exceed the pipeline's extraction budget slightly
+      // (safe: still well under the 300s platform limit).
+      await processBatch(batch);
+    } else {
+      // Concurrent: race the batch against remaining pipeline budget. Ensures we
+      // abandon the batch once time budget is exhausted rather than waiting for
+      // the slowest in-flight call.
+      const remainingMs = EXTRACTION_TIME_BUDGET_MS - (Date.now() - startTime);
+      const deadlineTimer = new Promise<"DEADLINE">((resolve) =>
+        setTimeout(() => resolve("DEADLINE"), remainingMs)
+      );
 
-    const raceResult = await Promise.race([
-      processBatch(batch).then(() => "BATCH_DONE" as const),
-      deadlineTimer,
-    ]);
+      const raceResult = await Promise.race([
+        processBatch(batch).then(() => "BATCH_DONE" as const),
+        deadlineTimer,
+      ]);
 
-    if (raceResult === "DEADLINE") {
-      budgetExhausted = true;
+      if (raceResult === "DEADLINE") {
+        budgetExhausted = true;
+      }
     }
 
     // Post-batch check: if any call inside the batch detected budget exhaustion
