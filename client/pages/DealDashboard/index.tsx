@@ -1517,9 +1517,17 @@ export default function DealDashboardPage() {
         findings: finalResult.findings as MergeNode["findings"],
       };
 
-      const coverageLine = buildCoverageLine();
-      const totalMergeRounds = pipelineResult.progress.mergeTotal;
-      const fullReport = await generateReport(moduleId, finalMerge, totalMergeRounds + 1, coverageLine, numericReport);
+      // Use server-side formatted report if available (eliminates client-side FormatReport timeout).
+      // Fall back to client-side formatting only when the pipeline didn't produce one.
+      let fullReport: string;
+      if (finalResult.fullReport) {
+        console.log("[pipeline] Using server-side formatted report");
+        fullReport = finalResult.fullReport;
+      } else {
+        const coverageLine = buildCoverageLine();
+        const totalMergeRounds = pipelineResult.progress.mergeTotal;
+        fullReport = await generateReport(moduleId, finalMerge, totalMergeRounds + 1, coverageLine, numericReport);
+      }
 
       await saveModuleResult(moduleId, {
         executiveHeader: finalMerge.executiveHeader,

@@ -11,7 +11,7 @@ const ANTHROPIC_ID = "8ccd43c8-5340-4ae2-8eee-7cbb3896df53";
 // ---------------------------------------------------------------------------
 const SONNET_MODEL = "claude-sonnet-4-6";
 const OPUS_MODEL = "claude-opus-4-7";
-const REPORT_MAX_TOKENS = 16000;
+const REPORT_MAX_TOKENS = 12000;
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -821,7 +821,8 @@ No deterministic numeric verification was performed for this analysis. All figur
       `${findingsJson}${sanitizeBraces(numericBlock)}`;
 
     // --- Report generation with continuation on truncation ---
-    const MAX_CONTINUATIONS = 2;
+    const MAX_CONTINUATIONS = 1;
+    // Default to Sonnet (3× faster) — Opus only when explicitly requested via useOpus flag
     const selectedModel = useOpus ? OPUS_MODEL : SONNET_MODEL;
     let accumulated = "";
     let truncated = false;

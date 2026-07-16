@@ -62,6 +62,7 @@ import { runDocTablesPhase } from "./doc-tables-phase.js";
 import { runNumericVerifyInline } from "./numeric-verify-inline.js";
 import { runCleanParsedTextPhase } from "./clean-parsed-text.js";
 import { runWebResearchPhase } from "./web-research-phase.js";
+import { upsertModuleOutput } from "../modules/upsert-module-output.js";
 import type { NumericVerifyResult } from "./numeric-verify-inline.js";
 
 // ---------------------------------------------------------------------------
@@ -81,6 +82,11 @@ const MERGE_NODE_TEXT_CAP = 3000; // Max chars per node's text in merge input �
 const TIME_BUDGET_MS = 200_000; // 3m20s — gives 100s headroom under platform's 300s API timeout
 // NOTE: Reduced from 250s because paginated extraction loading, checkpoint saves,
 // and DB overhead were pushing total wall-clock past the 300s platform limit.
+
+// Report formatting config (inline, post-merge)
+const FORMAT_REPORT_MIN_BUDGET_MS = 100_000; // Need at least 100s to attempt report formatting
+const FORMAT_REPORT_MAX_TOKENS = 12000;
+const FORMAT_REPORT_MODEL = "claude-sonnet-4-6"; // Sonnet for speed; Opus only via client re-format
 
 /** Modules that go through the web research phase instead of direct analysis */
 const WEB_RESEARCH_MODULES = new Set(["external_risk_overlay", "social_reputation"]);
@@ -174,6 +180,7 @@ export interface PipelineResult {
     executiveHeader: string;
     findings: MergedFinding[];
     mergedText: string;
+    fullReport?: string | null;
   } | null;
   failedChunks?: number;
   truncatedChunks?: number; // analysis chunks where stop_reason was "max_tokens"
@@ -329,6 +336,73 @@ function truncateMergeNodeText(text: string, cap: number): string {
 
 // Exported for testing
 export { truncateMergeNodeText as _truncateMergeNodeText };
+
+// ---------------------------------------------------------------------------
+// Inline Report Formatting (runs inside the pipeline after merge completes)
+// ---------------------------------------------------------------------------
+
+/**
+ * Simple report formatting prompt — generates the full IC report inline.
+ * Uses a condensed version of the FormatReport prompt structure.
+ * The client can optionally re-format with Opus via the FormatReport API,
+ * but this inline Sonnet pass eliminates the client-side timeout risk.
+ */
+async function formatReportInline(
+  ctx: PipelineContext,
+  moduleId: string,
+  executiveHeader: string,
+  findings: MergedFinding[],
+  timeRemainingMs: number
+): Promise<string | null> {
+  if (findings.length === 0) {
+    return `# ${moduleId.replace(/_/g, " ").replace(/\\b\\w/g, (c: string) => c.toUpperCase())}\n\n## Executive Summary\n\n${executiveHeader}\n\n## Findings\n\nNo findings identified in this analysis.`;
+  }
+
+  const perCallTimeout = Math.min(timeRemainingMs - 10_000, 150_000); // Leave 10s for DB writes after
+  if (perCallTimeout < 30_000) {
+    console.warn(`[pipeline:format] Insufficient time for formatting (${Math.round(timeRemainingMs / 1000)}s remaining) — skipping`);
+    return null;
+  }
+
+  const findingsJson = JSON.stringify(findings, null, 2);
+
+  const systemPrompt = `You are a senior investment committee advisor. Write a detailed markdown report based on the structured findings provided.
+
+Rules:
+- Every finding must appear as a fully detailed write-up (heading + body). No finding may be omitted.
+- Critical findings: heading with [CRITICAL] tag, detail paragraph, full analysis, source docs, recommended action.
+- Warning findings: heading with [WARNING] tag, detail paragraph, condensed analysis (2-3 sentences), source docs.
+- Info findings: heading with [INFO] tag, single paragraph combining detail and takeaway, source docs.
+- Output ONLY markdown. Start directly with the report content.`;
+
+  const userContent = `## Executive Header\n\n${executiveHeader}\n\n## Findings (${findings.length} total)\n\n${findingsJson}`;
+
+  try {
+    const result = await callAnthropic(
+      ctx,
+      {
+        model: FORMAT_REPORT_MODEL,
+        max_tokens: FORMAT_REPORT_MAX_TOKENS,
+        system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
+        messages: [{ role: "user", content: userContent }],
+      },
+      "Inline format report",
+      2, // retries
+      perCallTimeout
+    );
+
+    const textBlock = result.content.find((c: { type: string }) => c.type === "text");
+    if (!textBlock || textBlock.type !== "text") return null;
+
+    return textBlock.text;
+  } catch (err) {
+    const msg = err && typeof err === "object" && "message" in err
+      ? String((err as { message: unknown }).message)
+      : String(err);
+    console.warn(`[pipeline:format] Inline formatting failed (non-fatal): ${msg}`);
+    return null;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Core Pipeline Function
@@ -1265,6 +1339,55 @@ A "## Numeric Verification Report" section appears in the input below. It contai
     console.log(`[pipeline] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
   }
 
+  // --- Step 6: Inline Report Formatting ---
+  // Attempt to format the full report server-side so the client doesn't need a separate
+  // FormatReport call (which was hitting the 300s platform timeout for large reports).
+  // If insufficient time budget remains, return in_progress so the next invocation picks it up.
+  let fullReport: string | null = null;
+  const formatBudget = timeRemaining();
+
+  if (formatBudget >= FORMAT_REPORT_MIN_BUDGET_MS) {
+    console.log(`[pipeline] Formatting report inline (${Math.round(formatBudget / 1000)}s budget)`);
+    fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget);
+  } else {
+    console.warn(`[pipeline] Insufficient time for inline formatting (${Math.round(formatBudget / 1000)}s < ${FORMAT_REPORT_MIN_BUDGET_MS / 1000}s needed) — deferring to next invocation`);
+    // Return in_progress so the client re-invokes with a fresh time budget
+    return {
+      status: "in_progress",
+      runId,
+      phase: "formatting",
+      progress: {
+        analysisTotal: routed.length,
+        analysisCompleted: routed.length,
+        mergeRound: totalMergeRounds,
+        mergeTotal: totalMergeRounds,
+      },
+      result: null,
+      failedChunks,
+      truncatedChunks,
+      truncatedMerges,
+      firstError,
+    };
+  }
+
+  // If formatting succeeded, persist to module_outputs now so it's available
+  // even if the client disconnects before its own save call.
+  if (fullReport) {
+    try {
+      await upsertModuleOutput(ctx.integrations.db, {
+        runId,
+        dealId,
+        executiveHeader: finalNode.executiveHeader,
+        findings: finalFindings,
+        fullReport,
+      });
+      console.log(`[pipeline] Report saved to module_outputs (${fullReport.length} chars)`);
+    } catch (saveErr) {
+      console.warn(`[pipeline] Failed to save report to module_outputs (non-fatal):`, saveErr);
+      // Continue — the result will still be returned to the client
+    }
+  }
+
   // Mark run completed
   // Guard: only complete if still running — prevents resurrection after purge/cancel
   await ctx.integrations.db.execute(
@@ -1308,6 +1431,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
       executiveHeader: finalNode.executiveHeader,
       findings: finalFindings,
       mergedText,
+      fullReport,
     },
     failedChunks,
     truncatedChunks,

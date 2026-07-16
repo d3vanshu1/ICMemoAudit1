@@ -58,6 +58,7 @@ export default api({
       executiveHeader: z.string(),
       findings: z.array(z.any()),
       mergedText: z.string(),
+      fullReport: z.string().nullable().optional(),
     }).nullable(),
     // Failure & quality diagnostics
     failedChunks: z.number().optional(),
