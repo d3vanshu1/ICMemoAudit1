@@ -712,6 +712,11 @@ export default api({
   }),
 
   async run(ctx, { moduleId, executiveHeader, findings, useOpus, coverageLine, numericReport }) {
+    // Time-budget guard: ensure we return a partial report rather than being
+    // killed mid-stream by the 300s platform hard limit.
+    const FORMAT_START_TIME = Date.now();
+    const FORMAT_TIME_BUDGET_MS = 220_000; // 220s — leaves 80s margin under 300s platform kill
+
     let reportPrompt = REPORT_PROMPTS[moduleId];
     if (!reportPrompt) {
       throw new Error(`Module "${moduleId}" report prompt not configured.`);
@@ -826,6 +831,18 @@ No deterministic numeric verification was performed for this analysis. All figur
     ];
 
     for (let attempt = 0; attempt <= MAX_CONTINUATIONS; attempt++) {
+      // Time-budget check: abort continuation if insufficient time remains
+      const elapsedMs = Date.now() - FORMAT_START_TIME;
+      const remainingMs = FORMAT_TIME_BUDGET_MS - elapsedMs;
+      if (attempt > 0 && remainingMs < 60_000) {
+        console.warn(
+          `[FormatReport] Time budget exhausted after ${Math.round(elapsedMs / 1000)}s — ` +
+          `skipping continuation ${attempt} (only ${Math.round(remainingMs / 1000)}s left)`
+        );
+        truncated = true;
+        break;
+      }
+
       const result = await ctx.integrations.ai.apiRequest(
         {
           method: "POST",

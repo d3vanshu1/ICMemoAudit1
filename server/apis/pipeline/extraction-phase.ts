@@ -483,5 +483,12 @@ export async function runExtractionPhase(
     return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
   }
 
+  // Only report extraction complete when ALL chunks succeeded.
+  // If any failed (even without budget exhaustion), the pipeline must re-invoke
+  // to retry them rather than proceeding to merge with incomplete data.
+  if (failedChunks > 0) {
+    return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
+  }
+
   return { needed: true, completed: true, totalChunks };
 }

@@ -523,6 +523,10 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     const ext = typeof row.extraction_json === "string"
       ? JSON.parse(row.extraction_json)
       : row.extraction_json;
+    // Never analyze failed extractions — they contain no usable text.
+    // (Defense-in-depth: the extraction gate should prevent reaching here with
+    // failed chunks, but this filter protects against stale DB state or reruns.)
+    if (ext.failed) return false;
     const tag = String(ext.documentTag ?? "other");
     return relevantTags.has(tag);
   });
