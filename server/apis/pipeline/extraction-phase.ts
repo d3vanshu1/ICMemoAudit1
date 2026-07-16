@@ -565,7 +565,10 @@ export async function runExtractionPhase(
   // Only report extraction complete when ALL chunks succeeded.
   // If any failed (even without budget exhaustion), the pipeline must re-invoke
   // to retry them rather than proceeding to merge with incomplete data.
-  if (failedChunks > 0) {
+  // Exception: if fewer than 5 chunks failed, skip them and proceed — retrying
+  // indefinitely for a handful of stubborn chunks isn't worth blocking the entire
+  // pipeline. The merge/analysis phases work fine with slightly incomplete data.
+  if (failedChunks > 0 && failedChunks >= 5) {
     return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError, passStats: makePassStats() };
   }
 
