@@ -87,10 +87,17 @@ const MessageResponseSchema = z.object({
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+export interface ExtractionPassStats {
+  attemptedThisPass: number;
+  succeededThisPass: number;
+  failedThisPass: number;
+  skippedDueToBudget: number;
+}
+
 export type ExtractionPhaseResult =
   | { needed: false }
   | { needed: true; completed: true; totalChunks: number }
-  | { needed: true; completed: false; extractedSoFar: number; totalChunks: number; failedChunks: number; firstError: string | null };
+  | { needed: true; completed: false; extractedSoFar: number; totalChunks: number; failedChunks: number; firstError: string | null; passStats: ExtractionPassStats };
 
 // ---------------------------------------------------------------------------
 // LLM call with retry + truncation detection
@@ -311,6 +318,11 @@ export async function runExtractionPhase(
   let firstError: string | null = null;
   let budgetExhausted = false;
 
+  // Per-pass observability counters
+  let attemptedThisPass = 0;
+  let succeededThisPass = 0;
+  let failedThisPass = 0;
+
   const processBatch = async (batch: TextChunk[]): Promise<void> => {
     // Stagger launches: each call starts STAGGER_DELAY_MS after the previous one.
     // All calls still run concurrently once launched — only the start is spread out.
@@ -415,17 +427,23 @@ export async function runExtractionPhase(
 
     for (const r of results) {
       if (r.status === "fulfilled") {
+        attemptedThisPass++;
         if (r.value.success) {
           extractedSoFar++;
+          succeededThisPass++;
         } else if (r.value.error === "budget_skip") {
           // Not a failure — just skipped due to time budget. Don't count it.
+          attemptedThisPass--; // Was never actually attempted
         } else {
           failedChunks++;
+          failedThisPass++;
           if (!firstError && r.value.error) firstError = r.value.error;
         }
       } else {
         // Promise itself rejected (shouldn't happen with inner try/catch, but guard)
+        attemptedThisPass++;
         failedChunks++;
+        failedThisPass++;
         if (!firstError) firstError = r.reason instanceof Error ? r.reason.message : String(r.reason);
       }
     }
@@ -439,11 +457,18 @@ export async function runExtractionPhase(
     : allChunks;
   const isThrottled = allChunks.length > MAX_GAPS_PER_INVOCATION;
 
+  const makePassStats = (): ExtractionPassStats => ({
+    attemptedThisPass,
+    succeededThisPass,
+    failedThisPass,
+    skippedDueToBudget: chunksToProcess.length - attemptedThisPass,
+  });
+
   for (let i = 0; i < chunksToProcess.length; i += EXTRACTION_CONCURRENCY) {
     // Time budget check — before starting batch
     const elapsed = Date.now() - startTime;
     if (elapsed >= EXTRACTION_TIME_BUDGET_MS) {
-      return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
+      return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError, passStats: makePassStats() };
     }
 
     // Inter-batch cooldown when throttled (skip before first batch)
@@ -474,20 +499,20 @@ export async function runExtractionPhase(
     // Post-batch check: if any call inside the batch detected budget exhaustion
     // OR the deadline timer fired, return partial immediately.
     if (budgetExhausted) {
-      return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
+      return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError, passStats: makePassStats() };
     }
   }
 
   // If we capped the chunks (more gaps exist than we attempted), always return incomplete
   if (allChunks.length > chunksToProcess.length) {
-    return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
+    return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError, passStats: makePassStats() };
   }
 
   // Only report extraction complete when ALL chunks succeeded.
   // If any failed (even without budget exhaustion), the pipeline must re-invoke
   // to retry them rather than proceeding to merge with incomplete data.
   if (failedChunks > 0) {
-    return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
+    return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError, passStats: makePassStats() };
   }
 
   return { needed: true, completed: true, totalChunks };

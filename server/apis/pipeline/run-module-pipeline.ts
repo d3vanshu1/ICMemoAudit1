@@ -64,6 +64,13 @@ export default api({
     truncatedChunks: z.number().optional(),
     truncatedMerges: z.number().optional(),
     firstError: z.string().nullable().optional(),
+    // Per-invocation extraction observability
+    extractionPassStats: z.object({
+      attemptedThisPass: z.number(),
+      succeededThisPass: z.number(),
+      failedThisPass: z.number(),
+      skippedDueToBudget: z.number(),
+    }).optional(),
   }),
 
   async run(ctx, input): Promise<PipelineResult> {

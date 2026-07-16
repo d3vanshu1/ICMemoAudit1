@@ -178,6 +178,12 @@ export interface PipelineResult {
   truncatedChunks?: number; // analysis chunks where stop_reason was "max_tokens"
   truncatedMerges?: number; // merge groups where stop_reason was "max_tokens"
   firstError?: string | null;
+  extractionPassStats?: {
+    attemptedThisPass: number;
+    succeededThisPass: number;
+    failedThisPass: number;
+    skippedDueToBudget: number;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +441,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
       truncatedChunks: 0,
       truncatedMerges: 0,
       firstError: extractionResult.firstError,
+      extractionPassStats: extractionResult.passStats,
     };
   }
 
