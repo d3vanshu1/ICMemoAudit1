@@ -133,12 +133,19 @@ async function callExtractionLLM(
     ],
   };
 
+  // Accumulate errors from each attempt so we can persist the full retry history
+  // when the budget-exhaustion check fires (which otherwise hides the root cause).
+  const attemptErrors: string[] = [];
+
   for (let attempt = 1; attempt <= retries; attempt++) {
     // Budget check before each attempt (not just the first).
     // A single call can take up to 120s; if less than that remains, bail early.
     const remaining = EXTRACTION_TIME_BUDGET_MS - (Date.now() - startTime);
     if (remaining < 30_000) {
-      throw new Error(`Budget exhausted mid-retry (attempt ${attempt}/${retries}, ${Math.round(remaining / 1000)}s left): ${label}`);
+      const priorErrors = attemptErrors.length > 0
+        ? ` | prior_errors: [${attemptErrors.join("; ")}]`
+        : "";
+      throw new Error(`Budget exhausted mid-retry (attempt ${attempt}/${retries}, ${Math.round(remaining / 1000)}s left): ${label}${priorErrors}`);
     }
 
     try {
@@ -162,6 +169,7 @@ async function callExtractionLLM(
       return { text: textBlock.text.trim(), truncated };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      attemptErrors.push(`attempt_${attempt}: ${msg.slice(0, 200)}`);
       // Broad retryable check — covers HTTP status codes, Anthropic error messages,
       // and Superblocks SDK integration error wrappers.
       const isRetryable = /503|429|500|rate.?limit|service.?unavailable|overloaded|timed out|too many|capacity|throttl|ECONNRESET|ETIMEDOUT|socket hang up/i.test(msg);
@@ -403,7 +411,7 @@ export async function runExtractionPhase(
             sourceFile: sanitizeBraces(chunk.sourceFile),
             documentTag: tag,
             failed: true,
-            error_msg: errMsg.slice(0, 500), // Persist actual error for diagnosis
+            error_msg: errMsg.slice(0, 1000), // Persist full error with prior_errors for diagnosis
           };
           try {
             await ctx.integrations.db.execute(
