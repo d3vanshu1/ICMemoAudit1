@@ -27,7 +27,7 @@ import type { PipelineContext } from "./pipeline-core.js";
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-const EXTRACTION_MAX_TOKENS = 8000;
+const EXTRACTION_MAX_TOKENS = 16000;
 
 /** How much time budget the extraction phase is allowed to consume (ms) */
 const EXTRACTION_TIME_BUDGET_MS = 150_000; // 2.5 minutes — leaves headroom for Steps 0.4/0.6/0.7 + platform 300s limit
@@ -155,7 +155,9 @@ async function callExtractionLLM(
       return { text: textBlock.text.trim(), truncated };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const isRetryable = /503|429|rate.?limit|service.?unavailable|overloaded|timed out/i.test(msg);
+      // Broad retryable check — covers HTTP status codes, Anthropic error messages,
+      // and Superblocks SDK integration error wrappers.
+      const isRetryable = /503|429|500|rate.?limit|service.?unavailable|overloaded|timed out|too many|capacity|throttl|ECONNRESET|ETIMEDOUT|socket hang up/i.test(msg);
       if (!isRetryable || attempt === retries) throw err;
       await new Promise(r => setTimeout(r, Math.min(2000 * Math.pow(2, attempt - 1), 15000)));
     }
