@@ -154,25 +154,27 @@ function parseWorksheetFormulas(xml: string): Map<string, string> {
   // Parse all <c> elements with their <f> children
   // Strategy: regex-based streaming parse (faster than DOMParser for large sheets)
   //
-  // Match <c r="addr" ...> ... </c> or self-closing <c r="addr" ... />
-  // We need to extract the <f> tag within each <c> element.
+  // CRITICAL: Must handle BOTH open-close <c r="A1">...</c> AND self-closing <c r="A1" .../>
+  // A single regex that only matches open-close will incorrectly match the ">" in "/>" as
+  // the open-tag terminator, then consume content from subsequent cells looking for </c>.
+  // The alternation below tries self-closing first (left branch) to prevent this.
   //
-  // Use a two-pass approach:
-  // Pass 1: Find all <f ...>...</f> or <f .../> elements with their parent <c r="...">
-  // Pass 2: Resolve shared formula members
+  // Pass 1: Find all <c> elements with an r= address attribute
+  // Pass 2: Extract <f> formula tags from open-close cells
+  // Pass 3: Resolve shared formula members
 
-  // Find cell elements containing formula tags
-  // Pattern: <c r="ADDR" ...>...<f ...>...</f>...</c>
-  // or: <c r="ADDR" ...>...<f .../> ...</c>
-  const cellWithFormulaRegex = /<c\s[^>]*?r="([A-Z]{1,3}\d+)"[^>]*?>([\s\S]*?)<\/c>/g;
-  const selfClosingCellRegex = /<c\s[^>]*?r="([A-Z]{1,3}\d+)"[^>]*?\/>/g;
+  // Alternation regex: self-closing <c ... /> (group 1=addr) | open-close <c ...>content</c> (group 2=addr, group 3=content)
+  const cellRegex = /<c\s[^>]*?r="([A-Z]{1,3}\d+)"[^>]*?\/>|<c\s[^>]*?r="([A-Z]{1,3}\d+)"[^>]*?(?<!\/)>([\s\S]*?)<\/c>/g;
 
   let cellMatch: RegExpExecArray | null;
 
-  // Process full <c>...</c> elements
-  while ((cellMatch = cellWithFormulaRegex.exec(xml)) !== null) {
-    const addr = cellMatch[1];
-    const cellContent = cellMatch[2];
+  // Process all <c> elements (both self-closing and open-close)
+  while ((cellMatch = cellRegex.exec(xml)) !== null) {
+    // Self-closing <c .../> — no children, skip (cannot contain <f>)
+    if (cellMatch[1] != null) continue;
+
+    const addr = cellMatch[2];
+    const cellContent = cellMatch[3];
 
     // Look for <f> within this cell
     const fMatch = cellContent.match(
@@ -224,7 +226,7 @@ function parseWorksheetFormulas(xml: string): Map<string, string> {
     }
   }
 
-  // Resolve shared formula members
+  // Pass 3: Resolve shared formula members
   for (const { addr, si } of sharedMembers) {
     const anchor = sharedAnchors.get(si);
     if (!anchor) continue; // orphaned member — skip

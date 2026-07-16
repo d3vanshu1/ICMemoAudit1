@@ -74,10 +74,10 @@ const OPUS_MODEL = "claude-opus-4-7";
 const MERGE_MAX_TOKENS = 8000;
 
 const ANALYSIS_CONCURRENCY = 15;
-const MERGE_CONCURRENCY = 10;
+const MERGE_CONCURRENCY = 5;
 const MERGE_GROUP_SIZE = 4;
 const MAX_MERGE_GROUP_FAILURES = 3; // Skip (use fallback) after this many error checkpoints across invocations
-const MERGE_NODE_TEXT_CAP = 5000; // Max chars per node's text in merge input — prevents token overflow
+const MERGE_NODE_TEXT_CAP = 3000; // Max chars per node's text in merge input — prevents token overflow
 const TIME_BUDGET_MS = 200_000; // 3m20s — gives 100s headroom under platform's 300s API timeout
 // NOTE: Reduced from 250s because paginated extraction loading, checkpoint saves,
 // and DB overhead were pushing total wall-clock past the 300s platform limit.
@@ -195,7 +195,7 @@ async function callAnthropic(
   body: Record<string, unknown>,
   label: string,
   retries = 3,
-  perCallTimeoutMs = 150_000 // 2.5 minutes per LLM call — prevents hanging indefinitely
+  perCallTimeoutMs = 120_000 // 2 minutes default — merge calls pass dynamic value
 ): Promise<z.infer<typeof MessageResponseSchema>> {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -229,53 +229,106 @@ function extractTag(text: string, tag: string): string {
 
 /**
  * Truncate a merge node's text to MERGE_NODE_TEXT_CAP chars.
- * Strategy: if text is a fenced JSON block, parse it and keep the most valuable
- * fields (flags, key_claims, raw_summary) while trimming data_points.
- * Falls back to simple char truncation with a marker.
+ * Strategy: parse the text as JSON (bare or fenced) and progressively trim
+ * low-priority fields (data_points → key_claims) while preserving flags intact.
+ * Falls back to simple char truncation only if parsing fails entirely.
  */
 function truncateMergeNodeText(text: string, cap: number): string {
   if (text.length <= cap) return text;
 
-  // Try to parse structured JSON extraction (```json\n{...}\n```)
-  const jsonMatch = text.match(/```json\s*\n([\s\S]*?)\n```/);
-  if (jsonMatch) {
-    try {
-      const obj = JSON.parse(jsonMatch[1]);
-      // Priority order for fields to keep: flags > key_claims > raw_summary > data_points
-      // Remove data_points first (usually largest and least critical for merge synthesis)
-      if (obj.data_points && Array.isArray(obj.data_points)) {
-        // Progressively trim data_points until under cap
-        const dpCount = obj.data_points.length;
-        for (let keep = Math.floor(dpCount / 2); keep >= 0; keep -= Math.max(1, Math.floor(dpCount / 4))) {
-          obj.data_points = obj.data_points.slice(0, keep);
-          const rebuilt = text.replace(jsonMatch[0], "```json\n" + JSON.stringify(obj, null, 2) + "\n```");
-          if (rebuilt.length <= cap) {
-            const trimNote = keep < dpCount
-              ? `\n\n[NOTE: ${dpCount - keep} data_points trimmed for brevity — flags and claims preserved in full]`
-              : "";
-            return rebuilt + trimNote;
-          }
-        }
-        // data_points fully removed, still too long — trim key_claims
-        delete obj.data_points;
-        if (obj.key_claims && Array.isArray(obj.key_claims)) {
-          const claimCount = obj.key_claims.length;
-          obj.key_claims = obj.key_claims.slice(0, Math.ceil(claimCount / 2));
-          const rebuilt = text.replace(jsonMatch[0], "```json\n" + JSON.stringify(obj, null, 2) + "\n```");
-          if (rebuilt.length <= cap) {
-            return rebuilt + `\n\n[NOTE: Trimmed to ${obj.key_claims.length}/${claimCount} claims, removed data_points — flags preserved]`;
-          }
-        }
-        // If still too long after structured trimming, fall through to hard truncation
+  // Try to parse as structured JSON — real sub-agent output is bare JSON (no fence)
+  let obj: Record<string, unknown> | null = null;
+  let prefix = ""; // any text before the JSON (e.g. "### Extraction from: ...\n\n")
+  let suffix = ""; // any text after
+  let jsonStr = "";
+
+  // 1. Try bare JSON parse (text is the JSON itself or starts with it after a header)
+  const jsonStart = text.indexOf("{");
+  if (jsonStart !== -1) {
+    const candidate = text.slice(jsonStart);
+    // Find the last closing brace
+    const lastBrace = candidate.lastIndexOf("}");
+    if (lastBrace !== -1) {
+      jsonStr = candidate.slice(0, lastBrace + 1);
+      try {
+        obj = JSON.parse(jsonStr);
+        prefix = text.slice(0, jsonStart);
+        suffix = text.slice(jsonStart + lastBrace + 1);
+      } catch {
+        obj = null;
       }
-    } catch {
-      // JSON parse failed — fall through to hard truncation
     }
   }
 
-  // Hard truncation fallback
+  // 2. Fallback: try fenced ```json block (covers any format drift)
+  if (!obj) {
+    const jsonMatch = text.match(/```json\s*\n([\s\S]*?)\n```/);
+    if (jsonMatch) {
+      try {
+        obj = JSON.parse(jsonMatch[1]);
+        jsonStr = jsonMatch[1];
+        const matchStart = text.indexOf(jsonMatch[0]);
+        prefix = text.slice(0, matchStart);
+        suffix = text.slice(matchStart + jsonMatch[0].length);
+      } catch {
+        obj = null;
+      }
+    }
+  }
+
+  // If we have a parsed object, do structured trimming
+  if (obj) {
+    const rebuild = (o: Record<string, unknown>): string =>
+      prefix + JSON.stringify(o, null, 2) + suffix;
+
+    // Priority: flags > key_claims > raw_summary > data_points
+    // Remove data_points first (usually the largest field)
+    if (obj.data_points && Array.isArray(obj.data_points)) {
+      const dpCount = (obj.data_points as unknown[]).length;
+      // Progressively trim data_points until under cap
+      for (let keep = Math.floor(dpCount / 2); keep >= 0; keep -= Math.max(1, Math.floor(dpCount / 4))) {
+        const trimmed = { ...obj, data_points: (obj.data_points as unknown[]).slice(0, keep) };
+        const built = rebuild(trimmed);
+        if (built.length <= cap) {
+          const note = keep < dpCount
+            ? `\n\n[NOTE: ${dpCount - keep} data_points trimmed — flags and claims preserved in full]`
+            : "";
+          return built + note;
+        }
+      }
+      // data_points fully removed, still too long — try trimming key_claims
+      const withoutDp = { ...obj };
+      delete withoutDp.data_points;
+
+      if (withoutDp.key_claims && Array.isArray(withoutDp.key_claims)) {
+        const claimCount = (withoutDp.key_claims as unknown[]).length;
+        const keepClaims = Math.ceil(claimCount / 2);
+        const trimmed = { ...withoutDp, key_claims: (withoutDp.key_claims as unknown[]).slice(0, keepClaims) };
+        const built = rebuild(trimmed);
+        if (built.length <= cap) {
+          return built + `\n\n[NOTE: Trimmed to ${keepClaims}/${claimCount} claims, removed data_points — flags preserved]`;
+        }
+      }
+
+      // Still too long — keep only flags + raw_summary (the minimum for merge synthesis)
+      const minimal: Record<string, unknown> = {};
+      if (obj.document_name) minimal.document_name = obj.document_name;
+      if (obj.document_type) minimal.document_type = obj.document_type;
+      if (obj.flags) minimal.flags = obj.flags;
+      if (obj.raw_summary) minimal.raw_summary = obj.raw_summary;
+      const built = rebuild(minimal);
+      if (built.length <= cap) {
+        return built + `\n\n[NOTE: Kept only flags + raw_summary — data_points and key_claims removed]`;
+      }
+    }
+  }
+
+  // Hard truncation fallback — only reached if JSON parsing failed or flags alone exceed cap
   return text.slice(0, cap) + `\n\n[...TRUNCATED from ${text.length} chars to ${cap} — full text available in extraction checkpoint]`;
 }
+
+// Exported for testing
+export { truncateMergeNodeText as _truncateMergeNodeText };
 
 // ---------------------------------------------------------------------------
 // Core Pipeline Function
@@ -1054,8 +1107,10 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           const setBlocks = group.members.map((m, i) => `## Analysis Set ${i + 1}\n\n${truncateMergeNodeText(m.text, MERGE_NODE_TEXT_CAP)}`);
           const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock;
 
-          // retries=2 → 2 attempts (1 retry). Worst case = ~300s (2 × 150s timeout).
-          // Balanced: tolerates one transient timeout without risking platform death.
+          // Dynamic timeout: use at most 80s per attempt, and at most 2 attempts.
+          // Worst case = 160s which leaves 40s headroom in the 200s budget.
+          // The timeRemaining guard ensures we never exceed the platform limit.
+          const perCallTimeout = Math.min(80_000, Math.max(30_000, timeRemaining() - 30_000));
           const mergeResult = await callAnthropic(
             ctx,
             {
@@ -1065,7 +1120,8 @@ A "## Numeric Verification Report" section appears in the input below. It contai
               messages: [{ role: "user", content: mergeInput }],
             },
             `Merge R${currentRound} G${group.idx + 1}/${totalGroupsThisRound}`,
-            2 // 2 attempts, 1 retry
+            2, // 2 attempts, 1 retry
+            perCallTimeout
           );
 
           const mergeText = mergeResult.content.find((c: { type: string }) => c.type === "text")?.text ?? "";
