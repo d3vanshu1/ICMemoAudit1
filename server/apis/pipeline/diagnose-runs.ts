@@ -59,6 +59,22 @@ export default api({
       latest_write_after: z.string().nullable(),
       writes_before_triggered: z.coerce.number(),
     }).nullable().optional(),
+    chunkStatus: z.array(z.object({
+      document_id: z.string(),
+      chunk_index: z.coerce.number(),
+      file_name: z.string(),
+      doc_text_length: z.coerce.number(),
+      status: z.string(),
+      error_msg: z.string().nullable(),
+      json_size: z.coerce.number(),
+      last_write: z.string(),
+    })).optional(),
+    chunkSummary: z.object({
+      total: z.number(),
+      successful: z.number(),
+      failed: z.number(),
+      truncated: z.number(),
+    }).optional(),
   }),
 
   async run(ctx, { dealId }) {
@@ -153,12 +169,57 @@ export default api({
       { label: "Concurrency check" }
     );
 
+    // Per-chunk extraction status: which chunks are failed/truncated/successful?
+    // Join with documents to get source text lengths for comparison.
+    const chunkStatus = await ctx.integrations.db.query(
+      `SELECT
+         ue.document_id,
+         ue.chunk_index,
+         d.file_name,
+         COALESCE(length(d.parsed_text), 0) AS doc_text_length,
+         CASE
+           WHEN (ue.extraction_json->>'failed')::boolean IS TRUE THEN 'failed'
+           WHEN (ue.extraction_json->>'truncated')::boolean IS TRUE THEN 'truncated'
+           ELSE 'success'
+         END AS status,
+         COALESCE(ue.extraction_json->>'error_msg', ue.extraction_json->>'error') AS error_msg,
+         LENGTH(ue.extraction_json::text) AS json_size,
+         ue.created_at::text AS last_write
+       FROM universal_extractions ue
+       JOIN documents d ON d.id = ue.document_id
+       WHERE ue.deal_id = $1
+       ORDER BY ue.document_id, ue.chunk_index
+       LIMIT 200`,
+      z.object({
+        document_id: z.string(),
+        chunk_index: z.coerce.number(),
+        file_name: z.string(),
+        doc_text_length: z.coerce.number(),
+        status: z.string(),
+        error_msg: z.string().nullable(),
+        json_size: z.coerce.number(),
+        last_write: z.string(),
+      }),
+      [dealId],
+      { label: "Per-chunk extraction status" }
+    );
+
+    // Summarize: group by status, show source lengths
+    const summary = {
+      total: chunkStatus.length,
+      successful: chunkStatus.filter(c => c.status === "success").length,
+      failed: chunkStatus.filter(c => c.status === "failed").length,
+      truncated: chunkStatus.filter(c => c.status === "truncated").length,
+    };
+
     return {
       runs,
       analysisCount,
       mergeCheckpoints,
       extractionTimeline,
       concurrencyCheck: concurrencyCheck[0] ?? null,
+      chunkStatus,
+      chunkSummary: summary,
     };
   },
 });

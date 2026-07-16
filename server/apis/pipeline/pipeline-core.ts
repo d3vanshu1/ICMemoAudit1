@@ -415,40 +415,27 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   }
 
   // --- Step 0.5: Ensure extractions exist (self-sufficient extraction phase) ---
-  // OPTIMIZATION: If analysis is already fully complete for this run, skip extraction
-  // gap-fill. The analysis already consumed the original extractions — re-filling
-  // truncated/failed rows would only benefit a fresh re-run, not this one.
-  const analysisCheckCountRows = await ctx.integrations.db.query(
-    `SELECT COUNT(*)::int AS cnt FROM pipeline_analysis WHERE run_id = $1`,
-    z.object({ cnt: z.number() }),
-    [runId],
-    { label: "Quick-check: analysis complete?" }
-  );
-  const analysisAlreadyDone = (analysisCheckCountRows[0]?.cnt ?? 0) > 0;
-
-  // Only run extraction gap-fill if analysis hasn't started yet (fresh run).
-  // Once analysis has checkpoints, the extractions it used are already consumed.
-  if (!analysisAlreadyDone) {
-    const extractionResult = await runExtractionPhase(ctx, dealId, startTime);
-    if (extractionResult.needed && !extractionResult.completed) {
-      // Time budget consumed by extraction — return in_progress so caller re-invokes
-      return {
-        status: "in_progress",
-        runId,
-        phase: "extraction",
-        progress: {
-          analysisTotal: extractionResult.totalChunks,
-          analysisCompleted: extractionResult.extractedSoFar,
-          mergeRound: 0,
-          mergeTotal: 0,
-        },
-        result: null,
-        failedChunks: extractionResult.failedChunks,
-        truncatedChunks: 0,
-        truncatedMerges: 0,
-        firstError: extractionResult.firstError,
-      };
-    }
+  // ALWAYS run extraction gap-fill regardless of analysis state.
+  // Requirement: full extraction data must exist before merge proceeds.
+  const extractionResult = await runExtractionPhase(ctx, dealId, startTime);
+  if (extractionResult.needed && !extractionResult.completed) {
+    // Time budget consumed by extraction — return in_progress so caller re-invokes
+    return {
+      status: "in_progress",
+      runId,
+      phase: "extraction",
+      progress: {
+        analysisTotal: extractionResult.totalChunks,
+        analysisCompleted: extractionResult.extractedSoFar,
+        mergeRound: 0,
+        mergeTotal: 0,
+      },
+      result: null,
+      failedChunks: extractionResult.failedChunks,
+      truncatedChunks: 0,
+      truncatedMerges: 0,
+      firstError: extractionResult.firstError,
+    };
   }
 
   // --- Step 0.6: Ensure doc_tables is populated for spreadsheet documents ---

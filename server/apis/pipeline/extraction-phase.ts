@@ -377,6 +377,7 @@ export async function runExtractionPhase(
             sourceFile: sanitizeBraces(chunk.sourceFile),
             documentTag: tag,
             failed: true,
+            error_msg: errMsg.slice(0, 500), // Persist actual error for diagnosis
           };
           try {
             await ctx.integrations.db.execute(
