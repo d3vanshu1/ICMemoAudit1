@@ -286,6 +286,18 @@ export async function runExtractionPhase(
     }
   }
 
+  // Prioritize the three always-failing documents so we get diagnostic data sooner
+  const PRIORITY_DOC_IDS = new Set([
+    "5c0e0060-0d36-4971-88e9-3bc440041897", // SCG - Project Saint-IM_vF.pdf
+    "989537e9-cad0-4588-b7d0-5391d29a44d8", // 2026-06-21 Saint IC update_vS.pdf
+    "b5ae5ba1-ef41-4947-a706-7c888c896e6a", // SCG IC Screening Memo vS.pdf
+  ]);
+  allChunks.sort((a, b) => {
+    const aPri = PRIORITY_DOC_IDS.has(a.documentId) ? 0 : 1;
+    const bPri = PRIORITY_DOC_IDS.has(b.documentId) ? 0 : 1;
+    return aPri - bPri;
+  });
+
   const successfulCount = extractedSet.size;
   const totalChunks = allChunks.length + successfulCount; // total = pending + already done
   if (allChunks.length === 0) {
