@@ -57,6 +57,12 @@ const SMALL_TAIL_THRESHOLD = 8;
  *  this much time remains — keeps a 10s safety margin for DB writes. */
 const SOLO_BUDGET_CHECK_MS = 10_000;
 
+/** Time budget for solo chunks (ms). Higher than EXTRACTION_TIME_BUDGET_MS because
+ *  solo runs one chunk at a time with no concurrency risk. Effective timeout per
+ *  chunk = SOLO_TIME_BUDGET_MS - SOLO_BUDGET_CHECK_MS = 200s.
+ *  Total call time ~225s (doc loading + 200s + writes), well under 300s platform limit. */
+const SOLO_TIME_BUDGET_MS = 210_000;
+
 /** Page size for loading existing extraction keys (small rows: ~80 bytes each) */
 const EXTRACTION_KEYS_PAGE_SIZE = 5000;
 
@@ -151,7 +157,8 @@ async function callExtractionLLM(
   for (let attempt = 1; attempt <= retries; attempt++) {
     // Budget check before each attempt (not just the first).
     // A single call can take up to 120s; if less than that remains, bail early.
-    const remaining = EXTRACTION_TIME_BUDGET_MS - (Date.now() - startTime);
+    const effectiveBudget = solo ? SOLO_TIME_BUDGET_MS : EXTRACTION_TIME_BUDGET_MS;
+    const remaining = effectiveBudget - (Date.now() - startTime);
     const budgetFloor = solo ? SOLO_BUDGET_CHECK_MS : 30_000;
     if (remaining < budgetFloor) {
       const priorErrors = attemptErrors.length > 0
