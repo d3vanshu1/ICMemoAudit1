@@ -1768,6 +1768,49 @@ export default function DealDashboardPage() {
   }, [dealId, docs, handleRunModule, getRunProgressApi]);
 
   // ---------------------------------------------------------------------------
+  // Tab visibility: auto-resume pipeline when user returns from another tab.
+  // The pipeline polling loop dies when the browser throttles/aborts background
+  // tab connections. This listener detects when the tab regains focus and
+  // re-invokes handleRunModule for any module still running in DB but no longer
+  // driven by the active polling loop.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!dealId) return;
+
+    const handleVisibility = async () => {
+      if (document.visibilityState !== "visible") return;
+
+      // Find modules that DB says are running but the pipeline loop is NOT driving
+      const dbRunningIds = Object.entries(statuses)
+        .filter(([, s]) => s.latestRun?.status === "running")
+        .map(([id]) => id);
+
+      const orphanedModules = dbRunningIds.filter(
+        (id) => !pipelinePollingActive.current.has(id)
+      );
+
+      if (orphanedModules.length === 0) return;
+
+      // Small delay to let the browser fully wake up connections
+      await new Promise((r) => setTimeout(r, 1_000));
+
+      for (const moduleId of orphanedModules) {
+        if (moduleId === "executive_summary") continue;
+        // Get the run ID from statuses
+        const runId = statuses[moduleId]?.latestRun?.id;
+        if (!runId) continue;
+        // Only resume if not already being driven
+        if (pipelinePollingActive.current.has(moduleId)) continue;
+        console.log(`[visibility] Resuming orphaned pipeline: ${moduleId} (run ${runId})`);
+        handleRunModule(moduleId, runId);
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, [dealId, statuses, handleRunModule]);
+
+  // ---------------------------------------------------------------------------
   // Progress polling for DB-running modules
   // Keeps UI updated independently of the RunModulePipeline call (which can
   // take up to 200s to return). Polls GetRunProgress every 15s and shows

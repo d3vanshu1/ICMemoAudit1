@@ -14,6 +14,15 @@ const RunRowSchema = z.object({
   completed_at: z.string().nullable(),
 });
 
+const MergeCheckpointSchema = z.object({
+  tree_level: z.coerce.number(),
+  node_index: z.coerce.number(),
+  json_size: z.coerce.number(),
+  error: z.string().nullable(),
+  failure_count: z.string().nullable(),
+  header: z.string().nullable(),
+});
+
 export default api({
   name: "DiagnoseRuns",
   description: "Shows recent module_runs for a deal to diagnose stuck pipelines",
@@ -29,6 +38,7 @@ export default api({
   output: z.object({
     runs: z.array(RunRowSchema),
     analysisCount: z.number().optional(),
+    mergeCheckpoints: z.array(MergeCheckpointSchema).optional(),
   }),
 
   async run(ctx, { dealId }) {
@@ -47,6 +57,7 @@ export default api({
     // Check analysis checkpoint count for the most recent running run
     const runningRun = runs.find(r => r.status === "running");
     let analysisCount: number | undefined;
+    let mergeCheckpoints: z.infer<typeof MergeCheckpointSchema>[] | undefined;
     if (runningRun) {
       const countRows = await ctx.integrations.db.query(
         `SELECT COUNT(*)::int AS cnt FROM pipeline_analysis WHERE run_id = $1`,
@@ -55,8 +66,24 @@ export default api({
         { label: "Count analysis checkpoints" }
       );
       analysisCount = countRows[0]?.cnt ?? 0;
+
+      // Get merge checkpoint details
+      mergeCheckpoints = await ctx.integrations.db.query(
+        `SELECT tree_level, node_index,
+                LENGTH(merged_json::text) AS json_size,
+                merged_json->>'error' AS error,
+                merged_json->>'failureCount' AS failure_count,
+                SUBSTRING(merged_json->>'executiveHeader', 1, 80) AS header
+         FROM merge_checkpoints
+         WHERE module_run_id = $1
+         ORDER BY tree_level, node_index
+         LIMIT 10`,
+        MergeCheckpointSchema,
+        [runningRun.id],
+        { label: "Merge checkpoint details" }
+      );
     }
 
-    return { runs, analysisCount };
+    return { runs, analysisCount, mergeCheckpoints };
   },
 });
