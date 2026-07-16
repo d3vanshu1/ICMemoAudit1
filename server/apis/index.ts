@@ -31,6 +31,7 @@ import CleanParsedTextDryRun from './pipeline/clean-parsed-text-api.js';
 import CountSheets from './pipeline/count-sheets.js';
 import DiagnoseChunks from './pipeline/diagnose-chunks.js';
 import ResetDealRun from './pipeline/reset-deal-run.js';
+import DiagnoseRuns from './pipeline/diagnose-runs.js';
 import RunMigration004 from './pipeline/run-migration.js';
 
 // Database setup
@@ -94,7 +95,7 @@ const apis = {
   AnalyzeChunk, UniversalExtract, MergeFindings, FormatReport, WebResearch,
   SaveModuleResult, LoadModuleResults, GetRunHistory, GetRunOutput,
   // Server-side pipeline
-  RunModulePipeline, ResumeStalePipelines, DiagnoseParsedText, CleanParsedTextDryRun, CountSheets, DiagnoseChunks, ResetDealRun, RunMigration004,
+  RunModulePipeline, ResumeStalePipelines, DiagnoseParsedText, CleanParsedTextDryRun, CountSheets, DiagnoseChunks, DiagnoseRuns, ResetDealRun, RunMigration004,
   // DB setup
   SetupSchema, RunCheckpointMigration, CreatePipelineTable, CheckSchemaHealth, AddConcurrentRunIndex,
   // Deals

@@ -43,6 +43,7 @@ export default api({
         triggeredAt: z.string(),
         completedAt: z.string().nullable(),
         documentsIncluded: z.array(z.string()),
+        analysisCheckpointCount: z.number(),
         mergeCheckpointCount: z.number(),
         // Errors surfaced from checkpoint JSONB (if any)
         checkpointErrors: z.array(z.string()),
@@ -73,9 +74,17 @@ export default api({
       { label: "Get active/recent runs" }
     );
 
-    // For each run, count merge checkpoints + surface errors from JSONB
+    // For each run, count analysis + merge checkpoints + surface errors from JSONB
     const result = [];
     for (const run of runs) {
+      // Count analysis checkpoints for this run
+      const analysisRows = await ctx.integrations.db.query(
+        `SELECT COUNT(*) AS cnt FROM pipeline_analysis WHERE run_id = $1`,
+        CountSchema,
+        [run.id],
+        { label: `Count analysis checkpoints for ${run.module_id}` }
+      );
+
       const ckptRows = await ctx.integrations.db.query(
         `SELECT COUNT(*) AS cnt FROM merge_checkpoints WHERE module_run_id = $1`,
         CountSchema,
@@ -106,6 +115,7 @@ export default api({
         triggeredAt: run.triggered_at,
         completedAt: run.completed_at,
         documentsIncluded: docsIncluded,
+        analysisCheckpointCount: analysisRows[0]?.cnt ?? 0,
         mergeCheckpointCount: ckptRows[0]?.cnt ?? 0,
         checkpointErrors: errorRows
           .map((r) => r.error_text)

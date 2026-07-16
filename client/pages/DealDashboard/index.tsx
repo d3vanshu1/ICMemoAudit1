@@ -1584,6 +1584,8 @@ export default function DealDashboardPage() {
         purgeStaleRunsApi({ dealId, staleMinutes: 30, excludeModuleId: moduleId }).catch(() => {});
       }
 
+      let exitedEarlyForResume = false;
+
       try {
         if (moduleId === "executive_summary") {
           await runExecutiveSummary();
@@ -1608,24 +1610,27 @@ export default function DealDashboardPage() {
           // Keep the module in "running" state so the progress poll continues to show updates.
           toast.info(`[${displayName}] Connection to server pipeline timed out. The analysis continues server-side — progress will update automatically.`);
           pipelinePollingActive.current.delete(moduleId);
+          exitedEarlyForResume = true;
           return; // Don't clean up runningModules — let the progress poll handle it
         }
 
         const hint = isTimeoutOrNetwork ? " Try with fewer or smaller files." : "";
         toast.error(`[${displayName}] Analysis failed: ${message}${hint}`);
       } finally {
-        setRunningModules((prev) => {
-          const next = new Set(prev);
-          next.delete(moduleId);
-          return next;
-        });
-        clearModuleProgress(moduleId);
-        pipelinePollingActive.current.delete(moduleId);
-        // Clean up cancellation tracking
-        const finishedRunId = activeRunIdRef.current[moduleId];
-        if (finishedRunId) {
-          cancelledRunsRef.current.delete(finishedRunId);
-          delete activeRunIdRef.current[moduleId];
+        if (!exitedEarlyForResume) {
+          setRunningModules((prev) => {
+            const next = new Set(prev);
+            next.delete(moduleId);
+            return next;
+          });
+          clearModuleProgress(moduleId);
+          pipelinePollingActive.current.delete(moduleId);
+          // Clean up cancellation tracking
+          const finishedRunId = activeRunIdRef.current[moduleId];
+          if (finishedRunId) {
+            cancelledRunsRef.current.delete(finishedRunId);
+            delete activeRunIdRef.current[moduleId];
+          }
         }
       }
     },
@@ -1793,7 +1798,7 @@ export default function DealDashboardPage() {
           // Skip if the pipeline polling loop is now providing real-time progress
           if (pipelinePollingActive.current.has(moduleId)) continue;
 
-          const run = runs.find((r: { moduleId: string; status: string }) => r.moduleId === moduleId && r.status === "running");
+          const run = runs.find((r: { moduleId: string; status: string; analysisCheckpointCount?: number; mergeCheckpointCount?: number }) => r.moduleId === moduleId && r.status === "running");
           if (!run) {
             // Run is no longer "running" in DB — it completed or failed while
             // we were polling. Refetch module results to get the final output.
@@ -1813,10 +1818,12 @@ export default function DealDashboardPage() {
 
           // Derive progress from checkpoint counts
           let message: string;
-          if (run.mergeCheckpointCount > 0) {
+          if (run.mergeCheckpointCount && run.mergeCheckpointCount > 0) {
             message = `Merge phase: ${run.mergeCheckpointCount} nodes merged (server-side)…`;
+          } else if (run.analysisCheckpointCount && run.analysisCheckpointCount > 0) {
+            message = `Analysis phase: ${run.analysisCheckpointCount} chunks completed (server-side)…`;
           } else if (extractionCount > 0) {
-            message = `Analysis phase: processing ${extractionCount} extractions (server-side)…`;
+            message = `Preparing analysis: ${extractionCount} extractions available (server-side)…`;
           } else {
             message = "Running (server-side)…";
           }
