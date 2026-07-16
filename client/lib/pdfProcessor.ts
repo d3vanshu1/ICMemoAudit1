@@ -38,10 +38,14 @@ export interface DocumentChunk {
 
 /** A single cell in a structured table grid */
 export interface StructuredCell {
-  /** Row index (0-based) */
+  /** Row index (0-based, relative to non-empty filtered grid) */
   r: number;
-  /** Column index (0-based) */
+  /** Column index (0-based, relative to non-empty filtered grid) */
   c: number;
+  /** Absolute row index in the original Excel sheet (0-based) */
+  absR?: number;
+  /** Absolute column index in the original Excel sheet (0-based) */
+  absC?: number;
   /** Resolved numeric or string value */
   value: number | string | null;
   /** Cell data type: number, string, date, boolean, empty */
@@ -600,8 +604,11 @@ export function parseExcelToTables(buffer: ArrayBuffer, fileName: string): Struc
     // Column headers
     const colHeaders = allRows[headerRowIdx].display.map((h, i) => h || `Col${i + 1}`);
 
-    // Data rows (after header)
-    const dataRows = allRows.slice(headerRowIdx + 1);
+    // Data rows (after header) — track absolute sheet row index
+    const dataRows = allRows.slice(headerRowIdx + 1).map((row, i) => ({
+      ...row,
+      absRowIdx: range.s.r + headerRowIdx + 1 + i,
+    }));
     const nonEmptyRows = dataRows.filter((row) => row.display.some((c) => c !== ""));
 
     // Row headers (first column of each data row)
@@ -656,7 +663,15 @@ export function parseExcelToTables(buffer: ArrayBuffer, fileName: string): Struc
           }
         }
 
-        cells.push({ r: ri, c: ci, value, type, formula });
+        cells.push({
+          r: ri,
+          c: ci,
+          absR: nonEmptyRows[ri].absRowIdx,
+          absC: range.s.c + ci,
+          value,
+          type,
+          formula,
+        });
       }
     }
 

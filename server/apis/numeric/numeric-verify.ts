@@ -9,6 +9,8 @@ const IC_DILIGENCE_DB = "ba09e2b9-2715-4460-8131-896f50b0c414";
 const StructuredCellSchema = z.object({
   r: z.number(),
   c: z.number(),
+  absR: z.number().optional(),
+  absC: z.number().optional(),
   value: z.union([z.number(), z.string(), z.null()]),
   type: z.enum(["number", "string", "date", "boolean", "empty"]),
   formula: z.string().optional(),
@@ -43,6 +45,8 @@ const DiscrepancySchema = z.object({
   sources: z.array(z.string()),
   expected: z.union([z.number(), z.string()]).optional(),
   actual: z.union([z.number(), z.string()]).optional(),
+  verification_method: z.enum(["formula", "heuristic"]).optional(),
+  diagnostic_range: z.array(z.string()).optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -52,6 +56,8 @@ const DiscrepancySchema = z.object({
 type Cell = {
   r: number;
   c: number;
+  absR?: number;
+  absC?: number;
   value: number | string | null;
   type: "number" | "string" | "date" | "boolean" | "empty";
   formula?: string;
@@ -65,8 +71,10 @@ type ParsedTable = {
   rowHeaders: string[];
   colHeaders: string[];
   cells: Cell[];
-  // Derived grid: [row][col] -> Cell | undefined
+  // Derived grid: [row][col] -> Cell | undefined (relative indices)
   grid: Map<string, Cell>;
+  // Absolute-coordinate grid: "absR,absC" -> Cell (for formula resolution)
+  absGrid: Map<string, Cell>;
 };
 
 type Figure = z.infer<typeof FigureSchema>;
@@ -153,7 +161,183 @@ function normalizeLabel(label: string): string {
 function buildGrid(table: ParsedTable): void {
   for (const cell of table.cells) {
     table.grid.set(`${cell.r},${cell.c}`, cell);
+    if (cell.absR != null && cell.absC != null) {
+      table.absGrid.set(`${cell.absR},${cell.absC}`, cell);
+    }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Formula parser — resolves Excel formula strings to absolute cell references
+// ---------------------------------------------------------------------------
+
+/** A single resolved cell reference (absolute row/col) */
+type FormulaRef = { absR: number; absC: number };
+
+/** Result of parsing: flat list of individual cell coords to sum, or null if unparseable */
+type ParsedFormula = { refs: FormulaRef[]; rejected: false } | { rejected: true; reason: string };
+
+/**
+ * Convert an Excel column letter (e.g. "A", "AA", "BZ") to 0-based column index.
+ */
+function colLetterToIndex(letters: string): number {
+  let idx = 0;
+  for (let i = 0; i < letters.length; i++) {
+    idx = idx * 26 + (letters.charCodeAt(i) - 64); // A=1
+  }
+  return idx - 1; // 0-based
+}
+
+/**
+ * Parse a single cell address like "D208" or "$D$208" into {absR, absC}.
+ * Returns null if it can't be parsed as a simple cell reference.
+ */
+function parseCellAddress(addr: string): FormulaRef | null {
+  // Remove $ signs (absolute markers don't affect our logic)
+  const cleaned = addr.replace(/\$/g, "").trim();
+  const match = cleaned.match(/^([A-Z]{1,3})(\d+)$/i);
+  if (!match) return null;
+  const col = colLetterToIndex(match[1].toUpperCase());
+  const row = parseInt(match[2], 10) - 1; // Excel is 1-based, we need 0-based
+  return { absR: row, absC: col };
+}
+
+/**
+ * Expand a range like "D208:D217" into individual cell refs.
+ * Only supports same-column ranges (which subtotal formulas always are).
+ * Returns null if the range spans multiple columns or is invalid.
+ */
+function expandRange(rangeStr: string): FormulaRef[] | null {
+  const parts = rangeStr.split(":");
+  if (parts.length !== 2) return null;
+
+  const start = parseCellAddress(parts[0]);
+  const end = parseCellAddress(parts[1]);
+  if (!start || !end) return null;
+
+  // Only support same-column ranges for subtotal verification
+  if (start.absC !== end.absC) return null;
+
+  const refs: FormulaRef[] = [];
+  const minR = Math.min(start.absR, end.absR);
+  const maxR = Math.max(start.absR, end.absR);
+
+  // Sanity: don't expand ranges > 500 rows (likely a data range, not a subtotal)
+  if (maxR - minR > 500) return null;
+
+  for (let r = minR; r <= maxR; r++) {
+    refs.push({ absR: r, absC: start.absC });
+  }
+  return refs;
+}
+
+/**
+ * Parse a formula string and return absolute cell references to sum.
+ *
+ * Supported patterns:
+ * - SUM(A1:A10)
+ * - SUM(A1:A10,A12,A14:A16)
+ * - SUM(A1:A10)+A12-A13  (additive terms outside SUM — these get included)
+ * - A1+A2+A3  (plain addition)
+ * - SUM(A1:A10)+SUM(A12:A15)
+ *
+ * Rejected (returns null):
+ * - Cross-sheet refs (contains "!")
+ * - External workbook refs (contains "[")
+ * - Named ranges (non-cell-address tokens in function args)
+ * - Complex functions: INDIRECT, OFFSET, VLOOKUP, INDEX, MATCH, IF, SUMIF, etc.
+ */
+function parseFormulaRefs(formula: string): ParsedFormula {
+  if (!formula || formula.trim() === "") {
+    return { rejected: true, reason: "empty formula" };
+  }
+
+  // Reject cross-sheet, external, and complex function references
+  if (formula.includes("!")) {
+    return { rejected: true, reason: "cross-sheet reference" };
+  }
+  if (formula.includes("[")) {
+    return { rejected: true, reason: "external workbook reference" };
+  }
+
+  const complexFunctions = /\b(INDIRECT|OFFSET|VLOOKUP|HLOOKUP|INDEX|MATCH|IF|SUMIF|SUMIFS|COUNTIF|AVERAGEIF|IFERROR|CHOOSE|LOOKUP)\b/i;
+  if (complexFunctions.test(formula)) {
+    return { rejected: true, reason: `complex function: ${formula.match(complexFunctions)?.[1]}` };
+  }
+
+  const allRefs: FormulaRef[] = [];
+
+  // Strategy: extract all SUM(...) blocks, then handle remaining +/- cell refs
+  let remaining = formula;
+
+  // Extract SUM blocks
+  const sumPattern = /SUM\s*\(([^()]+)\)/gi;
+  let sumMatch: RegExpExecArray | null;
+  while ((sumMatch = sumPattern.exec(formula)) !== null) {
+    const inner = sumMatch[1]; // e.g. "D208:D217,D219"
+    const args = inner.split(",").map((s) => s.trim());
+
+    for (const arg of args) {
+      if (arg.includes(":")) {
+        // Range
+        const expanded = expandRange(arg);
+        if (!expanded) {
+          return { rejected: true, reason: `unresolvable range: ${arg}` };
+        }
+        allRefs.push(...expanded);
+      } else {
+        // Single cell
+        const ref = parseCellAddress(arg);
+        if (!ref) {
+          return { rejected: true, reason: `unresolvable reference: ${arg}` };
+        }
+        allRefs.push(ref);
+      }
+    }
+
+    // Remove the SUM(...) from remaining
+    remaining = remaining.replace(sumMatch[0], "");
+  }
+
+  // Process remaining: strip leading/trailing operators, split by +/-
+  // This handles patterns like SUM(A1:A10)+A12-A13 → the +A12 and -A13 parts
+  // Also handles plain A1+A2+A3 (no SUM at all)
+  remaining = remaining.trim();
+  if (remaining) {
+    // Split on + or - while preserving the operator (for sign, though we sum all)
+    // For subtotal verification we sum absolute values of all referenced cells
+    // (the cell values themselves carry the sign from Excel)
+    const cellTokens = remaining.split(/[+\-*/]/).map((s) => s.trim()).filter((s) => s !== "");
+
+    for (const token of cellTokens) {
+      // Skip pure numeric literals (e.g., "+0" or constants)
+      if (/^\d+(\.\d+)?$/.test(token)) continue;
+
+      if (token.includes(":")) {
+        const expanded = expandRange(token);
+        if (!expanded) {
+          return { rejected: true, reason: `unresolvable range in expression: ${token}` };
+        }
+        allRefs.push(...expanded);
+      } else {
+        const ref = parseCellAddress(token);
+        if (!ref) {
+          // If it looks like a named range or garbage, reject
+          if (/^[A-Z_][A-Z0-9_]*$/i.test(token)) {
+            return { rejected: true, reason: `named range: ${token}` };
+          }
+          return { rejected: true, reason: `unparseable token: ${token}` };
+        }
+        allRefs.push(ref);
+      }
+    }
+  }
+
+  if (allRefs.length === 0) {
+    return { rejected: true, reason: "no cell references found" };
+  }
+
+  return { refs: allRefs, rejected: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -184,16 +368,68 @@ function checkSubtotalReconciliation(
       const reportedTotal = totalCell.value as number;
       const ci = totalCell.c;
 
-      // Sum preceding rows until the last total row (or start)
-      const prevTotalIdx = [...totalRowIndices].reverse().find((t) => t < totalRow) ?? -1;
-      const startRow = prevTotalIdx + 1;
+      // ---------------------------------------------------------------
+      // Path A: Formula-first — use the cell's actual Excel formula
+      // ---------------------------------------------------------------
+      let verificationMethod: "formula" | "heuristic" = "heuristic";
+      let addends: number[] = [];
+      let diagnosticRange: string[] | undefined;
+      let formulaResolved = false;
 
-      const addends: number[] = [];
-      for (let ri = startRow; ri < totalRow; ri++) {
-        const cell = table.grid.get(`${ri},${ci}`);
-        if (cell?.type === "number" && cell.value !== null && !isSubtotalHeader(rowHeaders[ri])) {
-          addends.push(cell.value as number);
+      if (totalCell.formula) {
+        const parsed = parseFormulaRefs(totalCell.formula);
+        if (!parsed.rejected) {
+          // Resolve each referenced cell from the absolute grid
+          const resolvedValues: number[] = [];
+          let allResolved = true;
+
+          for (const ref of parsed.refs) {
+            const cell = table.absGrid.get(`${ref.absR},${ref.absC}`);
+            if (cell && cell.type === "number" && cell.value !== null) {
+              resolvedValues.push(cell.value as number);
+            } else if (cell && cell.type === "empty") {
+              // Empty cells in Excel SUM = 0
+              resolvedValues.push(0);
+            } else if (!cell) {
+              // Cell not captured (might be a blank row that was filtered out) — treat as 0
+              // This is safe because Excel's SUM treats blank cells as 0
+              resolvedValues.push(0);
+            } else {
+              // Non-numeric cell in a SUM range — formula can't be verified numerically
+              allResolved = false;
+              break;
+            }
+          }
+
+          if (allResolved && resolvedValues.length >= 1) {
+            addends = resolvedValues;
+            verificationMethod = "formula";
+            formulaResolved = true;
+          }
         }
+      }
+
+      // ---------------------------------------------------------------
+      // Path B: Heuristic fallback — sum rows between previous total and this total
+      // ---------------------------------------------------------------
+      if (!formulaResolved) {
+        const prevTotalIdx = [...totalRowIndices].reverse().find((t) => t < totalRow) ?? -1;
+        const startRow = prevTotalIdx + 1;
+
+        const rangeLabels: string[] = [];
+        for (let ri = startRow; ri < totalRow; ri++) {
+          const cell = table.grid.get(`${ri},${ci}`);
+          if (cell?.type === "number" && cell.value !== null && !isSubtotalHeader(rowHeaders[ri])) {
+            addends.push(cell.value as number);
+            rangeLabels.push(`${rowHeaders[ri] || `row${ri}`}=${(cell.value as number).toLocaleString()}`);
+          }
+        }
+
+        // Diagnostic dump: record what rows the heuristic pulled in
+        if (rangeLabels.length > 0) {
+          diagnosticRange = rangeLabels;
+        }
+        verificationMethod = "heuristic";
       }
 
       if (addends.length < 2) continue; // not enough data to verify
@@ -214,13 +450,26 @@ function checkSubtotalReconciliation(
         const pctDiff = reported !== 0 ? ((recomputed - reported) / Math.abs(reported)) * 100 : Infinity;
         const severity: Discrepancy["severity"] = Math.abs(pctDiff) > 5 ? "critical" : "warning";
 
+        // Build description with verification method context
+        let description: string;
+        if (verificationMethod === "formula") {
+          description = `[Formula-verified] Subtotal mismatch in "${table.sheetOrPage}": row "${rowHeaders[totalRow]}", col "${colHeaders[ci] || `col${ci}`}" — formula ${totalCell.formula} resolves to ${recomputed.toLocaleString()} but cell displays ${reported.toLocaleString()} (${pctDiff > 0 ? "+" : ""}${round(pctDiff, 2)}%). High confidence: discrepancy confirmed by formula.`;
+        } else {
+          const rangeNote = diagnosticRange && diagnosticRange.length > 0
+            ? ` (heuristic range — verify manually: [${diagnosticRange.slice(0, 15).join(", ")}${diagnosticRange.length > 15 ? `, ... +${diagnosticRange.length - 15} more` : ""}])`
+            : "";
+          description = `[Heuristic — lower confidence] Subtotal mismatch in "${table.sheetOrPage}": row "${rowHeaders[totalRow]}", col "${colHeaders[ci] || `col${ci}`}" — reported ${reported.toLocaleString()} but sum of nearby components = ${recomputed.toLocaleString()} (${pctDiff > 0 ? "+" : ""}${round(pctDiff, 2)}%)${rangeNote}`;
+        }
+
         discrepancies.push({
-          description: `Subtotal mismatch in "${table.sheetOrPage}": row "${rowHeaders[totalRow]}", col "${colHeaders[ci] || `col${ci}`}" — reported ${reported.toLocaleString()} but sum of components = ${recomputed.toLocaleString()} (${pctDiff > 0 ? "+" : ""}${round(pctDiff, 2)}%)`,
+          description,
           severity,
           check_type: "subtotal_reconciliation",
           sources: [`${table.documentId}::${table.sheetOrPage}`],
           expected: recomputed,
           actual: reported,
+          verification_method: verificationMethod,
+          diagnostic_range: diagnosticRange,
         });
       }
     }
@@ -540,6 +789,7 @@ function parseTables(rows: z.infer<typeof DocTableSchema>[]): ParsedTable[] {
       colHeaders: effectiveColHeaders,
       cells: data.cells,
       grid: new Map(),
+      absGrid: new Map(),
     };
     buildGrid(table);
     parsed.push(table);

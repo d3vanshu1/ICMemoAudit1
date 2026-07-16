@@ -58,7 +58,8 @@ export default api({
   }),
 
   async run(ctx, { dealId }) {
-    // Get the latest run per module with its output
+    // Get the latest run per module with its output.
+    // Prefer runs that have output (completed with findings) over failed/empty ones.
     const rows = await ctx.integrations.db.query(
       `SELECT DISTINCT ON (mr.module_id)
         mr.module_id,
@@ -73,7 +74,9 @@ export default api({
       FROM module_runs mr
       LEFT JOIN module_outputs mo ON mo.module_run_id = mr.id
       WHERE mr.deal_id = $1
-      ORDER BY mr.module_id, mr.triggered_at DESC
+      ORDER BY mr.module_id,
+        CASE WHEN mo.id IS NOT NULL THEN 0 ELSE 1 END,
+        mr.triggered_at DESC
       LIMIT 50`,
       ModuleStatusRowSchema,
       [dealId],
