@@ -23,6 +23,14 @@ const MergeCheckpointSchema = z.object({
   header: z.string().nullable(),
 });
 
+// Time-bucketed extraction writes — reveals overlapping invocations
+const ExtractionBucketSchema = z.object({
+  bucket: z.string(),
+  writes: z.coerce.number(),
+  failed: z.coerce.number(),
+  truncated: z.coerce.number(),
+});
+
 export default api({
   name: "DiagnoseRuns",
   description: "Shows recent module_runs for a deal to diagnose stuck pipelines",
@@ -39,6 +47,18 @@ export default api({
     runs: z.array(RunRowSchema),
     analysisCount: z.number().optional(),
     mergeCheckpoints: z.array(MergeCheckpointSchema).optional(),
+    // Extraction write timeline: 30s buckets showing writes per window
+    // Multiple high-count buckets within ~200s = overlapping invocations
+    extractionTimeline: z.array(ExtractionBucketSchema).optional(),
+    // Concurrency check: writes_before_triggered > 0 means a prior invocation
+    // was still writing AFTER the current invocation started (= overlap)
+    concurrencyCheck: z.object({
+      current_triggered_at: z.string().nullable(),
+      writes_after_triggered: z.coerce.number(),
+      earliest_write_after: z.string().nullable(),
+      latest_write_after: z.string().nullable(),
+      writes_before_triggered: z.coerce.number(),
+    }).nullable().optional(),
   }),
 
   async run(ctx, { dealId }) {
@@ -84,6 +104,61 @@ export default api({
       );
     }
 
-    return { runs, analysisCount, mergeCheckpoints };
+    // Extraction write timeline (30s buckets) — detect overlapping invocations.
+    // If two invocations run simultaneously, you'll see two bursts of 8 writes
+    // landing in the same or adjacent 30s windows (normal is max 8 per window).
+    const extractionTimeline = await ctx.integrations.db.query(
+      `SELECT
+         date_trunc('minute', created_at) +
+           (EXTRACT(second FROM created_at)::int / 30 * interval '30 seconds') AS bucket,
+         COUNT(*)::int AS writes,
+         COUNT(*) FILTER (WHERE (extraction_json->>'failed')::boolean IS TRUE)::int AS failed,
+         COUNT(*) FILTER (WHERE (extraction_json->>'truncated')::boolean IS TRUE)::int AS truncated
+       FROM universal_extractions
+       WHERE deal_id = $1
+         AND created_at >= now() - interval '6 hours'
+       GROUP BY 1
+       ORDER BY 1 DESC
+       LIMIT 50`,
+      ExtractionBucketSchema,
+      [dealId],
+      { label: "Extraction write timeline (30s buckets)" }
+    );
+
+    // Check for concurrent invocations: look at the gap between triggered_at
+    // timestamps. The pipeline updates triggered_at at the start of each invocation.
+    // If invocations are properly sequential (one finishes, then re-invoked),
+    // gaps should be ~200-210s. Gaps much shorter than that (< 60s) suggest overlap.
+    // We can also check: are there extraction writes happening RIGHT NOW that
+    // started before the current triggered_at? That means a prior invocation is
+    // still writing while a new one already started.
+    const concurrencyCheck = await ctx.integrations.db.query(
+      `SELECT
+         (SELECT triggered_at FROM module_runs WHERE id = $2) AS current_triggered_at,
+         COUNT(*)::int AS writes_after_triggered,
+         MIN(created_at)::text AS earliest_write_after,
+         MAX(created_at)::text AS latest_write_after,
+         COUNT(*) FILTER (WHERE created_at < (SELECT triggered_at FROM module_runs WHERE id = $2))::int AS writes_before_triggered
+       FROM universal_extractions
+       WHERE deal_id = $1
+         AND created_at >= now() - interval '5 minutes'`,
+      z.object({
+        current_triggered_at: z.string().nullable(),
+        writes_after_triggered: z.coerce.number(),
+        earliest_write_after: z.string().nullable(),
+        latest_write_after: z.string().nullable(),
+        writes_before_triggered: z.coerce.number(),
+      }),
+      [dealId, runningRun?.id ?? "00000000-0000-0000-0000-000000000000"],
+      { label: "Concurrency check" }
+    );
+
+    return {
+      runs,
+      analysisCount,
+      mergeCheckpoints,
+      extractionTimeline,
+      concurrencyCheck: concurrencyCheck[0] ?? null,
+    };
   },
 });

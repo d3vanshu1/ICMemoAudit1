@@ -36,6 +36,17 @@ const EXTRACTION_TIME_BUDGET_MS = 150_000; // 2.5 minutes — leaves headroom fo
  *  instead of firing all simultaneously, reducing 429 bursts. */
 const STAGGER_DELAY_MS = 250;
 
+/** Maximum number of gap-fill chunks to attempt per invocation.
+ *  When many gaps exist (e.g., 65), attempting all at once triggers rate-limit
+ *  storms (429 → 100% failure → infinite retry loop). Processing fewer chunks
+ *  per invocation spreads load across multiple re-invocations. */
+const MAX_GAPS_PER_INVOCATION = 16; // 2 full batches of 8
+
+/** Cooldown between batches (ms) when processing gap-fills.
+ *  Only applied when total gaps exceed MAX_GAPS_PER_INVOCATION — gives the
+ *  rate limiter time to recover between batches. */
+const INTER_BATCH_COOLDOWN_MS = 5_000;
+
 /** Page size for loading existing extraction keys (small rows: ~80 bytes each) */
 const EXTRACTION_KEYS_PAGE_SIZE = 5000;
 
@@ -405,15 +416,27 @@ export async function runExtractionPhase(
     }
   };
 
-  // Process in batches of EXTRACTION_CONCURRENCY
-  for (let i = 0; i < allChunks.length; i += EXTRACTION_CONCURRENCY) {
+  // Process in batches of EXTRACTION_CONCURRENCY, capped at MAX_GAPS_PER_INVOCATION.
+  // When many gaps exist, processing a limited subset per invocation prevents
+  // rate-limit storms. The pipeline will be re-invoked and pick up remaining gaps.
+  const chunksToProcess = allChunks.length > MAX_GAPS_PER_INVOCATION
+    ? allChunks.slice(0, MAX_GAPS_PER_INVOCATION)
+    : allChunks;
+  const isThrottled = allChunks.length > MAX_GAPS_PER_INVOCATION;
+
+  for (let i = 0; i < chunksToProcess.length; i += EXTRACTION_CONCURRENCY) {
     // Time budget check — before starting batch
     const elapsed = Date.now() - startTime;
     if (elapsed >= EXTRACTION_TIME_BUDGET_MS) {
       return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
     }
 
-    const batch = allChunks.slice(i, i + EXTRACTION_CONCURRENCY);
+    // Inter-batch cooldown when throttled (skip before first batch)
+    if (isThrottled && i > 0) {
+      await new Promise(r => setTimeout(r, INTER_BATCH_COOLDOWN_MS));
+    }
+
+    const batch = chunksToProcess.slice(i, i + EXTRACTION_CONCURRENCY);
 
     // Race the batch against remaining budget. Even if individual calls aren't
     // erroring (just slow first attempts running toward 120s), this ensures we
@@ -438,6 +461,11 @@ export async function runExtractionPhase(
     if (budgetExhausted) {
       return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
     }
+  }
+
+  // If we capped the chunks (more gaps exist than we attempted), always return incomplete
+  if (allChunks.length > chunksToProcess.length) {
+    return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError };
   }
 
   return { needed: true, completed: true, totalChunks };
