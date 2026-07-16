@@ -57,11 +57,13 @@ const SMALL_TAIL_THRESHOLD = 8;
  *  this much time remains — keeps a 10s safety margin for DB writes. */
 const SOLO_BUDGET_CHECK_MS = 10_000;
 
-/** Time budget for solo chunks (ms). Higher than EXTRACTION_TIME_BUDGET_MS because
- *  solo runs one chunk at a time with no concurrency risk. Effective timeout per
- *  chunk = SOLO_TIME_BUDGET_MS - SOLO_BUDGET_CHECK_MS = 200s.
- *  Total call time ~225s (doc loading + 200s + writes), well under 300s platform limit. */
-const SOLO_TIME_BUDGET_MS = 210_000;
+/** Escalating budgets for extraction attempts (ms). Each entry is the total budget
+ *  for that attempt level; effective timeout = budget - SOLO_BUDGET_CHECK_MS.
+ *  Attempt 1 (first pass): 140s | Attempt 2: 200s | Attempt 3: 260s
+ *  Graduated so we learn whether borderline chunks succeed at intermediate budgets.
+ *  Worst-case invocation: 5s overhead + 260s + 1s write = 266s (34s under 300s platform limit). */
+const ESCALATION_BUDGETS = [150_000, 210_000, 270_000] as const;
+const MAX_EXTRACTION_ATTEMPTS = ESCALATION_BUDGETS.length; // 3
 
 /** Page size for loading existing extraction keys (small rows: ~80 bytes each) */
 const EXTRACTION_KEYS_PAGE_SIZE = 5000;
@@ -88,6 +90,7 @@ const ExistingChunkSchema = z.object({
   chunk_index: z.coerce.number(),
   is_failed: z.coerce.boolean(),
   is_truncated: z.coerce.boolean(),
+  attempt_count: z.coerce.number(),
 });
 
 const MessageResponseSchema = z.object({
@@ -129,7 +132,8 @@ async function callExtractionLLM(
   totalChunks: number,
   startTime: number,
   retries = 3,
-  solo = false
+  solo = false,
+  budgetOverride?: number
 ): Promise<ExtractionLLMResult> {
   const label = `Extract: ${sanitizeBraces(chunk.label)} (${chunk.chunkIndex + 1}/${totalChunks})`;
   const body = {
@@ -157,7 +161,7 @@ async function callExtractionLLM(
   for (let attempt = 1; attempt <= retries; attempt++) {
     // Budget check before each attempt (not just the first).
     // A single call can take up to 120s; if less than that remains, bail early.
-    const effectiveBudget = solo ? SOLO_TIME_BUDGET_MS : EXTRACTION_TIME_BUDGET_MS;
+    const effectiveBudget = budgetOverride ?? (solo ? ESCALATION_BUDGETS[0] : EXTRACTION_TIME_BUDGET_MS);
     const remaining = effectiveBudget - (Date.now() - startTime);
     const budgetFloor = solo ? SOLO_BUDGET_CHECK_MS : 30_000;
     if (remaining < budgetFloor) {
@@ -243,14 +247,17 @@ export async function runExtractionPhase(
   // --- Step B: Load existing extraction keys (paginated) ---
   // Each row is small (~80 bytes: UUID + int + two bools), but row count can
   // grow unboundedly across re-processing cycles. Page to stay under 4MB gRPC cap.
-  const existingRows: Array<{ document_id: string; chunk_index: number; is_failed: boolean; is_truncated: boolean }> = [];
+  const existingRows: Array<{ document_id: string; chunk_index: number; is_failed: boolean; is_truncated: boolean; attempt_count: number }> = [];
   let keysOffset = 0;
 
   while (true) {
     const page = await ctx.integrations.db.query(
       `SELECT document_id, chunk_index,
               COALESCE((extraction_json->>'failed')::boolean, false) AS is_failed,
-              COALESCE((extraction_json->>'truncated')::boolean, false) AS is_truncated
+              COALESCE((extraction_json->>'truncated')::boolean, false) AS is_truncated,
+              COALESCE((extraction_json->>'attempt_count')::int,
+                CASE WHEN COALESCE((extraction_json->>'failed')::boolean, false) THEN 1 ELSE 0 END
+              ) AS attempt_count
        FROM universal_extractions
        WHERE deal_id = $1
        ORDER BY document_id, chunk_index
@@ -267,9 +274,14 @@ export async function runExtractionPhase(
   // Build a set of successfully-extracted (doc_id, chunk_index) pairs.
   // Exclude failed AND truncated extractions — they need to be re-done.
   const extractedSet = new Set<string>();
+  // Track attempt counts for failed chunks (used by escalation logic).
+  const failedChunkAttempts = new Map<string, number>();
   for (const row of existingRows) {
     if (!row.is_failed && !row.is_truncated) {
       extractedSet.add(`${row.document_id}:${row.chunk_index}`);
+    }
+    if (row.is_failed) {
+      failedChunkAttempts.set(`${row.document_id}:${row.chunk_index}`, row.attempt_count);
     }
   }
 
@@ -318,10 +330,13 @@ export async function runExtractionPhase(
     tagByDocId[doc.id] = doc.document_tag ?? "other";
     const chunks = chunkDocument(doc.file_name, doc.id, parsedText);
     // Only keep chunks that haven't been successfully extracted yet
+    // and haven't exhausted all retry attempts.
     for (const chunk of chunks) {
-      if (!extractedSet.has(`${doc.id}:${chunk.chunkIndex}`)) {
-        allChunks.push(chunk);
-      }
+      const key = `${doc.id}:${chunk.chunkIndex}`;
+      if (extractedSet.has(key)) continue; // already succeeded
+      const attempts = failedChunkAttempts.get(key) ?? 0;
+      if (attempts >= MAX_EXTRACTION_ATTEMPTS) continue; // permanently exhausted
+      allChunks.push(chunk);
     }
   }
 
@@ -435,6 +450,8 @@ export async function runExtractionPhase(
           // Save failed extraction so it can be retried on next invocation
           const errMsg = err instanceof Error ? err.message : String(err);
           const tag = tagByDocId[chunk.documentId] ?? "other";
+          const prevAttempts = failedChunkAttempts.get(`${chunk.documentId}:${chunk.chunkIndex}`) ?? 0;
+          const newAttemptCount = prevAttempts + 1;
           const failedJson = {
             label: sanitizeBraces(chunk.label),
             extraction: "",
@@ -442,7 +459,8 @@ export async function runExtractionPhase(
             sourceFile: sanitizeBraces(chunk.sourceFile),
             documentTag: tag,
             failed: true,
-            error_msg: errMsg.slice(0, 1000), // Persist full error with prior_errors for diagnosis
+            attempt_count: newAttemptCount,
+            error_msg: errMsg.slice(0, 1000),
           };
           try {
             await ctx.integrations.db.execute(
@@ -562,14 +580,138 @@ export async function runExtractionPhase(
     return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError, passStats: makePassStats() };
   }
 
-  // Only report extraction complete when ALL chunks succeeded.
-  // If any failed (even without budget exhaustion), the pipeline must re-invoke
-  // to retry them rather than proceeding to merge with incomplete data.
-  // Exception: if fewer than 5 chunks failed, skip them and proceed — retrying
-  // indefinitely for a handful of stubborn chunks isn't worth blocking the entire
-  // pipeline. The merge/analysis phases work fine with slightly incomplete data.
-  if (failedChunks > 0 && failedChunks >= 5) {
-    return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError, passStats: makePassStats() };
+  // --- Step E: Escalation retries for previously-failed chunks ---
+  // Runs only when no first-attempt chunks remain (all have had a first pass).
+  // Processes retries one-at-a-time with graduated budgets: 140s → 200s → 260s.
+  const firstPassChunks = chunksToProcess.filter(c =>
+    (failedChunkAttempts.get(`${c.documentId}:${c.chunkIndex}`) ?? 0) === 0
+  );
+  const retryChunks = chunksToProcess.filter(c => {
+    const attempts = failedChunkAttempts.get(`${c.documentId}:${c.chunkIndex}`) ?? 0;
+    return attempts >= 1 && attempts < MAX_EXTRACTION_ATTEMPTS;
+  });
+
+  let escalationSucceeded = 0;
+  let escalationFailed = 0;
+
+  if (firstPassChunks.length === 0 && retryChunks.length > 0) {
+    for (const chunk of retryChunks) {
+      const attempts = failedChunkAttempts.get(`${chunk.documentId}:${chunk.chunkIndex}`) ?? 1;
+      const budget = ESCALATION_BUDGETS[Math.min(attempts, MAX_EXTRACTION_ATTEMPTS - 1)];
+      const chunkStart = Date.now();
+      const tag = tagByDocId[chunk.documentId] ?? "other";
+
+      try {
+        const { text: rawText, truncated } = await callExtractionLLM(
+          ctx, chunk, totalChunks, chunkStart, 3, true, budget
+        );
+
+        if (truncated) {
+          // Save as truncated — will be retried at next level
+          const truncatedJson = {
+            label: sanitizeBraces(chunk.label),
+            extraction: "",
+            chunkIndex: chunk.chunkIndex,
+            sourceFile: sanitizeBraces(chunk.sourceFile),
+            documentTag: tag,
+            truncated: true,
+            attempt_count: attempts + 1,
+          };
+          await ctx.integrations.db.execute(
+            `INSERT INTO universal_extractions (deal_id, document_id, chunk_index, content_hash, extraction_json)
+             VALUES ($1, $2, $3, $4, $5::jsonb)
+             ON CONFLICT (deal_id, document_id, chunk_index)
+             DO UPDATE SET content_hash = EXCLUDED.content_hash,
+                           extraction_json = EXCLUDED.extraction_json,
+                           created_at = now()`,
+            [dealId, chunk.documentId, chunk.chunkIndex, chunk.contentHash, JSON.stringify(truncatedJson)],
+            { label: `Save truncated escalation ${chunk.chunkIndex}` }
+          );
+          escalationFailed++;
+        } else {
+          // Success — save the extraction
+          const idTaggedText = injectClaimIds(rawText, chunk.chunkIndex);
+          const extractionJson = {
+            label: sanitizeBraces(chunk.label),
+            extraction: `### Universal Extraction from: ${sanitizeBraces(chunk.label)}\n\n${sanitizeBraces(idTaggedText)}`,
+            chunkIndex: chunk.chunkIndex,
+            sourceFile: sanitizeBraces(chunk.sourceFile),
+            documentTag: tag,
+          };
+          await ctx.integrations.db.execute(
+            `INSERT INTO universal_extractions (deal_id, document_id, chunk_index, content_hash, extraction_json)
+             VALUES ($1, $2, $3, $4, $5::jsonb)
+             ON CONFLICT (deal_id, document_id, chunk_index)
+             DO UPDATE SET content_hash = EXCLUDED.content_hash,
+                           extraction_json = EXCLUDED.extraction_json,
+                           created_at = now()`,
+            [dealId, chunk.documentId, chunk.chunkIndex, chunk.contentHash, JSON.stringify(extractionJson)],
+            { label: `Save escalation success ${chunk.chunkIndex}` }
+          );
+          extractedSoFar++;
+          escalationSucceeded++;
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const newAttemptCount = attempts + 1;
+        const isFinal = newAttemptCount >= MAX_EXTRACTION_ATTEMPTS;
+        const failedJson = {
+          label: sanitizeBraces(chunk.label),
+          extraction: "",
+          chunkIndex: chunk.chunkIndex,
+          sourceFile: sanitizeBraces(chunk.sourceFile),
+          documentTag: tag,
+          failed: true,
+          permanently_failed: isFinal,
+          attempt_count: newAttemptCount,
+          char_count: chunk.text.length,
+          estimated_tokens: Math.ceil(chunk.text.length / 4),
+          error_msg: errMsg.slice(0, 1000),
+        };
+        try {
+          await ctx.integrations.db.execute(
+            `INSERT INTO universal_extractions (deal_id, document_id, chunk_index, content_hash, extraction_json)
+             VALUES ($1, $2, $3, $4, $5::jsonb)
+             ON CONFLICT (deal_id, document_id, chunk_index)
+             DO UPDATE SET content_hash = EXCLUDED.content_hash,
+                           extraction_json = EXCLUDED.extraction_json,
+                           created_at = now()`,
+            [dealId, chunk.documentId, chunk.chunkIndex, chunk.contentHash, JSON.stringify(failedJson)],
+            { label: `Save ${isFinal ? "permanently" : "escalation"} failed ${chunk.chunkIndex}` }
+          );
+        } catch { /* best effort */ }
+        escalationFailed++;
+        if (!firstError) firstError = errMsg;
+      }
+
+      // Only attempt 1 escalation per invocation — each can take up to 260s,
+      // and the 300s platform limit leaves room for exactly one.
+      break;
+    }
+  }
+
+  // Count definitively exhausted chunks (all 3 attempts used) — separate from
+  // in-progress retries. Only exhausted chunks count toward the <5 skip policy.
+  const permanentlyExhausted = existingRows.filter(
+    r => r.is_failed && r.attempt_count >= MAX_EXTRACTION_ATTEMPTS
+  ).length;
+
+  // Adjust failedChunks: only count chunks whose retries are fully exhausted.
+  // In-progress retries (attempt_count < MAX) will be retried on next invocation.
+  const exhaustedFailures = permanentlyExhausted + escalationFailed;
+  const retriesStillPending = retryChunks.length - (escalationSucceeded + escalationFailed);
+
+  // If retries are still pending (not all escalation attempts exhausted), return incomplete
+  // so the pipeline re-invokes to continue escalation.
+  if (retriesStillPending > 0) {
+    return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks: exhaustedFailures, firstError, passStats: makePassStats() };
+  }
+
+  // All chunks have been attempted through their full escalation path.
+  // The <5 policy: if fewer than 5 are permanently failed, proceed anyway.
+  // This governs pipeline progression; escalation governs exhaustion.
+  if (exhaustedFailures >= 5) {
+    return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks: exhaustedFailures, firstError, passStats: makePassStats() };
   }
 
   return { needed: true, completed: true, totalChunks };
