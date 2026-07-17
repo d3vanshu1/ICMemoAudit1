@@ -53,6 +53,31 @@ Do NOT flag "discrepancies" based on your own calculations — LLM arithmetic is
 All numeric verification is handled by a separate deterministic system (NumericVerify).
 Your role is EXTRACTION ONLY: report what the document states, not whether the numbers add up.`;
 
+// ---------------------------------------------------------------------------
+// Adversarial Absence Verification Protocol
+// Applied to modules that assert things are "missing" or "absent"
+// ---------------------------------------------------------------------------
+const ABSENCE_VERIFICATION_PROTOCOL = `
+
+## CRITICAL: Adversarial Self-Check for Absence Claims
+
+Before flagging ANYTHING as "missing", "absent", "not addressed", "not found", or "not mentioned":
+
+1. **State your exact search**: What specific terms, phrases, and synonyms did you look for?
+2. **Check alternate phrasings**: Try at least 2 alternate formulations. Example: "customer churn" might appear as "retention rate", "logo attrition", "client turnover", or "renewal rate".
+3. **Check indirect coverage**: Could the topic be addressed implicitly through related data? (e.g., a retention table addresses churn even without the word "churn")
+4. **Scope your claim**: You are reviewing ONE chunk of a larger data room. Something absent from THIS chunk may be present elsewhere. Flag gaps ONLY at the chunk level — do NOT assert deal-room-wide absence from a single chunk.
+5. **Classify your finding**:
+   - "not_found_in_this_chunk" — you looked, it's not here, but could be elsewhere (use this by default)
+   - "verified_absent" — the document structure strongly implies this information SHOULD be here (e.g., a financial model with no revenue assumptions) AND you tried all alternate phrasings
+
+In the flags array, EVERY gap/omission flag MUST include a "verification" key (string) that states:
+- The search terms you tried (at least 3)
+- Whether the topic might be covered under alternate terminology
+- Your classification: "not_found_in_this_chunk" or "verified_absent"
+
+Findings that assert absence WITHOUT this verification step are FABRICATIONS and will be discarded by the merge layer.`;
+
 export const SUB_AGENT_PROMPTS: Record<string, string> = {
   // ---- Omission Audit ----
   omission_audit: `You are a senior private equity due diligence analyst. Analyze this document chunk from a deal data room and identify what information is MISSING — data, sections, time periods, benchmarks, or risk factors that should be present but are absent.
@@ -71,6 +96,7 @@ Identify omissions in these categories:
 ## PE Diligence Checklist
 
 Cross-reference against: customer concentration, churn/retention, key man risk, revenue recognition, regulatory exposure, competitive response, management incentives, exit assumptions, QoE items, capex requirements.
+${ABSENCE_VERIFICATION_PROTOCOL}
 ${DENSE_SUFFIX}
 
 Required keys:
@@ -78,7 +104,7 @@ Required keys:
 - "document_type" (string): CIM, IC_MEMO, CUSTOMER_DATA, CONSULTANT_REPORT, FINANCIAL_MODEL, LEGAL, or OTHER
 - "key_claims" (array): each with "claim" (string), "location" (string), "confidence" ("high"|"medium"|"low")
 - "data_points" (array): each with "metric" (string), "value" (string), "context" (string)
-- "flags" (array): each with "type" ("risk"|"gap"|"contradiction"|"assumption"), "description" (string), "severity" ("critical"|"moderate"|"low")
+- "flags" (array): each with "type" ("risk"|"gap"|"contradiction"|"assumption"), "description" (string), "severity" ("critical"|"moderate"|"low"), "verification" (string — REQUIRED for gap/risk flags that assert absence)
 - "raw_summary" (string)`,
 
   // ---- Contradiction Check ----
@@ -116,6 +142,7 @@ You will receive BOTH page images AND extracted text. Use both for thorough anal
 2. **Explicit Assumptions**: List every assumption the document explicitly states (e.g., "assuming 15% annual growth", "management will stay post-close").
 3. **Implicit Assumptions**: Infer what MUST be true for the document's claims to hold, even if never stated. Examples: If the CIM projects 20% growth, it implicitly assumes the market can absorb that growth. If the model shows margin expansion, it implicitly assumes no competitive pricing pressure.
 4. **Flag Unaddressed Risks**: Note scenarios that would invalidate key assumptions but are never discussed.
+${ABSENCE_VERIFICATION_PROTOCOL}
 ${DENSE_SUFFIX}
 
 Required keys:
@@ -123,7 +150,7 @@ Required keys:
 - "document_type" (string): CIM | IC_MEMO | CUSTOMER_DATA | CONSULTANT_REPORT | FINANCIAL_MODEL | LEGAL | OTHER
 - "key_claims" (array): each with "claim" (string), "claim_type" ("thesis"|"explicit_assumption"|"implicit_assumption"), "location" (string), "confidence" ("high"|"medium"|"low")
 - "data_points" (array): each with "metric" (string), "value" (string), "context" (string)
-- "flags" (array): each with "type" ("assumption"|"risk"|"gap"), "description" (string), "severity" ("critical"|"moderate"|"low")
+- "flags" (array): each with "type" ("assumption"|"risk"|"gap"), "description" (string), "severity" ("critical"|"moderate"|"low"), "verification" (string — REQUIRED for gap/risk flags that assert absence)
 - "raw_summary" (string)`,
 
   // ---- External Risk Overlay (sub-agent extracts deal material) ----
@@ -262,6 +289,7 @@ You will receive BOTH page images AND extracted text. Use both for thorough anal
 10. ESG/Reputational: Environmental compliance, social factors, governance, reputational risk
 
 Scoring: 5=Comprehensive with data+validation, 4=Good with some gaps, 3=Addressed but lacks depth, 2=Mentioned briefly, 1=Not addressed.
+${ABSENCE_VERIFICATION_PROTOCOL}
 ${DENSE_SUFFIX}
 
 Required keys:
@@ -269,7 +297,7 @@ Required keys:
 - "document_type" (string): CIM | IC_MEMO | CUSTOMER_DATA | CONSULTANT_REPORT | FINANCIAL_MODEL | LEGAL | OTHER
 - "key_claims" (array): each with "claim" (string), "dimension" ("commercial"|"financial"|"management"|"technology"|"legal"|"competitive"|"customer"|"operational"|"exit"|"esg"), "location" (string), "confidence" ("high"|"medium"|"low")
 - "data_points" (array): each with "metric" (string), "value" (string), "context" (string)
-- "flags" (array): each with "type" ("gap"|"risk"), "description" (string), "severity" ("critical"|"moderate"|"low")
+- "flags" (array): each with "type" ("gap"|"risk"), "description" (string), "severity" ("critical"|"moderate"|"low"), "verification" (string — REQUIRED for gap flags that assert absence)
 - "raw_summary" (string)`,
 
   // ---- Executive Summary (processes prior module outputs, not documents) ----

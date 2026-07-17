@@ -87,6 +87,21 @@ export const MERGE_PROMPTS: Record<string, string> = {
 2. **Checklist Comparison**: Ensure coverage against: customer concentration, churn/retention, key man risk, revenue recognition, regulatory, competitive response, management incentives, exit assumptions, QoE items, capex requirements.
 3. **Identify Additional Gaps**: Based on the full body of evidence, flag any omissions the analysts may have missed.
 4. **Prioritize**: Rank all findings by potential impact on investment decision.
+
+## CRITICAL: Adversarial Re-Verification of Absence Claims
+
+You are the gatekeeper against fabricated omission findings. Before including ANY finding that asserts something is "missing" or "absent" from the data room:
+
+1. **Cross-chunk check**: Did ANY analyst extraction mention this topic, even tangentially? Search all input sets for related terms. If found anywhere, the claim is FALSE — downgrade or discard.
+2. **Verify the "verification" field**: Each analyst flag should include a "verification" field explaining what search terms they tried. If a flag has NO verification field, treat it as UNVERIFIED and either discard it or downgrade to info severity with a note: "Unverified absence claim — requires manual confirmation."
+3. **Check for alternate terminology**: Could the gap be addressed under different wording? (e.g., "no churn data" when retention rates ARE present)
+4. **Classify each absence finding**:
+   - **"verified_absent"**: Multiple analysts checked, alternate phrasings tried, genuinely not in the reviewed materials
+   - **"likely_absent"**: One analyst flagged with verification, not contradicted by others
+   - **"unverified"**: No verification evidence, or contradicted by another extraction
+5. **Include classification in output**: Add an "absence_confidence" field to every gap/omission finding: "verified_absent" | "likely_absent" | "unverified"
+
+Findings classified as "unverified" MUST be severity "info" regardless of the analyst's original severity rating. Do NOT promote unverified absence claims to critical or warning.
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   contradiction_check: `You are a senior investment committee advisor. You are synthesizing analyst findings that extracted narrative claims and data points from deal documents. Your job is to cross-reference narrative claims against data-derived findings and flag contradictions.
@@ -113,6 +128,15 @@ ${MERGE_OUTPUT_STRUCTURE}`,
 4. **Stress Test**: For each blind spot, describe what happens to the thesis if that assumption proves wrong.
 5. **Generate Diligence Questions**: For each critical blind spot, provide the specific question the deal team should answer.
 6. **Consolidate**: Combine overlapping observations into single, stronger findings.
+
+## CRITICAL: Adversarial Re-Verification of Absence Claims
+
+Before asserting that a risk is "unaddressed" or an assumption is "never discussed":
+
+1. **Cross-check all input sets**: Search every analyst extraction for related terms, synonyms, and indirect coverage.
+2. **Require verification evidence**: Only promote a blind spot to critical/warning if the analyst included a "verification" field showing what they searched for. Unverified claims → info severity with note.
+3. **Distinguish scope**: "Not found in reviewed chunks" ≠ "not addressed in the deal". Use precise language.
+4. **Add "absence_confidence"**: "verified_absent" | "likely_absent" | "unverified" to every finding asserting something is missing.
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   external_risk_overlay: `You are the most senior risk advisor at a private equity firm. You are synthesizing EXTERNAL WEB RESEARCH findings into a comprehensive risk assessment.
@@ -184,6 +208,15 @@ ${MERGE_OUTPUT_STRUCTURE}`,
 4. **Calculate Overall Rating**: Average across all 10 dimensions and provide a letter grade (A/B/C/D/F).
 5. **State What IC Is Approving Blind**: Explicitly list areas where information is insufficient.
 6. **Consolidate**: Combine overlapping observations into single, stronger findings.
+
+## CRITICAL: Adversarial Re-Verification of Absence Claims
+
+When scoring a dimension low (1-2) due to "missing" information:
+
+1. **Cross-check all analyst inputs**: Did ANY extraction mention coverage of this dimension, even partially? If yes, the score cannot be 1.
+2. **Require verification evidence**: For dimensions scored ≤2, the finding MUST cite specific verification (search terms tried, alternate terminology checked). If no verification, cap at score 2 with "unverified gap" note.
+3. **Distinguish partial vs. absent**: Score 2 = mentioned briefly (some content exists). Score 1 = truly not addressed (verified across all reviewed chunks).
+4. **Add "absence_confidence"** to every gap finding: "verified_absent" | "likely_absent" | "unverified"
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   executive_summary: `You are the senior-most investment professional preparing the final IC briefing document. You are synthesizing all module outputs into a cohesive executive summary.

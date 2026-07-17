@@ -64,6 +64,7 @@ import { runCleanParsedTextPhase } from "./clean-parsed-text.js";
 import { runWebResearchPhase } from "./web-research-phase.js";
 import { upsertModuleOutput } from "../modules/upsert-module-output.js";
 import { getModuleModel, SONNET_MODEL } from "./model-config.js";
+import { runChecklistScan, formatCoverageMapForPrompt, type ChecklistScanResult } from "./checklist-scan-phase.js";
 import type { NumericVerifyResult } from "./numeric-verify-inline.js";
 
 // ---------------------------------------------------------------------------
@@ -807,10 +808,10 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
         ].filter(Boolean).join("\n");
 
         await ctx.integrations.db.execute(
-          `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json)
-           VALUES ($1, $2, $3::jsonb)
+          `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json, model_used)
+           VALUES ($1, $2, $3::jsonb, $4)
            ON CONFLICT (run_id, chunk_index) DO NOTHING`,
-          [runId, row.iteration - 1, JSON.stringify({ label, extraction, chunkIndex: row.iteration - 1 })],
+          [runId, row.iteration - 1, JSON.stringify({ label, extraction, chunkIndex: row.iteration - 1 }), getModuleModel(moduleId)],
           { label: `Inject iteration ${row.iteration} as analysis` }
         );
       }
@@ -841,6 +842,22 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   let truncatedChunks = 0;
   let truncatedMerges = 0;
   let firstError: string | null = null;
+
+  // --- Checklist Coverage Scan (runs once, before analysis) ---
+  // Exhaustive full-text search across ALL document chunks for each
+  // diligence checklist category. Produces authoritative coverage map
+  // that prevents sub-agents AND the merge layer from fabricating absence claims.
+  const CHECKLIST_MODULES = new Set(["omission_audit", "blind_spot_scanner", "diligence_completeness"]);
+  let coverageMapBlock = "";
+  if (CHECKLIST_MODULES.has(moduleId)) {
+    try {
+      const scanResult = await runChecklistScan(ctx, dealId);
+      coverageMapBlock = "\n\n" + formatCoverageMapForPrompt(scanResult);
+      console.log(`[pipeline] Checklist scan complete: ${scanResult.coveredCount} covered, ${scanResult.notFoundCount} not found (${scanResult.scanDurationMs}ms, ${scanResult.totalQueries} queries)`);
+    } catch (scanErr) {
+      console.warn("[pipeline] Checklist scan failed (non-fatal, proceeding without coverage map):", scanErr);
+    }
+  }
 
   // Helper: return in_progress checkpoint
   const returnInProgress = (phase: "analysis" | "merge", mergeRound = 0, mergeGroupsDone = 0, mergeGroupsTotal = 0): PipelineResult => ({
@@ -883,7 +900,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
         const chunkLabel = String(ext.label ?? `Chunk ${row.chunk_index}`);
         const globalIdx = routed.indexOf(row);
 
-        const userContent = `--- Extracted text from "${chunkLabel}" ---\n\n${chunkText}\n\nAnalyze this chunk now.`;
+        const userContent = `--- Extracted text from "${chunkLabel}" ---\n\n${chunkText}\n\nAnalyze this chunk now.${coverageMapBlock}`;
 
         const result = await callAnthropic(
           ctx,
@@ -902,10 +919,10 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
         // Save checkpoint (flag truncated responses so thin findings are traceable)
         await ctx.integrations.db.execute(
-          `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json)
-           VALUES ($1, $2, $3::jsonb)
+          `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json, model_used)
+           VALUES ($1, $2, $3::jsonb, $4)
            ON CONFLICT (run_id, chunk_index) DO NOTHING`,
-          [runId, globalIdx, JSON.stringify({ label: chunkLabel, extraction, chunkIndex: globalIdx, truncated })],
+          [runId, globalIdx, JSON.stringify({ label: chunkLabel, extraction, chunkIndex: globalIdx, truncated }), getModuleModel(moduleId)],
           { label: `Save analysis checkpoint ${globalIdx}` }
         );
 
@@ -914,15 +931,23 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     );
 
     // Count successes and track failures
-    for (const r of results) {
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
       if (r.status === "fulfilled") {
         analysisCompleted++;
         if (r.value.truncated) truncatedChunks++;
       } else {
         failedChunks++;
-        if (!firstError) {
-          firstError = r.reason?.message ?? String(r.reason ?? "Unknown error");
-        }
+        const failedRow = batch[i];
+        const failedLabel = (() => {
+          try {
+            const ext = typeof failedRow.extraction_json === "string" ? JSON.parse(failedRow.extraction_json) : failedRow.extraction_json;
+            return ext.label ?? `Chunk ${routed.indexOf(failedRow)}`;
+          } catch { return `Chunk (batch index ${i})`; }
+        })();
+        const errMsg = r.reason?.message ?? String(r.reason ?? "Unknown error");
+        console.error(`[ANALYSIS FAILED] ${failedLabel} | error: ${errMsg}`);
+        if (!firstError) firstError = errMsg;
       }
     }
 
@@ -937,6 +962,37 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     if (timeRemaining() < 60_000) {
       return returnInProgress("analysis");
     }
+  }
+
+  // --- Chunk Coverage Log (per-document in vs. processed) ---
+  {
+    const docCoverage = new Map<string, { total: number; analyzed: number }>();
+    for (const row of routed) {
+      const ext = typeof row.extraction_json === "string" ? JSON.parse(row.extraction_json) : row.extraction_json;
+      const label = String(ext.label ?? "unknown").replace(/ \(part \d+\)$/, "");
+      if (!docCoverage.has(label)) docCoverage.set(label, { total: 0, analyzed: 0 });
+      docCoverage.get(label)!.total++;
+    }
+    // Count analyzed from DB (already stored checkpoint rows)
+    const analyzedIndicesNow = await ctx.integrations.db.query(
+      `SELECT chunk_index FROM pipeline_analysis WHERE run_id = $1`,
+      z.object({ chunk_index: z.coerce.number() }),
+      [runId],
+      { label: "Coverage log: count analyzed rows" }
+    );
+    const analyzedSetNow = new Set(analyzedIndicesNow.map(r => r.chunk_index));
+    for (let i = 0; i < routed.length; i++) {
+      const ext = typeof routed[i].extraction_json === "string" ? JSON.parse(routed[i].extraction_json) : routed[i].extraction_json;
+      const label = String(ext.label ?? "unknown").replace(/ \(part \d+\)$/, "");
+      if (analyzedSetNow.has(i)) docCoverage.get(label)!.analyzed++;
+    }
+    const lines = [`[CHUNK COVERAGE] run=${runId} module=${moduleId}`];
+    for (const [doc, counts] of docCoverage) {
+      const status = counts.analyzed === counts.total ? "✓" : "⚠ DROPPED";
+      lines.push(`  ${status} ${doc}: ${counts.analyzed}/${counts.total} chunks analyzed`);
+    }
+    lines.push(`  TOTAL: ${analyzedSetNow.size}/${routed.length} (${failedChunks} failed this invocation)`);
+    console.log(lines.join("\n"));
   }
 
   // --- Step 3: Load all analysis results for merge ---
@@ -1153,10 +1209,10 @@ A "## Numeric Verification Report" section appears in the input below. It contai
         groupsDone++;
         // Save a non-error checkpoint so the group is permanently resolved
         await ctx.integrations.db.execute(
-          `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json)
-           VALUES ($1, $2, $3, $4::jsonb)
-           ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb`,
-          [runId, currentRound, group.idx, JSON.stringify({ text: fallback.text, executiveHeader: fallback.executiveHeader, findings: fallback.findings, skippedAfterFailures: priorFailures, lastError })],
+          `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json, model_used)
+           VALUES ($1, $2, $3, $4::jsonb, $5)
+           ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb, model_used = $5`,
+          [runId, currentRound, group.idx, JSON.stringify({ text: fallback.text, executiveHeader: fallback.executiveHeader, findings: fallback.findings, skippedAfterFailures: priorFailures, lastError }), getModuleModel(moduleId, useOpus)],
           { label: `Save fallback checkpoint R${currentRound}:G${group.idx} (skipped after ${priorFailures} failures)` }
         );
         continue;
@@ -1177,7 +1233,7 @@ A "## Numeric Verification Report" section appears in the input below. It contai
       const results = await Promise.allSettled(
         batch.map(async (group) => {
           const setBlocks = group.members.map((m, i) => `## Analysis Set ${i + 1}\n\n${truncateMergeNodeText(m.text, MERGE_NODE_TEXT_CAP)}`);
-          const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock;
+          const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock + coverageMapBlock;
 
           // Dynamic timeout: use at most 120s per attempt, and at most 2 attempts.
           // Merge calls run in parallel within a batch (MERGE_CONCURRENCY=5),
@@ -1250,10 +1306,10 @@ A "## Numeric Verification Report" section appears in the input below. It contai
 
           // Save merge checkpoint
           await ctx.integrations.db.execute(
-            `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json)
-             VALUES ($1, $2, $3, $4::jsonb)
-             ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb`,
-            [runId, currentRound, group.idx, JSON.stringify({ text: node.text, executiveHeader: node.executiveHeader, findings: node.findings, truncated: node.truncated ?? false })],
+            `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json, model_used)
+             VALUES ($1, $2, $3, $4::jsonb, $5)
+             ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb, model_used = $5`,
+            [runId, currentRound, group.idx, JSON.stringify({ text: node.text, executiveHeader: node.executiveHeader, findings: node.findings, truncated: node.truncated ?? false }), getModuleModel(moduleId, useOpus)],
             { label: `Save merge checkpoint R${currentRound}:G${group.idx}` }
           );
         } else {
@@ -1281,10 +1337,10 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           errorCountMap.set(errCpKey, newFailureCount); // update in-memory for same-invocation re-encounters
           errorMessageMap.set(errCpKey, errMsg); // preserve latest error message
           await ctx.integrations.db.execute(
-            `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json)
-             VALUES ($1, $2, $3, $4::jsonb)
-             ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb`,
-            [runId, currentRound, group.idx, JSON.stringify({ error: errMsg, failureCount: newFailureCount, timestamp: new Date().toISOString() })],
+            `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json, model_used)
+             VALUES ($1, $2, $3, $4::jsonb, $5)
+             ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb, model_used = $5`,
+            [runId, currentRound, group.idx, JSON.stringify({ error: errMsg, failureCount: newFailureCount, timestamp: new Date().toISOString() }), getModuleModel(moduleId, useOpus)],
             { label: `Save merge error checkpoint R${currentRound}:G${group.idx} (failure #${newFailureCount})` }
           );
         }
@@ -1375,19 +1431,52 @@ A "## Numeric Verification Report" section appears in the input below. It contai
 
   // If formatting succeeded, persist to module_outputs now so it's available
   // even if the client disconnects before its own save call.
+  // CRITICAL: If this save fails, DO NOT mark the run completed — the client
+  // would get result:null and GetRunOutput would also find nothing.
+  let outputSaved = false;
   if (fullReport) {
-    try {
-      await upsertModuleOutput(ctx.integrations.db, {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await upsertModuleOutput(ctx.integrations.db, {
+          runId,
+          dealId,
+          executiveHeader: finalNode.executiveHeader,
+          findings: finalFindings,
+          fullReport,
+        });
+        console.log(`[pipeline] Report saved to module_outputs (${fullReport.length} chars, attempt ${attempt})`);
+        outputSaved = true;
+        break;
+      } catch (saveErr) {
+        console.warn(`[pipeline] Failed to save report to module_outputs (attempt ${attempt}/2):`, saveErr);
+        if (attempt < 2) {
+          // Brief pause before retry
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+    }
+
+    if (!outputSaved) {
+      // Both save attempts failed — return in_progress so the client re-invokes.
+      // The merge tree is complete (checkpoints saved), so re-invocation will
+      // skip straight to formatting+save with a fresh time budget.
+      console.error(`[pipeline] module_outputs save failed after 2 attempts — NOT marking completed`);
+      return {
+        status: "in_progress",
         runId,
-        dealId,
-        executiveHeader: finalNode.executiveHeader,
-        findings: finalFindings,
-        fullReport,
-      });
-      console.log(`[pipeline] Report saved to module_outputs (${fullReport.length} chars)`);
-    } catch (saveErr) {
-      console.warn(`[pipeline] Failed to save report to module_outputs (non-fatal):`, saveErr);
-      // Continue — the result will still be returned to the client
+        phase: "save_retry",
+        progress: {
+          analysisTotal: routed.length,
+          analysisCompleted: routed.length,
+          mergeRound: totalMergeRounds,
+          mergeTotal: totalMergeRounds,
+        },
+        result: null,
+        failedChunks,
+        truncatedChunks,
+        truncatedMerges,
+        firstError: "module_outputs save failed — will retry on next invocation",
+      };
     }
   }
 

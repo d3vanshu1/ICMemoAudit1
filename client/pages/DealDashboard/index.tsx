@@ -3,6 +3,7 @@ import { useParams, useNavigate } from "react-router";
 import { toast } from "sonner";
 import { useApi } from "@/hooks/useApi.js";
 import { useApiData } from "@/hooks/useApiData.js";
+import { executeApi } from "@/lib/executeApi.js";
 import { processAllFiles, extractTextFromFile, parseExcelToTables, parseCsvToTable } from "@/lib/pdfProcessor";
 import type { DocumentChunk, ProcessedFileInfo, ExcludedFile, StructuredCell } from "@/lib/pdfProcessor";
 import { MODULE_DEFINITIONS, MODULE_MAP, NUMERIC_MODULES } from "@/lib/moduleConfig";
@@ -1509,7 +1510,23 @@ export default function DealDashboardPage() {
 
       // Pipeline completed — format report
       const finalResult = pipelineResult.result;
-      if (!finalResult) throw new Error("Pipeline completed but no result returned");
+      if (!finalResult) {
+        // The server returns result:null when the run was already completed (synthetic response).
+        // Fall back to loading the persisted output from module_outputs via GetRunOutput.
+        console.log("[pipeline] result:null on completed — loading from GetRunOutput");
+        const stored = await executeApi("GetRunOutput", { runId: pipelineResult.runId });
+        if (!stored?.output) {
+          throw new Error("Pipeline completed but no result returned and no persisted output found");
+        }
+        // Use the persisted output directly — it already has findings + fullReport
+        await saveModuleResult(moduleId, {
+          executiveHeader: stored.output.executiveHeader,
+          findings: stored.output.findings as MergeNode["findings"],
+          fullReport: stored.output.fullReport,
+        }, pipelineResult.runId);
+        toast.success(`${displayName} complete!`);
+        return;
+      }
 
       const finalMerge: MergeNode = {
         text: finalResult.mergedText,
