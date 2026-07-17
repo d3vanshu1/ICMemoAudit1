@@ -68,16 +68,29 @@ import type { NumericVerifyResult } from "./numeric-verify-inline.js";
 // ---------------------------------------------------------------------------
 // Models & Config
 // ---------------------------------------------------------------------------
-const SUB_AGENT_MODEL = "claude-sonnet-4-6";
-const SUB_AGENT_MAX_TOKENS = 4096;
+const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const SONNET_MODEL = "claude-sonnet-4-6";
 const OPUS_MODEL = "claude-opus-4-7";
+
+/** Default model for sub-agent analysis and merge — fast/cheap for most modules */
+const DEFAULT_MODEL = HAIKU_MODEL;
+
+/** Modules that use Sonnet for higher-fidelity analysis (absence claims, coverage) */
+const SONNET_MODULES = new Set(["omission_audit", "blind_spot_scanner", "diligence_completeness"]);
+
+/** Resolve model for a given module — Sonnet for quality-critical modules, Haiku otherwise */
+function getModuleModel(moduleId: string, useOpus?: boolean | null): string {
+  if (useOpus) return OPUS_MODEL;
+  return SONNET_MODULES.has(moduleId) ? SONNET_MODEL : DEFAULT_MODEL;
+}
+
+const SUB_AGENT_MAX_TOKENS = 4096;
 const MERGE_MAX_TOKENS = 8000;
 
 const ANALYSIS_CONCURRENCY = 15;
 const MERGE_CONCURRENCY = 5;
 const MERGE_GROUP_SIZE = 4;
-const MAX_MERGE_GROUP_FAILURES = 3; // Skip (use fallback) after this many error checkpoints across invocations
+const MAX_MERGE_GROUP_FAILURES = 5; // Skip (use fallback) after this many error checkpoints across invocations
 const MERGE_NODE_TEXT_CAP = 3000; // Max chars per node's text in merge input — prevents token overflow
 const TIME_BUDGET_MS = 200_000; // 3m20s — gives 100s headroom under platform's 300s API timeout
 // NOTE: Reduced from 250s because paginated extraction loading, checkpoint saves,
@@ -890,7 +903,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
         const result = await callAnthropic(
           ctx,
           {
-            model: SUB_AGENT_MODEL,
+            model: getModuleModel(moduleId),
             max_tokens: SUB_AGENT_MAX_TOKENS,
             system: [{ type: "text", text: subAgentPrompt, cache_control: { type: "ephemeral" } }],
             messages: [{ role: "user", content: userContent }],
@@ -1181,14 +1194,16 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           const setBlocks = group.members.map((m, i) => `## Analysis Set ${i + 1}\n\n${truncateMergeNodeText(m.text, MERGE_NODE_TEXT_CAP)}`);
           const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock;
 
-          // Dynamic timeout: use at most 80s per attempt, and at most 2 attempts.
-          // Worst case = 160s which leaves 40s headroom in the 200s budget.
+          // Dynamic timeout: use at most 120s per attempt, and at most 2 attempts.
+          // Merge calls run in parallel within a batch (MERGE_CONCURRENCY=5),
+          // so a batch takes ~120s wall-clock, not N×120s.
           // The timeRemaining guard ensures we never exceed the platform limit.
-          const perCallTimeout = Math.min(80_000, Math.max(30_000, timeRemaining() - 30_000));
+          const perCallTimeout = Math.min(120_000, Math.max(30_000, timeRemaining() - 30_000));
+          console.log(`[pipeline:merge] R${currentRound}:G${group.idx + 1}/${totalGroupsThisRound} — timeout=${Math.round(perCallTimeout / 1000)}s, budget=${Math.round(timeRemaining() / 1000)}s, inputLen=${setBlocks.join("").length}`);
           const mergeResult = await callAnthropic(
             ctx,
             {
-              model: useOpus ? OPUS_MODEL : SONNET_MODEL,
+              model: getModuleModel(moduleId, useOpus),
               max_tokens: MERGE_MAX_TOKENS,
               system: [{ type: "text", text: mergePrompt, cache_control: { type: "ephemeral" } }],
               messages: [{ role: "user", content: mergeInput }],
@@ -1259,8 +1274,10 @@ A "## Numeric Verification Report" section appears in the input below. It contai
         } else {
           // Merge call failed — use a placeholder so the tree can still reduce
           mergeFailedGroups++;
+          const errMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+          console.warn(`[pipeline:merge] Group R${currentRound}:G${group.idx} failed: ${errMsg.slice(0, 200)}`);
           if (!mergeFirstError) {
-            mergeFirstError = result.reason instanceof Error ? result.reason.message : String(result.reason);
+            mergeFirstError = errMsg;
           }
           // Use first member's text as fallback so tree reduction can continue
           // Preserve input members' findings so they aren't lost
@@ -1277,11 +1294,12 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           const prevFailures = errorCountMap.get(errCpKey) ?? 0;
           const newFailureCount = prevFailures + 1;
           errorCountMap.set(errCpKey, newFailureCount); // update in-memory for same-invocation re-encounters
+          errorMessageMap.set(errCpKey, errMsg); // preserve latest error message
           await ctx.integrations.db.execute(
             `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json)
              VALUES ($1, $2, $3, $4::jsonb)
              ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb`,
-            [runId, currentRound, group.idx, JSON.stringify({ error: mergeFirstError, failureCount: newFailureCount })],
+            [runId, currentRound, group.idx, JSON.stringify({ error: errMsg, failureCount: newFailureCount, timestamp: new Date().toISOString() })],
             { label: `Save merge error checkpoint R${currentRound}:G${group.idx} (failure #${newFailureCount})` }
           );
         }

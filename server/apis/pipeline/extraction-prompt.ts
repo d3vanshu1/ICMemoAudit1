@@ -173,7 +173,7 @@ export function computeContentHash(text: string): string {
 // ---------------------------------------------------------------------------
 
 /** Claude model used for universal extraction. */
-export const EXTRACTION_MODEL = "claude-sonnet-4-6";
+export const EXTRACTION_MODEL = "claude-haiku-4-5-20251001";
 
 /** Number of concurrent LLM extraction calls per batch. */
 export const EXTRACTION_CONCURRENCY = 8; // Reduced from 12 to limit account-level rate-limit pressure

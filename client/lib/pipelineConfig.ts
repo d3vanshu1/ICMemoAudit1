@@ -38,10 +38,22 @@ export const CHUNK_CONCURRENCY = 12;
 
 /**
  * Claude model used for universal extraction.
- * - Production: "claude-sonnet-4-6" (highest quality)
- * - Testing: "claude-haiku-4-5-20251001" (fastest/cheapest)
+ * - Quality-critical modules (omission_audit, blind_spot_scanner, diligence_completeness)
+ *   override to Sonnet at the sub-agent/merge layer.
+ * - Extraction (chunking) uses Haiku — cost-effective; quality-sensitive work
+ *   happens in the analysis + merge phases.
  */
-export const EXTRACTION_MODEL = "claude-sonnet-4-6";
+export const EXTRACTION_MODEL = "claude-haiku-4-5-20251001";
+
+/**
+ * Per-module model overrides for sub-agent analysis and merge.
+ * Modules listed here use Sonnet; all others use Haiku.
+ */
+export const SONNET_OVERRIDE_MODULES = new Set([
+  "omission_audit",
+  "blind_spot_scanner",
+  "diligence_completeness",
+]);
 
 // ---------------------------------------------------------------------------
 // File type filtering

@@ -40,6 +40,10 @@ export default api({
             })
           ).optional(),
           error: z.string().optional(),
+          failureCount: z.number().optional(),
+          lastError: z.string().optional(),
+          skippedAfterFailures: z.number().optional(),
+          timestamp: z.string().optional(),
         }),
       })
     ),
@@ -62,12 +66,16 @@ export default api({
         ? JSON.parse(row.merged_json)
         : row.merged_json;
 
-      // If this is an error node, return it as-is
+      // If this is an error node, return it with diagnostic fields
       if (merged.error) {
         return {
           treeLevel: row.tree_level,
           nodeIndex: row.node_index,
-          mergedNode: { error: String(merged.error) },
+          mergedNode: {
+            error: String(merged.error),
+            failureCount: merged.failureCount ?? undefined,
+            timestamp: merged.timestamp ?? undefined,
+          },
         };
       }
 
@@ -99,7 +107,14 @@ export default api({
       return {
         treeLevel: row.tree_level,
         nodeIndex: row.node_index,
-        mergedNode: { text, executiveHeader, findings },
+        mergedNode: {
+          text,
+          executiveHeader,
+          findings,
+          // Include diagnostic fields from fallback (skipped) checkpoints
+          ...(merged.lastError ? { lastError: String(merged.lastError) } : {}),
+          ...(merged.skippedAfterFailures ? { skippedAfterFailures: merged.skippedAfterFailures } : {}),
+        },
       };
     });
 
