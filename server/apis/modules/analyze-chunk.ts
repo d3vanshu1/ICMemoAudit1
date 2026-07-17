@@ -1,4 +1,5 @@
 import { api, z, anthropic } from "@superblocksteam/sdk-api";
+import { getModuleModel } from "../pipeline/model-config.js";
 
 // ---------------------------------------------------------------------------
 // Integration
@@ -6,9 +7,8 @@ import { api, z, anthropic } from "@superblocksteam/sdk-api";
 const ANTHROPIC_ID = "8ccd43c8-5340-4ae2-8eee-7cbb3896df53";
 
 // ---------------------------------------------------------------------------
-// Models
+// Config
 // ---------------------------------------------------------------------------
-const SUB_AGENT_MODEL = "claude-sonnet-4-6";
 const SUB_AGENT_MAX_TOKENS = 4096;
 
 // ---------------------------------------------------------------------------
@@ -403,7 +403,7 @@ export default api({
         method: "POST",
         path: "/v1/messages",
         body: {
-          model: SUB_AGENT_MODEL,
+          model: getModuleModel(moduleId),
           max_tokens: SUB_AGENT_MAX_TOKENS,
           system: [
             {

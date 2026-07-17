@@ -63,27 +63,12 @@ import { runNumericVerifyInline } from "./numeric-verify-inline.js";
 import { runCleanParsedTextPhase } from "./clean-parsed-text.js";
 import { runWebResearchPhase } from "./web-research-phase.js";
 import { upsertModuleOutput } from "../modules/upsert-module-output.js";
+import { getModuleModel, SONNET_MODEL } from "./model-config.js";
 import type { NumericVerifyResult } from "./numeric-verify-inline.js";
 
 // ---------------------------------------------------------------------------
-// Models & Config
+// Config
 // ---------------------------------------------------------------------------
-const HAIKU_MODEL = "claude-haiku-4-5-20251001";
-const SONNET_MODEL = "claude-sonnet-4-6";
-const OPUS_MODEL = "claude-opus-4-7";
-
-/** Default model for sub-agent analysis and merge — fast/cheap for most modules */
-const DEFAULT_MODEL = HAIKU_MODEL;
-
-/** Modules that use Sonnet for higher-fidelity analysis (absence claims, coverage) */
-const SONNET_MODULES = new Set(["omission_audit", "blind_spot_scanner", "diligence_completeness"]);
-
-/** Resolve model for a given module — Sonnet for quality-critical modules, Haiku otherwise */
-function getModuleModel(moduleId: string, useOpus?: boolean | null): string {
-  if (useOpus) return OPUS_MODEL;
-  return SONNET_MODULES.has(moduleId) ? SONNET_MODEL : DEFAULT_MODEL;
-}
-
 const SUB_AGENT_MAX_TOKENS = 4096;
 const MERGE_MAX_TOKENS = 8000;
 
@@ -99,7 +84,7 @@ const TIME_BUDGET_MS = 200_000; // 3m20s — gives 100s headroom under platform'
 // Report formatting config (inline, post-merge)
 const FORMAT_REPORT_MIN_BUDGET_MS = 100_000; // Need at least 100s to attempt report formatting
 const FORMAT_REPORT_MAX_TOKENS = 12000;
-const FORMAT_REPORT_MODEL = "claude-sonnet-4-6"; // Sonnet for speed; Opus only via client re-format
+const FORMAT_REPORT_MODEL = SONNET_MODEL; // Always Sonnet — report formatting is quality-critical
 
 /** Modules that go through the web research phase instead of direct analysis */
 const WEB_RESEARCH_MODULES = new Set(["external_risk_overlay", "social_reputation"]);

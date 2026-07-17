@@ -1,5 +1,6 @@
 import { api, z, anthropic } from "@superblocksteam/sdk-api";
 import {
+  EXTRACTION_MODEL,
   UNIVERSAL_EXTRACTION_PROMPT,
   injectClaimIds,
   sanitizeBraces,
@@ -11,9 +12,8 @@ import {
 const ANTHROPIC_ID = "8ccd43c8-5340-4ae2-8eee-7cbb3896df53";
 
 // ---------------------------------------------------------------------------
-// Models — default used when no override is provided via input
+// Config
 // ---------------------------------------------------------------------------
-const DEFAULT_MODEL = "claude-sonnet-4-6";
 const SUB_AGENT_MAX_TOKENS = 8000;
 
 // ---------------------------------------------------------------------------
@@ -118,7 +118,7 @@ export default api({
   }),
 
   async run(ctx, { chunkIndex, totalChunks, chunk, model }) {
-    const useModel = model || DEFAULT_MODEL;
+    const useModel = model || EXTRACTION_MODEL;
     const content = buildMultimodalContent(chunk);
     const label = `Universal extract: ${sanitizeBraces(chunk.label)} (${chunkIndex + 1}/${totalChunks})`;
 

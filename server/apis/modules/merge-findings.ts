@@ -1,6 +1,7 @@
 import { api, z, anthropic } from "@superblocksteam/sdk-api";
 import { buildMergedText } from "./build-merged-text.js";
 import { NUMERIC_MODULES } from "./constants.js";
+import { getModuleModel } from "../pipeline/model-config.js";
 
 // ---------------------------------------------------------------------------
 // Integration
@@ -8,10 +9,8 @@ import { NUMERIC_MODULES } from "./constants.js";
 const ANTHROPIC_ID = "8ccd43c8-5340-4ae2-8eee-7cbb3896df53";
 
 // ---------------------------------------------------------------------------
-// Models
+// Config
 // ---------------------------------------------------------------------------
-const SONNET_MODEL = "claude-sonnet-4-6";
-const OPUS_MODEL = "claude-opus-4-7";
 const MERGE_MAX_TOKENS = 8000;
 
 // ---------------------------------------------------------------------------
@@ -358,7 +357,7 @@ No deterministic numeric verification was performed for this analysis. All figur
         method: "POST",
         path: "/v1/messages",
         body: {
-          model: useOpus ? OPUS_MODEL : SONNET_MODEL,
+          model: getModuleModel(moduleId, useOpus),
           max_tokens: MERGE_MAX_TOKENS,
           system: [
             {

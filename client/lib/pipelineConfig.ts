@@ -1,8 +1,12 @@
 /**
- * Pipeline Configuration — single source of truth for extraction pipeline settings.
+ * Pipeline Configuration — client-side extraction settings.
  *
- * Change these values to tune performance vs. quality tradeoffs.
- * All pipeline code reads from this file — no hardcoded duplicates.
+ * Model selection for sub-agent/merge is handled server-side by
+ * server/apis/pipeline/model-config.ts (single source of truth).
+ *
+ * ⚠️  EXTRACTION_MODEL and CHUNK_CHARS must stay in sync with their
+ *     server-side counterparts (extraction-prompt.ts). Client and server
+ *     cannot share an import across the build boundary.
  */
 
 // ---------------------------------------------------------------------------
@@ -37,23 +41,11 @@ export const CHUNK_CONCURRENCY = 12;
 // ---------------------------------------------------------------------------
 
 /**
- * Claude model used for universal extraction.
- * - Quality-critical modules (omission_audit, blind_spot_scanner, diligence_completeness)
- *   override to Sonnet at the sub-agent/merge layer.
- * - Extraction (chunking) uses Haiku — cost-effective; quality-sensitive work
- *   happens in the analysis + merge phases.
+ * Claude model used for universal extraction (chunking phase).
+ * Haiku — cost-effective; quality-sensitive work happens server-side
+ * in the analysis + merge phases (model selected by server/apis/pipeline/model-config.ts).
  */
 export const EXTRACTION_MODEL = "claude-haiku-4-5-20251001";
-
-/**
- * Per-module model overrides for sub-agent analysis and merge.
- * Modules listed here use Sonnet; all others use Haiku.
- */
-export const SONNET_OVERRIDE_MODULES = new Set([
-  "omission_audit",
-  "blind_spot_scanner",
-  "diligence_completeness",
-]);
 
 // ---------------------------------------------------------------------------
 // File type filtering
