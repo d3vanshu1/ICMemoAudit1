@@ -54,10 +54,49 @@ All numeric verification is handled by a separate deterministic system (NumericV
 Your role is EXTRACTION ONLY: report what the document states, not whether the numbers add up.`;
 
 // ---------------------------------------------------------------------------
+// Legal/Tax/Regulatory Scope Boundary (omission_audit only)
+// Prevents findings from citing external statutes or making legal conclusions
+// ---------------------------------------------------------------------------
+export const LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY = `
+
+## SCOPE BOUNDARY — LEGAL, TAX, AND REGULATORY TOPICS
+
+You are auditing a data room for missing or unverified DOCUMENTATION, not
+assessing the underlying legal, tax, or regulatory questions yourself. When a
+finding touches a legal, tax, or regulatory topic:
+
+DO:
+- State what documentation, sign-off, or analysis you would expect to see
+  (e.g., "a written tax counsel opinion," "an independent legal review of
+  marketing claims," "confirmation from regulatory counsel") and note whether
+  it's present in the reviewed materials.
+- Note internal inconsistencies WITHIN the documents themselves (e.g., one
+  slide hedges a claim as forthcoming while another states it in present
+  tense) — this is a documentary observation, not a legal conclusion.
+
+DO NOT:
+- Cite, name, or explain external statutes, regulations, legal regimes, or
+  case law (e.g., specific tax codes, named Acts, regulatory frameworks) —
+  even if you are confident they are accurate. You cannot verify legal or
+  regulatory facts against the data room, so do not assert them.
+- State the legislative or regulatory status of any law (whether it has
+  passed, when it takes effect, whether it has received assent, etc.).
+- Produce your own quantified estimate of a legal, tax, or regulatory impact
+  (e.g., an estimated IRR or EBITDA sensitivity to a tax outcome). If a
+  sensitivity matters, recommend that the deal team run it — do not run it
+  yourself.
+- Conclude whether a legal, tax, or regulatory position is correct, sound, or
+  compliant.
+
+If you are unsure whether a point crosses this line, the safe fallback is:
+"This raises a legal/tax/regulatory question that the data room does not
+show has been independently addressed" — and stop there.`;
+
+// ---------------------------------------------------------------------------
 // Adversarial Absence Verification Protocol
 // Applied to modules that assert things are "missing" or "absent"
 // ---------------------------------------------------------------------------
-const ABSENCE_VERIFICATION_PROTOCOL = `
+export const ABSENCE_VERIFICATION_PROTOCOL = `
 
 ## CRITICAL: Adversarial Self-Check for Absence Claims
 
@@ -96,6 +135,7 @@ Identify omissions in these categories:
 ## PE Diligence Checklist
 
 Cross-reference against: customer concentration, churn/retention, key man risk, revenue recognition, regulatory exposure, competitive response, management incentives, exit assumptions, QoE items, capex requirements.
+${LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY}
 ${ABSENCE_VERIFICATION_PROTOCOL}
 ${DENSE_SUFFIX}
 

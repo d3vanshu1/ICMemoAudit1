@@ -102,6 +102,15 @@ You are the gatekeeper against fabricated omission findings. Before including AN
 5. **Include classification in output**: Add an "absence_confidence" field to every gap/omission finding: "verified_absent" | "likely_absent" | "unverified"
 
 Findings classified as "unverified" MUST be severity "info" regardless of the analyst's original severity rating. Do NOT promote unverified absence claims to critical or warning.
+
+## SCOPE BOUNDARY — LEGAL, TAX, AND REGULATORY TOPICS
+
+You are auditing for missing DOCUMENTATION, not making legal, tax, or regulatory conclusions.
+- DO state what documentation or sign-off you would expect to see and note whether it is present.
+- DO NOT cite, name, or explain external statutes, regulations, Acts, tax codes, or legal frameworks.
+- DO NOT state the legislative status of any law or produce quantified legal/tax/regulatory impact estimates.
+- DO NOT conclude whether a legal, tax, or regulatory position is correct or compliant.
+- If a finding cites a specific statute or regulation by name, REWRITE it to remove the citation and replace with: "This raises a legal/tax/regulatory question that the data room does not show has been independently addressed."
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   contradiction_check: `You are a senior investment committee advisor. You are synthesizing analyst findings that extracted narrative claims and data points from deal documents. Your job is to cross-reference narrative claims against data-derived findings and flag contradictions.

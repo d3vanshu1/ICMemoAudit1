@@ -65,6 +65,8 @@ import { runWebResearchPhase } from "./web-research-phase.js";
 import { upsertModuleOutput } from "../modules/upsert-module-output.js";
 import { getModuleModel, SONNET_MODEL } from "./model-config.js";
 import { runChecklistScan, formatCoverageMapForPrompt, type ChecklistScanResult } from "./checklist-scan-phase.js";
+import { runAbsenceVerificationPhase } from "./absence-verification-phase.js";
+import { getPipelineVersion } from "./pipeline-version.js";
 import type { NumericVerifyResult } from "./numeric-verify-inline.js";
 
 // ---------------------------------------------------------------------------
@@ -84,6 +86,9 @@ const TIME_BUDGET_MS = 200_000; // 3m20s — gives 100s headroom under platform'
 
 // Report formatting config (inline, post-merge)
 const FORMAT_REPORT_MIN_BUDGET_MS = 100_000; // Need at least 100s to attempt report formatting
+
+// Absence verification config (Step 5.5, between merge and format)
+const ABSENCE_VERIFICATION_MIN_BUDGET_MS = 120_000; // Need at least 120s — 2 LLM calls per finding
 const FORMAT_REPORT_MAX_TOKENS = 12000;
 const FORMAT_REPORT_MODEL = SONNET_MODEL; // Always Sonnet — report formatting is quality-critical
 
@@ -808,10 +813,10 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
         ].filter(Boolean).join("\n");
 
         await ctx.integrations.db.execute(
-          `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json, model_used)
-           VALUES ($1, $2, $3::jsonb, $4)
+          `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json, model_used, prompt_version)
+           VALUES ($1, $2, $3::jsonb, $4, $5)
            ON CONFLICT (run_id, chunk_index) DO NOTHING`,
-          [runId, row.iteration - 1, JSON.stringify({ label, extraction, chunkIndex: row.iteration - 1 }), getModuleModel(moduleId)],
+          [runId, row.iteration - 1, JSON.stringify({ label, extraction, chunkIndex: row.iteration - 1 }), getModuleModel(moduleId), getPipelineVersion()],
           { label: `Inject iteration ${row.iteration} as analysis` }
         );
       }
@@ -822,14 +827,53 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // --- Step 2: Sub-agent analysis (with checkpointing) ---
   // For web research modules, iterations have already been injected as analysis
   // checkpoints above — this step will see them all as "already analyzed" and skip.
+  const currentVersion = getPipelineVersion();
   const analyzedRows = await ctx.integrations.db.query(
     `SELECT chunk_index FROM pipeline_analysis
-     WHERE run_id = $1
+     WHERE run_id = $1 AND prompt_version = $2
      ORDER BY chunk_index`,
     AnalysisCheckpointSchema,
-    [runId],
-    { label: "Load analysis checkpoints" }
+    [runId, currentVersion],
+    { label: "Load analysis checkpoints (version-matched)" }
   );
+
+  // Version mismatch detection: check if there are ANY rows for this run with a
+  // DIFFERENT prompt_version OR null (pre-versioning = stale by definition).
+  const staleRows = await ctx.integrations.db.query(
+    `SELECT COUNT(*)::int AS cnt FROM pipeline_analysis
+     WHERE run_id = $1 AND (prompt_version IS NULL OR prompt_version != $2)`,
+    z.object({ cnt: z.coerce.number() }),
+    [runId, currentVersion],
+    { label: "Check for stale analysis checkpoints" }
+  );
+
+  if (staleRows.length > 0 && staleRows[0].cnt > 0) {
+    // Stale checkpoints detected — cannot resume this run. Create a new run_id.
+    console.error(`[pipeline] VERSION MISMATCH: ${staleRows[0].cnt} analysis rows for run ${runId} have a different prompt_version than current (${currentVersion}). Starting fresh run.`);
+
+    // Create a brand new run instead of reusing this stale one
+    const freshRunRows = await ctx.integrations.db.query(
+      `INSERT INTO module_runs (deal_id, module_id, status)
+       VALUES ($1, $2, 'running'::module_status)
+       RETURNING id AS run_id`,
+      RunIdSchema,
+      [dealId, moduleId],
+      { label: "Create fresh run (version mismatch)" }
+    );
+    const freshRunId = freshRunRows[0].run_id;
+    console.log(`[pipeline] Created fresh run ${freshRunId} (replacing stale ${runId})`);
+
+    // Mark the old run as failed
+    await ctx.integrations.db.execute(
+      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
+      [runId],
+      { label: "Mark stale run as failed" }
+    );
+
+    // Recurse with the new run_id (this is safe — it will enter the fresh-start path)
+    return runPipelineCore(ctx, { ...input, runId: freshRunId });
+  }
+
   const analyzedSet = new Set(analyzedRows.map(r => r.chunk_index));
 
   // For web research modules, analysis is synthetic (injected from iterations).
@@ -919,10 +963,10 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
         // Save checkpoint (flag truncated responses so thin findings are traceable)
         await ctx.integrations.db.execute(
-          `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json, model_used)
-           VALUES ($1, $2, $3::jsonb, $4)
+          `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json, model_used, prompt_version)
+           VALUES ($1, $2, $3::jsonb, $4, $5)
            ON CONFLICT (run_id, chunk_index) DO NOTHING`,
-          [runId, globalIdx, JSON.stringify({ label: chunkLabel, extraction, chunkIndex: globalIdx, truncated }), getModuleModel(moduleId)],
+          [runId, globalIdx, JSON.stringify({ label: chunkLabel, extraction, chunkIndex: globalIdx, truncated }), getModuleModel(moduleId), currentVersion],
           { label: `Save analysis checkpoint ${globalIdx}` }
         );
 
@@ -1209,10 +1253,10 @@ A "## Numeric Verification Report" section appears in the input below. It contai
         groupsDone++;
         // Save a non-error checkpoint so the group is permanently resolved
         await ctx.integrations.db.execute(
-          `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json, model_used)
-           VALUES ($1, $2, $3, $4::jsonb, $5)
-           ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb, model_used = $5`,
-          [runId, currentRound, group.idx, JSON.stringify({ text: fallback.text, executiveHeader: fallback.executiveHeader, findings: fallback.findings, skippedAfterFailures: priorFailures, lastError }), getModuleModel(moduleId, useOpus)],
+          `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json, model_used, prompt_version)
+           VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+           ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb, model_used = $5, prompt_version = $6`,
+          [runId, currentRound, group.idx, JSON.stringify({ text: fallback.text, executiveHeader: fallback.executiveHeader, findings: fallback.findings, skippedAfterFailures: priorFailures, lastError }), getModuleModel(moduleId, useOpus), currentVersion],
           { label: `Save fallback checkpoint R${currentRound}:G${group.idx} (skipped after ${priorFailures} failures)` }
         );
         continue;
@@ -1306,10 +1350,10 @@ A "## Numeric Verification Report" section appears in the input below. It contai
 
           // Save merge checkpoint
           await ctx.integrations.db.execute(
-            `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json, model_used)
-             VALUES ($1, $2, $3, $4::jsonb, $5)
-             ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb, model_used = $5`,
-            [runId, currentRound, group.idx, JSON.stringify({ text: node.text, executiveHeader: node.executiveHeader, findings: node.findings, truncated: node.truncated ?? false }), getModuleModel(moduleId, useOpus)],
+            `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json, model_used, prompt_version)
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+             ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb, model_used = $5, prompt_version = $6`,
+            [runId, currentRound, group.idx, JSON.stringify({ text: node.text, executiveHeader: node.executiveHeader, findings: node.findings, truncated: node.truncated ?? false }), getModuleModel(moduleId, useOpus), currentVersion],
             { label: `Save merge checkpoint R${currentRound}:G${group.idx}` }
           );
         } else {
@@ -1337,10 +1381,10 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           errorCountMap.set(errCpKey, newFailureCount); // update in-memory for same-invocation re-encounters
           errorMessageMap.set(errCpKey, errMsg); // preserve latest error message
           await ctx.integrations.db.execute(
-            `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json, model_used)
-             VALUES ($1, $2, $3, $4::jsonb, $5)
-             ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb, model_used = $5`,
-            [runId, currentRound, group.idx, JSON.stringify({ error: errMsg, failureCount: newFailureCount, timestamp: new Date().toISOString() }), getModuleModel(moduleId, useOpus)],
+            `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json, model_used, prompt_version)
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+             ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb, model_used = $5, prompt_version = $6`,
+            [runId, currentRound, group.idx, JSON.stringify({ error: errMsg, failureCount: newFailureCount, timestamp: new Date().toISOString() }), getModuleModel(moduleId, useOpus), currentVersion],
             { label: `Save merge error checkpoint R${currentRound}:G${group.idx} (failure #${newFailureCount})` }
           );
         }
@@ -1396,6 +1440,54 @@ A "## Numeric Verification Report" section appears in the input below. It contai
   const suppressedCount = preSuppressCount - finalFindings.length;
   if (suppressedCount > 0) {
     console.log(`[pipeline] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
+  }
+
+  // --- Step 5.5: Absence Verification Phase ---
+  // For omission_audit / blind_spot_scanner / diligence_completeness, run adversarial
+  // verification on any finding with absence_confidence set. Two LLM calls per finding:
+  //   Call A: generate alternate search queries
+  //   Call B: retrieve evidence and issue REVISED/UPHELD verdict
+  // Findings without absence_confidence pass through untouched.
+  if (CHECKLIST_MODULES.has(moduleId)) {
+    const verifyBudget = timeRemaining();
+    if (verifyBudget >= ABSENCE_VERIFICATION_MIN_BUDGET_MS) {
+      console.log(`[pipeline] Running absence verification phase (${Math.round(verifyBudget / 1000)}s budget)`);
+      try {
+        const verifyResult = await runAbsenceVerificationPhase(
+          ctx,
+          dealId,
+          runId!,
+          finalFindings,
+          moduleId,
+          useOpus
+        );
+        finalFindings = verifyResult.findings;
+        const revised = verifyResult.verificationLog.filter(v => v.verdict.verdict === "REVISED").length;
+        const upheld = verifyResult.verificationLog.filter(v => v.verdict.verdict === "UPHELD").length;
+        console.log(`[pipeline] Absence verification complete: ${revised} revised, ${upheld} upheld`);
+      } catch (verifyErr) {
+        const msg = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
+        console.error(`[pipeline] Absence verification phase failed (non-fatal, findings unchanged): ${msg}`);
+      }
+    } else {
+      console.warn(`[pipeline] Insufficient time for absence verification (${Math.round(verifyBudget / 1000)}s < ${ABSENCE_VERIFICATION_MIN_BUDGET_MS / 1000}s needed) — deferring to next invocation`);
+      return {
+        status: "in_progress",
+        runId: runId!,
+        phase: "absence_verification",
+        progress: {
+          analysisTotal: routed.length,
+          analysisCompleted: routed.length,
+          mergeRound: totalMergeRounds,
+          mergeTotal: totalMergeRounds,
+        },
+        result: null,
+        failedChunks,
+        truncatedChunks,
+        truncatedMerges,
+        firstError,
+      };
+    }
   }
 
   // --- Step 6: Inline Report Formatting ---

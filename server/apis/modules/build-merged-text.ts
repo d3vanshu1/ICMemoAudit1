@@ -15,6 +15,13 @@ export interface MergedFinding {
   full_analysis: string;
   source_docs: string[];
   claim_ids?: string[];
+  absence_confidence?: string;
+  verification?: {
+    status: "revised" | "upheld";
+    evidenceQuoted?: string;
+    evidenceSource?: string;
+    queriesRun: string[];
+  };
 }
 
 export function buildMergedText(
