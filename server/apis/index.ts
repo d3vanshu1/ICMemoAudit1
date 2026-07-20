@@ -67,6 +67,7 @@ import SaveDocTables from './documents/save-doc-tables.js';
 import GetDocTables from './documents/get-doc-tables.js';
 import BackfillDocTablesFromText from './documents/backfill-doc-tables-from-text.js';
 import GetDocTablesSummary from './documents/get-doc-tables-summary.js';
+import UpdateParsedText from './documents/update-parsed-text.js';
 
 // Numeric verification
 import NumericVerify from './numeric/numeric-verify.js';
@@ -114,7 +115,7 @@ const apis = {
   ListDeals, GetDeal, CreateDeal, UpdateDeal, DeleteDeal,
   // Documents
   ListDocuments, SaveDocument, UpdateDocument, DeleteDocument, GetDocumentTexts,
-  SaveDocTables, GetDocTables, BackfillDocTablesFromText, GetDocTablesSummary,
+  SaveDocTables, GetDocTables, BackfillDocTablesFromText, GetDocTablesSummary, UpdateParsedText,
   // Numeric verification
   NumericVerify, GetNumericReport, SearchNumericFindings, DiagSharedFormulas, DiagFormulaExtraction,
   // Q&A

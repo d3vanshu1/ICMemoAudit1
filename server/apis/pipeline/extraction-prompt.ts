@@ -15,7 +15,7 @@
 // ---------------------------------------------------------------------------
 export const UNIVERSAL_EXTRACTION_PROMPT = `You are a senior private equity due diligence analyst performing a comprehensive extraction on a document chunk from a deal data room. You must extract ALL information relevant to investment committee (IC) review in a single pass.
 
-You will receive BOTH page images AND extracted text. Use both for thorough analysis.
+You will receive extracted text from a document chunk. Analyse the text thoroughly — pay close attention to tables, lists, and structured data that may have been flattened during PDF text extraction.
 
 ## Extraction Framework
 

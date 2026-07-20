@@ -1,10 +1,11 @@
-import { ArrowLeft, CheckCircle2, Circle } from "lucide-react";
+import { ArrowLeft, CheckCircle2, Circle, RefreshCw } from "lucide-react";
 import type { Deal } from "@/types/deal";
 import type { Document, DocumentTag, DocumentSource } from "@/types/document";
 import { MODULE_DEFINITIONS } from "@/lib/moduleConfig";
 import DealMetadata from "../deal/DealMetadata";
 import DocumentList from "../documents/DocumentList";
 import DocumentUpload from "../documents/DocumentUpload";
+import ICButton from "../ui/ICButton";
 
 interface SidebarProps {
   deal: Deal;
@@ -16,6 +17,7 @@ interface SidebarProps {
   onUpdateTag: (docId: string, tag: DocumentTag) => void;
   onUpdateSource: (docId: string, source: DocumentSource) => void;
   onBack: () => void;
+  onReparse?: () => void;
 }
 
 export default function Sidebar({
@@ -28,6 +30,7 @@ export default function Sidebar({
   onUpdateTag,
   onUpdateSource,
   onBack,
+  onReparse,
 }: SidebarProps) {
   const progressPct = totalModules > 0 ? Math.round((completedModules.length / totalModules) * 100) : 0;
 
@@ -61,8 +64,14 @@ export default function Sidebar({
             onTagChange={onUpdateTag}
             onSourceChange={onUpdateSource}
           />
-          <div className="mt-3">
+          <div className="mt-3 space-y-2">
             <DocumentUpload onUpload={onUpload} />
+            {onReparse && documents.some((d) => d.file_type === "application/pdf" || d.file_name.toLowerCase().endsWith(".pdf")) && (
+              <ICButton size="sm" variant="ghost" onClick={onReparse} className="w-full text-[10px]">
+                <RefreshCw className="w-3 h-3" />
+                Re-parse PDFs
+              </ICButton>
+            )}
           </div>
         </div>
 

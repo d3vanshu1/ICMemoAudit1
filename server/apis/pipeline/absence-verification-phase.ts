@@ -286,21 +286,44 @@ export async function runAbsenceVerificationPhase(
   console.log(`[absence-verify] ${findingsToVerify.length} findings with absence_confidence, ${completedIndices.size} already checkpointed`);
 
   // Fetch document timeline for temporal supersession checks
+  // Parse dates from filenames (format: "YYYY-MM-DD rest of name.pdf")
+  // Documents without date prefixes are listed as "(date: unknown)"
   let documentTimeline = "No document timeline available.";
   try {
     const docs = await ctx.integrations.db.query(
       `SELECT file_name, uploaded_at::text
        FROM documents
        WHERE deal_id = $1
-       ORDER BY uploaded_at ASC`,
+       ORDER BY file_name ASC`,
       DocumentTimelineSchema,
       [dealId],
       { label: "Fetch document timeline for recency check" }
     );
     if (docs.length > 0) {
-      documentTimeline = docs
-        .map((d, i) => `${i + 1}. ${d.file_name} (date: ${d.uploaded_at.slice(0, 10)})`)
-        .join("\n");
+      const DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})\s/;
+      const dated: { date: string; fileName: string }[] = [];
+      const undated: string[] = [];
+
+      for (const d of docs) {
+        const match = d.file_name.match(DATE_PREFIX_RE);
+        if (match) {
+          dated.push({ date: match[1], fileName: d.file_name });
+        } else {
+          undated.push(d.file_name);
+        }
+      }
+
+      // Sort dated documents chronologically
+      dated.sort((a, b) => a.date.localeCompare(b.date));
+
+      const lines: string[] = [];
+      for (let i = 0; i < dated.length; i++) {
+        lines.push(`${i + 1}. ${dated[i].fileName} (date: ${dated[i].date})`);
+      }
+      for (let i = 0; i < undated.length; i++) {
+        lines.push(`${dated.length + i + 1}. ${undated[i]} (date: unknown)`);
+      }
+      documentTimeline = lines.join("\n");
     }
   } catch (err) {
     console.warn("[absence-verify] Failed to fetch document timeline:", err);

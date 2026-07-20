@@ -199,16 +199,274 @@ async function renderPageToImage(
   return dataUrl.split(",")[1];
 }
 
-/** Extract text content from a PDF page */
+// ---------------------------------------------------------------------------
+// Helpers — PDF text extraction with spatial awareness
+// ---------------------------------------------------------------------------
+
+/** Tolerance for grouping items into the same row (points) */
+const ROW_Y_TOLERANCE = 3;
+
+/** Minimum number of rows with consistent column count to detect a grid */
+const MIN_GRID_ROWS = 3;
+
+/** Minimum columns to qualify as a table (2 = at least key-value pairs) */
+const MIN_GRID_COLS = 2;
+
+/** Maximum gap ratio between columns — if one "column" is much wider than
+ *  others, it's probably free-form text, not a grid */
+const MAX_COL_WIDTH_RATIO = 8;
+
+interface TextItemPos {
+  str: string;
+  x: number;
+  y: number;
+  width: number;
+}
+
+/**
+ * Group text items into rows by y-coordinate, then detect tabular grids
+ * and emit structured output. Falls back to flat join for non-grid content.
+ */
 async function extractPageText(
   page: pdfjsLib.PDFPageProxy
 ): Promise<string> {
   const textContent = await page.getTextContent();
-  const raw = textContent.items
-    .map((item) => ("str" in item ? item.str : ""))
-    .join(" ");
-  return sanitizeBraces(raw);
+  const items: TextItemPos[] = [];
+
+  for (const item of textContent.items) {
+    if (!("str" in item) || !item.str.trim()) continue;
+    const ti = item as { str: string; transform: number[]; width: number; height: number };
+    items.push({
+      str: ti.str.trim(),
+      x: ti.transform[4],
+      y: ti.transform[5],
+      width: ti.width,
+    });
+  }
+
+  if (items.length === 0) return "";
+
+  // --- Group items into rows by y-coordinate ---
+  // Sort by y descending (PDF coordinate system: y=0 is bottom)
+  items.sort((a, b) => b.y - a.y || a.x - b.x);
+
+  const rows: TextItemPos[][] = [];
+  let currentRow: TextItemPos[] = [items[0]];
+  let currentY = items[0].y;
+
+  for (let i = 1; i < items.length; i++) {
+    const item = items[i];
+    if (Math.abs(item.y - currentY) <= ROW_Y_TOLERANCE) {
+      currentRow.push(item);
+    } else {
+      // Sort current row by x before pushing
+      currentRow.sort((a, b) => a.x - b.x);
+      rows.push(currentRow);
+      currentRow = [item];
+      currentY = item.y;
+    }
+  }
+  // Push final row
+  currentRow.sort((a, b) => a.x - b.x);
+  rows.push(currentRow);
+
+  // --- Attempt grid detection ---
+  // A grid exists when multiple consecutive rows have items at consistent x-positions
+  const gridRegions = detectGridRegions(rows);
+
+  if (gridRegions.length === 0) {
+    // No grids detected — flat join (existing behavior)
+    return sanitizeBraces(
+      rows.map(row => row.map(item => item.str).join(" ")).join("\n")
+    );
+  }
+
+  // --- Emit structured output ---
+  const outputLines: string[] = [];
+  let rowIdx = 0;
+
+  for (const region of gridRegions) {
+    // Emit non-grid rows before this region as plain text
+    while (rowIdx < region.startRow) {
+      outputLines.push(rows[rowIdx].map(item => item.str).join(" "));
+      rowIdx++;
+    }
+
+    // Emit grid region as markdown table
+    const tableLines = emitMarkdownTable(rows, region);
+    outputLines.push(...tableLines);
+    rowIdx = region.endRow;
+  }
+
+  // Emit remaining non-grid rows
+  while (rowIdx < rows.length) {
+    outputLines.push(rows[rowIdx].map(item => item.str).join(" "));
+    rowIdx++;
+  }
+
+  return sanitizeBraces(outputLines.join("\n"));
 }
+
+interface GridRegion {
+  startRow: number;
+  endRow: number; // exclusive
+  columnBoundaries: number[]; // x-positions of column starts
+}
+
+/**
+ * Detect contiguous regions of rows that form a grid (consistent column alignment).
+ */
+function detectGridRegions(rows: TextItemPos[][]): GridRegion[] {
+  const regions: GridRegion[] = [];
+  let i = 0;
+
+  while (i < rows.length) {
+    // Skip rows with only 1 item (can't be part of a multi-column grid)
+    if (rows[i].length < MIN_GRID_COLS) {
+      i++;
+      continue;
+    }
+
+    // Try to find a grid starting at row i
+    const region = tryBuildGrid(rows, i);
+    if (region) {
+      regions.push(region);
+      i = region.endRow;
+    } else {
+      i++;
+    }
+  }
+
+  return regions;
+}
+
+/**
+ * Attempt to build a grid region starting at `startRow`.
+ * Returns null if no valid grid of MIN_GRID_ROWS rows is found.
+ */
+function tryBuildGrid(rows: TextItemPos[][], startRow: number): GridRegion | null {
+  const firstRow = rows[startRow];
+  const colCount = firstRow.length;
+
+  if (colCount < MIN_GRID_COLS) return null;
+
+  // Use the first row's x-positions as candidate column boundaries
+  const colPositions = firstRow.map(item => item.x);
+
+  // Check subsequent rows for alignment
+  let endRow = startRow + 1;
+  while (endRow < rows.length) {
+    const row = rows[endRow];
+
+    // Allow rows with same column count (±1 for merged cells / spanning)
+    if (row.length < colCount - 1 || row.length > colCount + 1) break;
+
+    // Check if items roughly align to the established columns
+    if (!rowAlignsToColumns(row, colPositions)) break;
+
+    endRow++;
+  }
+
+  const gridRowCount = endRow - startRow;
+  if (gridRowCount < MIN_GRID_ROWS) return null;
+
+  // Validate column widths aren't degenerate (one huge column + tiny slivers)
+  const widths = computeColumnWidths(colPositions, rows[startRow]);
+  if (widths.length >= 2) {
+    const maxW = Math.max(...widths);
+    const minW = Math.min(...widths.filter(w => w > 0));
+    if (minW > 0 && maxW / minW > MAX_COL_WIDTH_RATIO) return null;
+  }
+
+  return { startRow, endRow, columnBoundaries: colPositions };
+}
+
+/**
+ * Check if a row's items align to the established column x-positions.
+ * Uses a tolerance of 30% of the average column gap.
+ */
+function rowAlignsToColumns(row: TextItemPos[], colPositions: number[]): boolean {
+  if (colPositions.length < 2) return false;
+
+  // Compute average gap between columns
+  const gaps: number[] = [];
+  for (let i = 1; i < colPositions.length; i++) {
+    gaps.push(colPositions[i] - colPositions[i - 1]);
+  }
+  const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+  const tolerance = Math.max(avgGap * 0.3, 10); // At least 10pt tolerance
+
+  // Each item in the row should align to some column position
+  let alignedCount = 0;
+  for (const item of row) {
+    const closestDist = Math.min(...colPositions.map(cx => Math.abs(item.x - cx)));
+    if (closestDist <= tolerance) alignedCount++;
+  }
+
+  // Require at least 70% of items to align
+  return alignedCount / row.length >= 0.7;
+}
+
+function computeColumnWidths(colPositions: number[], firstRow: TextItemPos[]): number[] {
+  const widths: number[] = [];
+  for (let i = 0; i < colPositions.length - 1; i++) {
+    widths.push(colPositions[i + 1] - colPositions[i]);
+  }
+  // Last column: use item width as proxy
+  if (firstRow.length > 0) {
+    const lastItem = firstRow[firstRow.length - 1];
+    widths.push(lastItem.width || 50);
+  }
+  return widths;
+}
+
+/**
+ * Emit a grid region as a markdown table.
+ * First row is treated as headers.
+ */
+function emitMarkdownTable(rows: TextItemPos[][], region: GridRegion): string[] {
+  const { startRow, endRow, columnBoundaries } = region;
+  const colCount = columnBoundaries.length;
+  const lines: string[] = [];
+
+  for (let r = startRow; r < endRow; r++) {
+    const row = rows[r];
+    const cells = assignItemsToColumns(row, columnBoundaries);
+    lines.push("| " + cells.join(" | ") + " |");
+
+    // Add separator after header row
+    if (r === startRow) {
+      lines.push("|" + " --- |".repeat(colCount));
+    }
+  }
+
+  return lines;
+}
+
+/**
+ * Assign a row's text items into column buckets based on x-position alignment.
+ */
+function assignItemsToColumns(row: TextItemPos[], colPositions: number[]): string[] {
+  const cells: string[] = new Array(colPositions.length).fill("");
+
+  for (const item of row) {
+    // Find the closest column
+    let bestCol = 0;
+    let bestDist = Math.abs(item.x - colPositions[0]);
+    for (let c = 1; c < colPositions.length; c++) {
+      const dist = Math.abs(item.x - colPositions[c]);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestCol = c;
+      }
+    }
+    // Append to cell (in case multiple items map to same column)
+    cells[bestCol] = cells[bestCol] ? cells[bestCol] + " " + item.str : item.str;
+  }
+
+  return cells;
+}
+
 
 // ---------------------------------------------------------------------------
 // Helpers — Excel

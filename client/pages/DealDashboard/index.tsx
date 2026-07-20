@@ -23,6 +23,7 @@ import RunAllModal from "@/components/ic/modules/RunAllModal";
 import RerunSuggestionModal from "@/components/ic/modules/RerunSuggestionModal";
 import RunHistory from "@/components/ic/modules/RunHistory";
 import QAPanel from "@/components/ic/qa/QAPanel";
+import ReparseDocumentsModal from "@/components/ic/documents/ReparseDocumentsModal";
 
 export { DealDashboardPage as Component };
 
@@ -90,6 +91,7 @@ export default function DealDashboardPage() {
   const [progressMap, setProgressMap] = useState<Record<string, AnalysisProgress>>({});
   const [rerunModal, setRerunModal] = useState<{ fileNames: string[]; suggestedIds: string[] } | null>(null);
   const [useOpus, setUseOpus] = useState(false);
+  const [showReparseModal, setShowReparseModal] = useState(false);
 
   // Sync DB docs into local state — only on initial load
   const docsInitialized = useRef(false);
@@ -2283,6 +2285,7 @@ export default function DealDashboardPage() {
         onUpdateTag={handleUpdateDocTag}
         onUpdateSource={handleUpdateDocSource}
         onBack={() => navigate("/")}
+        onReparse={() => setShowReparseModal(true)}
       />
 
       {/* Main content */}
@@ -2358,6 +2361,13 @@ export default function DealDashboardPage() {
           }}
         />
       )}
+
+      <ReparseDocumentsModal
+        open={showReparseModal}
+        onClose={() => setShowReparseModal(false)}
+        existingDocuments={docs.map((d) => ({ id: d.id, file_name: d.file_name }))}
+        onCommitComplete={() => refetchDocs()}
+      />
     </div>
   );
 }
