@@ -34,6 +34,8 @@ interface ReparseFileState {
 interface ReparseDocumentsModalProps {
   open: boolean;
   onClose: () => void;
+  /** Deal ID — needed for re-indexing and extraction purge */
+  dealId: string;
   /** Current documents in this deal (from DB) */
   existingDocuments: ExistingDocument[];
   /** Called after successful commit so parent can refetch */
@@ -47,16 +49,21 @@ interface ReparseDocumentsModalProps {
 export default function ReparseDocumentsModal({
   open,
   onClose,
+  dealId,
   existingDocuments,
   onCommitComplete,
 }: ReparseDocumentsModalProps) {
   const [fileStates, setFileStates] = useState<ReparseFileState[]>([]);
   const [previewIndex, setPreviewIndex] = useState<number | null>(null);
   const [committing, setCommitting] = useState(false);
+  const [purging, setPurging] = useState(false);
+  const [purgeComplete, setPurgeComplete] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragActive, setDragActive] = useState(false);
 
   const { run: updateParsedText } = useApi("UpdateParsedText");
+  const { run: indexDocumentChunks } = useApi("IndexDocumentChunks");
+  const { run: purgeDocumentExtractions } = useApi("PurgeDocumentExtractions");
 
   // -------------------------------------------------------------------------
   // File selection
@@ -186,10 +193,21 @@ export default function ReparseDocumentsModal({
       if (state.parseStatus !== "parsed" || !state.matchedDoc || state.committed || !state.newText) continue;
 
       try {
+        // 1. Update parsed_text in documents table
         await updateParsedText({
           documentId: state.matchedDoc.id,
           parsedText: state.newText,
         });
+
+        // 2. Re-index document_chunks so Q&A, checklist-scan, and
+        //    absence-verification all search the corrected text
+        await indexDocumentChunks({
+          documentId: state.matchedDoc.id,
+          dealId,
+          fileName: state.file.name,
+          parsedText: state.newText,
+        });
+
         successCount++;
         setFileStates((prev) =>
           prev.map((s, idx) => (idx === i ? { ...s, committed: true } : s))
@@ -203,12 +221,39 @@ export default function ReparseDocumentsModal({
     setCommitting(false);
     if (successCount > 0) {
       toast.success(
-        `Updated parsed_text for ${successCount} document${successCount > 1 ? "s" : ""}. ` +
-        `Purge extractions and re-run pipeline to use the improved text.`
+        `Updated parsed_text + re-indexed chunks for ${successCount} document${successCount > 1 ? "s" : ""}. ` +
+        `Purge stale extractions below to complete the refresh.`
       );
       onCommitComplete?.();
     }
-  }, [fileStates, updateParsedText, onCommitComplete]);
+  }, [fileStates, updateParsedText, indexDocumentChunks, dealId, onCommitComplete]);
+
+  // -------------------------------------------------------------------------
+  // Purge stale extractions for committed documents
+  // -------------------------------------------------------------------------
+
+  const handlePurgeExtractions = useCallback(async () => {
+    const committedDocIds = fileStates
+      .filter((s) => s.committed && s.matchedDoc)
+      .map((s) => s.matchedDoc!.id);
+
+    if (committedDocIds.length === 0) return;
+
+    setPurging(true);
+    try {
+      const result = await purgeDocumentExtractions({ documentIds: committedDocIds });
+      const count = result?.extractionsDeleted ?? 0;
+      setPurgeComplete(true);
+      toast.success(
+        `Purged ${count} stale extraction${count !== 1 ? "s" : ""} for ${committedDocIds.length} document${committedDocIds.length > 1 ? "s" : ""}. ` +
+        `Next pipeline run will re-extract from the improved text.`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Purge failed: ${msg}`);
+    }
+    setPurging(false);
+  }, [fileStates, purgeDocumentExtractions]);
 
   // -------------------------------------------------------------------------
   // Derived state
@@ -399,6 +444,24 @@ export default function ReparseDocumentsModal({
               >
                 Commit to DB ({parsedCount - committedCount} files)
               </ICButton>
+            )}
+
+            {committedCount > 0 && !purgeComplete && (
+              <ICButton
+                size="sm"
+                variant="secondary"
+                onClick={handlePurgeExtractions}
+                loading={purging}
+                disabled={purging}
+              >
+                Purge Stale Extractions ({committedCount} docs)
+              </ICButton>
+            )}
+
+            {purgeComplete && (
+              <span className="text-[11px] text-ic-turquoise font-bold">
+                ✓ Extractions purged — next pipeline run will use corrected text
+              </span>
             )}
           </div>
         )}

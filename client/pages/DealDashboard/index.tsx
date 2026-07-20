@@ -2365,6 +2365,7 @@ export default function DealDashboardPage() {
       <ReparseDocumentsModal
         open={showReparseModal}
         onClose={() => setShowReparseModal(false)}
+        dealId={dealId ?? ""}
         existingDocuments={docs.map((d) => ({ id: d.id, file_name: d.file_name }))}
         onCommitComplete={() => refetchDocs()}
       />
