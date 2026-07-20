@@ -29,6 +29,8 @@ interface ReparseFileState {
   error: string | null;
   /** Whether this file's updated text has been written to DB */
   committed: boolean;
+  /** True if parsed_text was written but re-index failed (half-applied state) */
+  needsReindex: boolean;
 }
 
 interface ReparseDocumentsModalProps {
@@ -93,6 +95,7 @@ export default function ReparseDocumentsModal({
           newText: null,
           error: null,
           committed: false,
+          needsReindex: false,
         };
       });
 
@@ -194,23 +197,35 @@ export default function ReparseDocumentsModal({
 
       try {
         // 1. Update parsed_text in documents table
-        await updateParsedText({
-          documentId: state.matchedDoc.id,
-          parsedText: state.newText,
-        });
+        if (!state.needsReindex) {
+          await updateParsedText({
+            documentId: state.matchedDoc.id,
+            parsedText: state.newText,
+          });
+        }
 
         // 2. Re-index document_chunks so Q&A, checklist-scan, and
         //    absence-verification all search the corrected text
-        await indexDocumentChunks({
-          documentId: state.matchedDoc.id,
-          dealId,
-          fileName: state.file.name,
-          parsedText: state.newText,
-        });
+        try {
+          await indexDocumentChunks({
+            documentId: state.matchedDoc.id,
+            dealId,
+            fileName: state.file.name,
+            parsedText: state.newText,
+          });
+        } catch (reindexErr) {
+          // parsed_text written but chunks stale — flag for retry
+          setFileStates((prev) =>
+            prev.map((s, idx) => (idx === i ? { ...s, needsReindex: true } : s))
+          );
+          const msg = reindexErr instanceof Error ? reindexErr.message : String(reindexErr);
+          toast.error(`"${state.file.name}": parsed_text saved but re-index failed (retry available): ${msg}`);
+          continue;
+        }
 
         successCount++;
         setFileStates((prev) =>
-          prev.map((s, idx) => (idx === i ? { ...s, committed: true } : s))
+          prev.map((s, idx) => (idx === i ? { ...s, committed: true, needsReindex: false } : s))
         );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -273,6 +288,10 @@ export default function ReparseDocumentsModal({
   );
   const committedCount = useMemo(
     () => fileStates.filter((s) => s.committed).length,
+    [fileStates]
+  );
+  const needsRetryCount = useMemo(
+    () => fileStates.filter((s) => s.needsReindex && !s.committed).length,
     [fileStates]
   );
   const isParsing = useMemo(
@@ -372,6 +391,11 @@ export default function ReparseDocumentsModal({
                 {state.committed && (
                   <span className="text-[10px] font-bold text-ic-turquoise">saved</span>
                 )}
+                {state.needsReindex && !state.committed && (
+                  <span className="text-[10px] font-bold text-ic-coral" title="parsed_text written but re-index failed — retry via Commit">
+                    needs retry
+                  </span>
+                )}
                 {state.parseStatus === "error" && (
                   <span title={state.error ?? ""}>
                     <AlertTriangle className="w-3.5 h-3.5 text-ic-coral" />
@@ -434,7 +458,7 @@ export default function ReparseDocumentsModal({
               Parse All ({matchedCount} files)
             </ICButton>
 
-            {parsedCount > 0 && parsedCount > committedCount && (
+            {(parsedCount > committedCount || needsRetryCount > 0) && (
               <ICButton
                 size="sm"
                 variant="primary"
@@ -442,7 +466,9 @@ export default function ReparseDocumentsModal({
                 loading={committing}
                 disabled={committing}
               >
-                Commit to DB ({parsedCount - committedCount} files)
+                {needsRetryCount > 0
+                  ? `Retry Re-index (${needsRetryCount} failed)`
+                  : `Commit to DB (${parsedCount - committedCount} files)`}
               </ICButton>
             )}
 
