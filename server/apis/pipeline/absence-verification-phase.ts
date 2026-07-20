@@ -15,6 +15,7 @@ import { z } from "@superblocksteam/sdk-api";
 import { getModuleModel } from "./model-config.js";
 import type { MergedFinding } from "../modules/build-merged-text.js";
 import type { PipelineContext } from "./pipeline-core.js";
+import { LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY } from "../modules/analyze-chunk.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -120,6 +121,7 @@ Search Queries Run: ${JSON.stringify(queries)}
 
 Retrieved Evidence:
 ${retrievedEvidence}
+${LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY}
 
 Does the retrieved evidence contradict, partially contradict, or fail to contradict the finding's claim of absence?
 

@@ -36,6 +36,8 @@ import DiagnoseRuns from './pipeline/diagnose-runs.js';
 import DiagnoseChunkCoverage from './pipeline/diagnose-chunk-coverage.js';
 import DiagnoseChunkDetail from './pipeline/diagnose-chunk-detail.js';
 import DiagnoseRunEvidence from './pipeline/diagnose-run-evidence.js';
+import DiagnoseFindingTrace from './pipeline/diagnose-finding-trace.js';
+import DiagnoseExtractionRaw from './pipeline/diagnose-extraction-raw.js';
 import RunMigration004 from './pipeline/run-migration.js';
 import RunMigration005 from './pipeline/run-migration-005.js';
 import RunMigration006 from './pipeline/run-migration-006.js';
@@ -105,7 +107,7 @@ const apis = {
   AnalyzeChunk, UniversalExtract, MergeFindings, FormatReport, WebResearch,
   SaveModuleResult, LoadModuleResults, GetRunHistory, GetRunOutput,
   // Server-side pipeline
-  RunModulePipeline, ResumeStalePipelines, DiagnoseParsedText, CleanParsedTextDryRun, CountSheets, DiagnoseChunks, DiagnoseRuns, DiagnoseChunkCoverage, DiagnoseChunkDetail, DiagnoseRunEvidence, ResetDealRun, ResetModuleMerge, RunMigration004, RunMigration005, RunMigration006, RunMigration007,
+  RunModulePipeline, ResumeStalePipelines, DiagnoseParsedText, CleanParsedTextDryRun, CountSheets, DiagnoseChunks, DiagnoseRuns, DiagnoseChunkCoverage, DiagnoseChunkDetail, DiagnoseRunEvidence, DiagnoseFindingTrace, DiagnoseExtractionRaw, ResetDealRun, ResetModuleMerge, RunMigration004, RunMigration005, RunMigration006, RunMigration007,
   // DB setup
   SetupSchema, RunCheckpointMigration, CreatePipelineTable, CheckSchemaHealth, AddConcurrentRunIndex,
   // Deals

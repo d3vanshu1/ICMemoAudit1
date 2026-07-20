@@ -815,7 +815,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
         await ctx.integrations.db.execute(
           `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json, model_used, prompt_version)
            VALUES ($1, $2, $3::jsonb, $4, $5)
-           ON CONFLICT (run_id, chunk_index) DO NOTHING`,
+           ON CONFLICT (run_id, chunk_index) DO UPDATE SET result_json = $3::jsonb, model_used = $4, prompt_version = $5`,
           [runId, row.iteration - 1, JSON.stringify({ label, extraction, chunkIndex: row.iteration - 1 }), getModuleModel(moduleId), getPipelineVersion()],
           { label: `Inject iteration ${row.iteration} as analysis` }
         );
@@ -965,7 +965,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
         await ctx.integrations.db.execute(
           `INSERT INTO pipeline_analysis (run_id, chunk_index, result_json, model_used, prompt_version)
            VALUES ($1, $2, $3::jsonb, $4, $5)
-           ON CONFLICT (run_id, chunk_index) DO NOTHING`,
+           ON CONFLICT (run_id, chunk_index) DO UPDATE SET result_json = $3::jsonb, model_used = $4, prompt_version = $5`,
           [runId, globalIdx, JSON.stringify({ label: chunkLabel, extraction, chunkIndex: globalIdx, truncated }), getModuleModel(moduleId), currentVersion],
           { label: `Save analysis checkpoint ${globalIdx}` }
         );
@@ -1279,11 +1279,12 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           const setBlocks = group.members.map((m, i) => `## Analysis Set ${i + 1}\n\n${truncateMergeNodeText(m.text, MERGE_NODE_TEXT_CAP)}`);
           const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock + coverageMapBlock;
 
-          // Dynamic timeout: use at most 120s per attempt, and at most 2 attempts.
+          // Dynamic timeout: later rounds have much larger payloads and need more time.
+          // Round 0-1: cap at 120s. Round 2+: cap at 180s (final merge can be very large).
           // Merge calls run in parallel within a batch (MERGE_CONCURRENCY=5),
-          // so a batch takes ~120s wall-clock, not N×120s.
-          // The timeRemaining guard ensures we never exceed the platform limit.
-          const perCallTimeout = Math.min(120_000, Math.max(30_000, timeRemaining() - 30_000));
+          // so a batch takes ~maxTimeout wall-clock, not N×maxTimeout.
+          const timeoutCap = currentRound >= 2 ? 180_000 : 120_000;
+          const perCallTimeout = Math.min(timeoutCap, Math.max(30_000, timeRemaining() - 30_000));
           console.log(`[pipeline:merge] R${currentRound}:G${group.idx + 1}/${totalGroupsThisRound} — timeout=${Math.round(perCallTimeout / 1000)}s, budget=${Math.round(timeRemaining() / 1000)}s, inputLen=${setBlocks.join("").length}`);
           const mergeResult = await callAnthropic(
             ctx,
@@ -1315,6 +1316,11 @@ A "## Numeric Verification Report" section appears in the input below. It contai
                   full_analysis: String(f.full_analysis ?? f.detail ?? ""),
                   source_docs: Array.isArray(f.source_docs) ? f.source_docs.map(String) : [],
                   ...(Array.isArray(f.claim_ids) && f.claim_ids.length > 0 ? { claim_ids: f.claim_ids.map(String) } : {}),
+                  ...(f.absence_confidence === "verified_absent" ||
+                    f.absence_confidence === "likely_absent" ||
+                    f.absence_confidence === "unverified"
+                    ? { absence_confidence: f.absence_confidence as string }
+                    : {}),
                 }));
               }
             } catch { /* parse failure — use empty findings */ }

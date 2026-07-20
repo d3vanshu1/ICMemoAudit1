@@ -182,6 +182,7 @@ You will receive BOTH page images AND extracted text. Use both for thorough anal
 2. **Explicit Assumptions**: List every assumption the document explicitly states (e.g., "assuming 15% annual growth", "management will stay post-close").
 3. **Implicit Assumptions**: Infer what MUST be true for the document's claims to hold, even if never stated. Examples: If the CIM projects 20% growth, it implicitly assumes the market can absorb that growth. If the model shows margin expansion, it implicitly assumes no competitive pricing pressure.
 4. **Flag Unaddressed Risks**: Note scenarios that would invalidate key assumptions but are never discussed.
+${LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY}
 ${ABSENCE_VERIFICATION_PROTOCOL}
 ${DENSE_SUFFIX}
 
@@ -329,6 +330,7 @@ You will receive BOTH page images AND extracted text. Use both for thorough anal
 10. ESG/Reputational: Environmental compliance, social factors, governance, reputational risk
 
 Scoring: 5=Comprehensive with data+validation, 4=Good with some gaps, 3=Addressed but lacks depth, 2=Mentioned briefly, 1=Not addressed.
+${LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY}
 ${ABSENCE_VERIFICATION_PROTOCOL}
 ${DENSE_SUFFIX}
 

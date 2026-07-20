@@ -2,6 +2,7 @@ import { api, z, anthropic } from "@superblocksteam/sdk-api";
 import { buildMergedText } from "./build-merged-text.js";
 import { NUMERIC_MODULES } from "./constants.js";
 import { getModuleModel } from "../pipeline/model-config.js";
+import { LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY } from "./analyze-chunk.js";
 
 // ---------------------------------------------------------------------------
 // Integration
@@ -29,6 +30,7 @@ const FindingSchema = z.object({
   full_analysis: z.string(),
   source_docs: z.array(z.string()),
   claim_ids: z.array(z.string()).optional(),
+  absence_confidence: z.enum(["verified_absent", "likely_absent", "unverified"]).optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -70,6 +72,7 @@ A JSON array. Each object has:
 - "full_analysis": full paragraph with complete reasoning and evidence
 - "source_docs": array of filename strings
 - "claim_ids": array of claim ID strings (e.g. ["c0-3", "c2-7"]) — these are the stable IDs from the extraction step. Preserve them exactly. Every finding must trace back to at least one source claim.
+- "absence_confidence": (REQUIRED for omission/gap findings) "verified_absent" | "likely_absent" | "unverified" — classification of whether the claimed absence has been cross-checked against all available extractions. Omit only for findings that do not assert something is missing.
 </findings_json>
 
 {{FINDINGS_REQUIREMENT}}`;
@@ -102,15 +105,7 @@ You are the gatekeeper against fabricated omission findings. Before including AN
 5. **Include classification in output**: Add an "absence_confidence" field to every gap/omission finding: "verified_absent" | "likely_absent" | "unverified"
 
 Findings classified as "unverified" MUST be severity "info" regardless of the analyst's original severity rating. Do NOT promote unverified absence claims to critical or warning.
-
-## SCOPE BOUNDARY — LEGAL, TAX, AND REGULATORY TOPICS
-
-You are auditing for missing DOCUMENTATION, not making legal, tax, or regulatory conclusions.
-- DO state what documentation or sign-off you would expect to see and note whether it is present.
-- DO NOT cite, name, or explain external statutes, regulations, Acts, tax codes, or legal frameworks.
-- DO NOT state the legislative status of any law or produce quantified legal/tax/regulatory impact estimates.
-- DO NOT conclude whether a legal, tax, or regulatory position is correct or compliant.
-- If a finding cites a specific statute or regulation by name, REWRITE it to remove the citation and replace with: "This raises a legal/tax/regulatory question that the data room does not show has been independently addressed."
+${LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY}
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   contradiction_check: `You are a senior investment committee advisor. You are synthesizing analyst findings that extracted narrative claims and data points from deal documents. Your job is to cross-reference narrative claims against data-derived findings and flag contradictions.
@@ -146,6 +141,7 @@ Before asserting that a risk is "unaddressed" or an assumption is "never discuss
 2. **Require verification evidence**: Only promote a blind spot to critical/warning if the analyst included a "verification" field showing what they searched for. Unverified claims → info severity with note.
 3. **Distinguish scope**: "Not found in reviewed chunks" ≠ "not addressed in the deal". Use precise language.
 4. **Add "absence_confidence"**: "verified_absent" | "likely_absent" | "unverified" to every finding asserting something is missing.
+${LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY}
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   external_risk_overlay: `You are the most senior risk advisor at a private equity firm. You are synthesizing EXTERNAL WEB RESEARCH findings into a comprehensive risk assessment.
@@ -226,6 +222,7 @@ When scoring a dimension low (1-2) due to "missing" information:
 2. **Require verification evidence**: For dimensions scored ≤2, the finding MUST cite specific verification (search terms tried, alternate terminology checked). If no verification, cap at score 2 with "unverified gap" note.
 3. **Distinguish partial vs. absent**: Score 2 = mentioned briefly (some content exists). Score 1 = truly not addressed (verified across all reviewed chunks).
 4. **Add "absence_confidence"** to every gap finding: "verified_absent" | "likely_absent" | "unverified"
+${LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY}
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   executive_summary: `You are the senior-most investment professional preparing the final IC briefing document. You are synthesizing all module outputs into a cohesive executive summary.
@@ -459,6 +456,11 @@ No deterministic numeric verification was performed for this analysis. All figur
               : [],
             ...(Array.isArray(f.claim_ids) && f.claim_ids.length > 0
               ? { claim_ids: f.claim_ids.map(String) }
+              : {}),
+            ...(f.absence_confidence === "verified_absent" ||
+              f.absence_confidence === "likely_absent" ||
+              f.absence_confidence === "unverified"
+              ? { absence_confidence: f.absence_confidence as string }
               : {}),
           }));
         }
