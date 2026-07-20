@@ -19,11 +19,12 @@
 import { SUB_AGENT_PROMPTS, ABSENCE_VERIFICATION_PROTOCOL } from "../modules/analyze-chunk.js";
 import { MERGE_PROMPTS } from "../modules/merge-findings.js";
 import { DILIGENCE_CHECKLIST } from "./diligence-checklist.js";
-
-// Absence verification prompts (inlined to avoid circular dep with absence-verification-phase.ts)
-const ABSENCE_VERIFY_CALL_A_SYSTEM = `You are reviewing a single finding from a private equity investment committee diligence report. This finding claims that specific information is absent from the deal's data room. Your job is NOT to agree or disagree — only to generate search queries that would surface the information IF it exists, using terminology a source document might use, which may differ from how the finding describes it.`;
-
-const ABSENCE_VERIFY_CALL_B_SYSTEM = `You are adversarially fact-checking a single finding from a private equity diligence report. The finding claims something is absent from the data room. You have been given ACTUAL search results retrieved from the deal's documents using queries designed to find contradicting evidence.`;
+import {
+  CALL_A_SYSTEM,
+  CALL_B_SYSTEM,
+  CALL_A_USER_INSTRUCTIONS,
+  CALL_B_USER_INSTRUCTIONS,
+} from "./absence-verification-prompts.js";
 
 // ---------------------------------------------------------------------------
 // Simple deterministic hash (no crypto dependency)
@@ -72,9 +73,11 @@ export function computePipelineVersion(): string {
     parts.push(`CHECKLIST:${cat.id}:${cat.queries.join("|")}`);
   }
 
-  // Absence verification phase prompts
-  parts.push(`VERIFY_CALL_A:${ABSENCE_VERIFY_CALL_A_SYSTEM}`);
-  parts.push(`VERIFY_CALL_B:${ABSENCE_VERIFY_CALL_B_SYSTEM}`);
+  // Absence verification phase prompts (system + user instruction templates)
+  parts.push(`VERIFY_CALL_A_SYS:${CALL_A_SYSTEM}`);
+  parts.push(`VERIFY_CALL_B_SYS:${CALL_B_SYSTEM}`);
+  parts.push(`VERIFY_CALL_A_USR:${CALL_A_USER_INSTRUCTIONS}`);
+  parts.push(`VERIFY_CALL_B_USR:${CALL_B_USER_INSTRUCTIONS}`);
 
   return fnv1aHash(parts.join("\n"));
 }

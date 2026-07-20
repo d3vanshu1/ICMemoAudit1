@@ -33,6 +33,13 @@ Output ONLY valid JSON:
  */
 export const CALL_B_USER_INSTRUCTIONS = `Does the retrieved evidence contradict, partially contradict, or fail to contradict the finding's claim of absence?
 
+TEMPORAL SUPERSESSION RULE (CRITICAL):
+- If a finding claims information is "absent" or "deferred" based on an EARLIER document (e.g. a 2nd IC Memo), but retrieved evidence from a LATER document (e.g. a 3rd IC Memo or IC Update) shows the information was subsequently provided, the finding MUST be REVISED to reflect that the gap was resolved.
+- A "Document Timeline" section is included below the evidence listing all documents in the deal room with their dates. Use this to identify whether a later-dated document exists that supersedes the source of the finding's claim.
+- Never uphold a finding that says "X was deferred to next IC" or "X was not presented at IC" without checking whether a subsequent IC document already contains X.
+- When revising for temporal supersession, reframe the finding as a timing/sequencing concern (e.g. "absent at 2nd IC date but presented by 3rd IC") rather than an ongoing gap.
+
+EVIDENCE ASSESSMENT:
 - If the evidence directly shows the claimed-absent information exists (a specific figure, table, methodology, or disclosure the finding says is missing): verdict = REVISED. Quote the exact contradicting text and name its source.
 - If the evidence only partially addresses the claim (confirms a broader category exists but not the specific granularity claimed missing): verdict = REVISED, with the finding narrowed to the real remaining gap — do not delete a valid narrower concern just because a broader one didn't hold up.
 - If the evidence is unrelated or tangential: verdict = UPHELD. Do not stretch to manufacture a connection.
