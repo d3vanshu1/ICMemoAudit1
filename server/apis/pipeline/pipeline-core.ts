@@ -569,6 +569,24 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     }
   }
 
+  // --- Step 0.3.5: Load filename→tag map for deterministic independent flag ---
+  // Used in two places:
+  //   1. Injected into the merge prompt so the model has authoritative tag info
+  //   2. Post-merge pass overrides `independent` based on actual tags
+  // Loaded early so the fast-path (checkpoint resume → format) also has access.
+  const DocTagRow = z.object({ file_name: z.string(), document_tag: z.string() });
+  const docTagRows = await ctx.integrations.db.query(
+    `SELECT file_name, document_tag FROM documents WHERE deal_id = $1`,
+    DocTagRow,
+    [dealId],
+    { label: "Load filename→tag map for independent flag" }
+  );
+  /** Maps lowercase filename → document_tag (e.g. "ic_memo", "cim", "financial_model") */
+  const fileTagMap = new Map<string, string>();
+  for (const row of docTagRows) {
+    fileTagMap.set(row.file_name.toLowerCase(), row.document_tag);
+  }
+
   // --- Fast-Path: Skip to formatting when merge tree is already complete ---
   // When a prior invocation completed all analysis + merge but timed out during
   // formatting (or formatting returned null), re-running the full pipeline wastes
@@ -637,6 +655,16 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
             const suppressedCount = preSuppressCount - finalFindings.length;
             if (suppressedCount > 0) {
               console.log(`[pipeline:fast-path] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
+            }
+
+            // Deterministic independent override (same logic as Step 5.7)
+            for (const f of finalFindings) {
+              if (f.evidence_docs && f.evidence_docs.length > 0) {
+                f.independent = f.evidence_docs.some((docName) => {
+                  const tag = fileTagMap.get(docName.toLowerCase());
+                  return tag !== "ic_memo";
+                });
+              }
             }
 
             // Format report with full time budget
@@ -783,13 +811,18 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     };
   }
 
-  // Check that the evidence pool (deal docs minus subject IDs) is non-empty.
-  // We query the DB for a quick count to avoid passing the full doc list as input.
+  // Check that the evidence pool (deal docs minus subject IDs) has at least one document
+  // with indexed chunks. A document that exists but produced zero chunks (parse failure,
+  // unsupported type) means FTS has nothing to search — treat as empty evidence pool.
   const evidenceCountRows = await ctx.integrations.db.query(
-    `SELECT COUNT(*)::int AS cnt FROM documents WHERE deal_id = $1 AND id != ALL($2::uuid[])`,
+    `SELECT COUNT(DISTINCT d.id)::int AS cnt
+     FROM documents d
+     WHERE d.deal_id = $1
+       AND d.id != ALL($2::uuid[])
+       AND EXISTS (SELECT 1 FROM document_chunks dc WHERE dc.document_id = d.id)`,
     z.object({ cnt: z.number() }),
     [dealId, subjectIds],
-    { label: "Check evidence pool non-empty" }
+    { label: "Check evidence pool has chunked documents" }
   );
   const evidenceCount = evidenceCountRows[0]?.cnt ?? 0;
   if (evidenceCount === 0) {
@@ -1448,6 +1481,17 @@ A "## Numeric Verification Report" section appears in the input below. It contai
     baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_TASK_STEP_1}}", "");
   }
 
+  // Inject authoritative filename→tag reference so the model uses real tags
+  // rather than guessing from filenames when classifying gap_type and evidence_docs.
+  // This is appended to the system prompt for all merge rounds.
+  const tagMapLines = Array.from(fileTagMap.entries())
+    .map(([fn, tag]) => `  "${fn}" → ${tag}`)
+    .join("\n");
+  const tagMapBlock = tagMapLines.length > 0
+    ? `\n\n## Document Tag Reference (authoritative — do NOT infer tags from filenames)\n\n${tagMapLines}\n\nUse these tags to classify evidence_docs accurately. A document is an IC memo ONLY if its tag is "ic_memo".`
+    : "";
+  baseMergePrompt += tagMapBlock;
+
   while (nodes.length > 1) {
     currentRound++;
 
@@ -1564,6 +1608,15 @@ A "## Numeric Verification Report" section appears in the input below. It contai
                     f.absence_confidence === "likely_absent" ||
                     f.absence_confidence === "unverified"
                     ? { absence_confidence: f.absence_confidence as string }
+                    : {}),
+                  ...(f.gap_type === "diligence_gap" || f.gap_type === "memo_omission"
+                    ? { gap_type: f.gap_type as "diligence_gap" | "memo_omission" }
+                    : {}),
+                  ...(Array.isArray(f.evidence_docs) && f.evidence_docs.length > 0
+                    ? { evidence_docs: f.evidence_docs.map(String) }
+                    : {}),
+                  ...(typeof f.independent === "boolean"
+                    ? { independent: f.independent }
                     : {}),
                 }));
               }
@@ -1739,6 +1792,31 @@ A "## Numeric Verification Report" section appears in the input below. It contai
         firstError,
       };
     }
+  }
+
+  // --- Step 5.7: Deterministic `independent` flag override ---
+  // The model may emit `independent` based on filename heuristics. This code pass
+  // overrides it authoritatively using the actual document_tag for each evidence_doc.
+  // Rule: independent = evidence_docs.some(filename => tagOf(filename) !== 'ic_memo')
+  //        i.e. false only when ALL evidence_docs have tag ic_memo.
+  // Only applies to findings with non-empty evidence_docs (gap_type = "memo_omission").
+  // Lookup source: `fileTagMap` loaded from DB at Step 0.3.5 (filename→document_tag).
+  let independentOverrides = 0;
+  for (const f of finalFindings) {
+    if (f.evidence_docs && f.evidence_docs.length > 0) {
+      const hasNonIcMemo = f.evidence_docs.some((docName) => {
+        const tag = fileTagMap.get(docName.toLowerCase());
+        // If tag is unknown (e.g. filename mismatch), treat as independent to avoid
+        // incorrectly marking corroboration as non-independent.
+        return tag !== "ic_memo";
+      });
+      const oldValue = f.independent;
+      f.independent = hasNonIcMemo;
+      if (oldValue !== hasNonIcMemo) independentOverrides++;
+    }
+  }
+  if (independentOverrides > 0) {
+    console.log(`[pipeline] Deterministic independent override: corrected ${independentOverrides} finding(s)`);
   }
 
   // --- Step 6: Inline Report Formatting ---
