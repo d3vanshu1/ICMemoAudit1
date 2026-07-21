@@ -574,17 +574,20 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   //   1. Injected into the merge prompt so the model has authoritative tag info
   //   2. Post-merge pass overrides `independent` based on actual tags
   // Loaded early so the fast-path (checkpoint resume → format) also has access.
-  const DocTagRow = z.object({ file_name: z.string(), document_tag: z.string() });
+  const DocTagRow = z.object({ id: z.string(), file_name: z.string(), document_tag: z.string() });
   const docTagRows = await ctx.integrations.db.query(
-    `SELECT file_name, document_tag FROM documents WHERE deal_id = $1`,
+    `SELECT id, file_name, document_tag FROM documents WHERE deal_id = $1`,
     DocTagRow,
     [dealId],
     { label: "Load filename→tag map for independent flag" }
   );
   /** Maps lowercase filename → document_tag (e.g. "ic_memo", "cim", "financial_model") */
   const fileTagMap = new Map<string, string>();
+  /** Maps document ID → filename (for subject identity resolution) */
+  const idToFileName = new Map<string, string>();
   for (const row of docTagRows) {
     fileTagMap.set(row.file_name.toLowerCase(), row.document_tag);
+    idToFileName.set(row.id, row.file_name);
   }
 
   // --- Fast-Path: Skip to formatting when merge tree is already complete ---
@@ -1491,6 +1494,28 @@ A "## Numeric Verification Report" section appears in the input below. It contai
     ? `\n\n## Document Tag Reference (authoritative — do NOT infer tags from filenames)\n\n${tagMapLines}\n\nUse these tags to classify evidence_docs accurately. A document is an IC memo ONLY if its tag is "ic_memo".`
     : "";
   baseMergePrompt += tagMapBlock;
+
+  // --- Inject subject identity block: chronologically ordered IC memo record ---
+  const DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})\s/;
+  const subjectDocumentIds: string[] = input.subjectDocumentIds ?? [];
+  const subjectFiles = subjectDocumentIds
+    .map((id) => ({ id, fileName: idToFileName.get(id) ?? id }))
+    .map(({ id, fileName }) => {
+      const match = fileName.match(DATE_PREFIX_RE);
+      return { id, fileName, date: match ? match[1] : null };
+    })
+    .sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""));
+
+  const subjectIdentityBlock = subjectFiles.length > 0
+    ? `\n\n## Subject Under Review — The IC Memo Record
+
+The following document(s) collectively constitute the IC memo record under review, listed chronologically (earliest to latest):
+
+${subjectFiles.map((f, i) => `  ${i + 1}. "${f.fileName}"${f.date ? ` (date: ${f.date})` : ""}`).join("\n")}
+
+The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earlier memos establish what was previously disclosed, asserted, or committed to.`
+    : "";
+  baseMergePrompt += subjectIdentityBlock;
 
   while (nodes.length > 1) {
     currentRound++;

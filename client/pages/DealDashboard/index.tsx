@@ -101,7 +101,7 @@ export default function DealDashboardPage() {
   useEffect(() => {
     if (docsData?.documents && !docsInitialized.current) {
       docsInitialized.current = true;
-      setDocs(docsData.documents.map((d: Record<string, unknown>) => ({
+      const mappedDocs = docsData.documents.map((d: Record<string, unknown>) => ({
         id: d.id as string,
         deal_id: d.deal_id as string,
         file_name: d.file_name as string,
@@ -109,7 +109,15 @@ export default function DealDashboardPage() {
         document_tag: (d.document_tag ?? "other") as DocumentTag,
         document_source: (d.document_source ?? "sellside") as DocumentSource,
         uploaded_at: d.uploaded_at as string,
-      })));
+      }));
+      setDocs(mappedDocs);
+      // Auto-preselect all IC memo docs on initial load (user can untick)
+      const icMemoIds = mappedDocs
+        .filter((d) => d.document_tag === "ic_memo")
+        .map((d) => d.id);
+      if (icMemoIds.length > 0 && selectedSubjectIds.length === 0) {
+        setSelectedSubjectIds(icMemoIds);
+      }
     }
   }, [docsData]);
 

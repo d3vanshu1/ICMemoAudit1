@@ -132,6 +132,7 @@ const apis = {
   ExtractReportSnippets, FramingPatternAudit,
 } as const;
 
+
 export default apis;
 
 /** Type for useApi inference - exported for client type-only imports */

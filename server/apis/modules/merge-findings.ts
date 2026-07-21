@@ -92,10 +92,17 @@ export const MERGE_PROMPTS: Record<string, string> = {
 
 ## Document Role Context (derived at prompt time, not stored)
 
-The evidence pool contains ALL deal documents EXCEPT the subject memo itself (excluded by ID). This includes:
+The evidence pool contains ALL deal documents EXCEPT the subject document(s) (excluded by ID). This includes:
 - **Objective sources** (document_tag ∈ financial_model, customer_data, consultant_report, legal, other with document_source = 'pep'): Treat as factual ground truth.
 - **Narrative sources** (document_tag ∈ cim, im, OR document_source = 'sellside'): These are ADVOCACY documents. They may contain spin, selective emphasis, or omissions of their own. Scrutinize narrative-source claims against objective-source data rather than treating them as authoritative. A claim made ONLY in a narrative source without objective backing is NOT confirmed evidence.
-- **Prior IC memos** (document_tag = 'ic_memo', but NOT the subject): These are the team's own earlier work product. They are valid evidence for detecting memo_omission (e.g. "the 2nd memo discussed churn, the 3rd memo does not"), but they are NOT independent corroboration. When a finding's evidence comes solely from prior IC memos, you MUST set "independent": false. When at least one non-ic_memo source also supports the finding, set "independent": true.
+
+The "independent" field on findings is determined by code post-merge — you do NOT need to set it. Focus on classifying gap_type and listing evidence_docs accurately.
+
+## Multi-Version Memo Handling (union-subject model)
+
+When the subject comprises multiple IC memo versions (chronological record):
+- **(a) Supersession rule**: When memo versions state different values for the same metric or claim, the LATEST memo governs. Do NOT flag superseded figures as contradictions of the current thesis. You MAY note a revision if the magnitude is material (e.g., "revenue projection revised from $50M to $38M between Memo 2 and Memo 3") at severity "info".
+- **(b) Thesis drift**: A risk, topic, or commitment discussed in an EARLIER memo that is ABSENT from the LATEST memo is a reportable finding. Classify this as a distinct finding type — it represents thesis drift (the team quietly dropped or de-emphasized something), which is different from memo_omission (information in evidence but never mentioned in any memo version).
 
 ## Your Task
 
@@ -139,6 +146,12 @@ ${MERGE_OUTPUT_STRUCTURE}`,
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   blind_spot_scanner: `You are a senior investment committee advisor and contrarian thinker. You are synthesizing analyst findings that extracted the investment thesis, explicit assumptions, and implicit assumptions from deal documents. Your job is to identify blind spots.
+
+## Multi-Version Memo Handling (union-subject model)
+
+When the subject comprises multiple IC memo versions (chronological record):
+- **(a) Supersession rule**: When memo versions state different values for the same metric or claim, the LATEST memo governs. Do NOT flag superseded figures as contradictions of the current thesis. You MAY note a revision if the magnitude is material at severity "info".
+- **(b) Thesis drift**: A risk, topic, or commitment discussed in an EARLIER memo that is ABSENT from the LATEST memo is a reportable finding. Classify this as thesis drift — the team quietly dropped or de-emphasized something. This is distinct from a standard blind spot (assumption never addressed anywhere).
 
 ## Your Task
 
@@ -220,6 +233,12 @@ ${MERGE_OUTPUT_STRUCTURE}`,
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   diligence_completeness: `You are a senior PE operating partner conducting a final diligence completeness review. You are synthesizing analyst findings that evaluated documents against the 10 standard PE diligence dimensions.
+
+## Multi-Version Memo Handling (union-subject model)
+
+When the subject comprises multiple IC memo versions (chronological record):
+- **(a) Supersession rule**: When memo versions state different values for the same metric or claim, the LATEST memo governs. Do NOT flag superseded figures as contradictions of the current thesis. You MAY note a revision if the magnitude is material at severity "info".
+- **(b) Thesis drift**: A risk, topic, or commitment discussed in an EARLIER memo that is ABSENT from the LATEST memo is a reportable finding. Classify this as thesis drift — the team quietly dropped or de-emphasized something. This is distinct from a missing diligence dimension.
 
 ## Your Task
 

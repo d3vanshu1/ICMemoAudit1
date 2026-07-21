@@ -44,12 +44,21 @@ export default function SubjectSelector({
       <div className="flex items-center gap-2 mb-2">
         <FileText className="w-3.5 h-3.5 text-ic-turquoise" />
         <span className="text-[10px] font-bold uppercase tracking-wider text-ic-muted">
-          Memo(s) under review
+          IC memo record under review
         </span>
         {selectedIds.length === 0 && (
           <span className="text-[10px] text-ic-coral font-light ml-1">
             — select at least one before running
           </span>
+        )}
+        {icMemos.length > 0 && selectedIds.length < icMemos.length && (
+          <button
+            type="button"
+            onClick={() => onSelectionChange(icMemos.map((m) => m.id))}
+            className="text-[10px] text-ic-turquoise hover:text-ic-turquoise/80 font-light ml-auto cursor-pointer transition-colors"
+          >
+            Select all IC memos
+          </button>
         )}
       </div>
       <div className="flex flex-wrap gap-2">
