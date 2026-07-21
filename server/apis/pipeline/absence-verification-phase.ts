@@ -47,6 +47,8 @@ export interface VerificationLogEntry {
 export interface AbsenceVerificationResult {
   findings: MergedFinding[];
   verificationLog: VerificationLogEntry[];
+  /** false if the phase broke early due to budget — caller should return in_progress */
+  completed: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +259,9 @@ export async function runAbsenceVerificationPhase(
   findings: MergedFinding[],
   moduleId: string,
   useOpus: boolean | null | undefined,
-  subjectDocumentIds: string[] = []
+  subjectDocumentIds: string[] = [],
+  /** Returns milliseconds of budget remaining. Phase breaks when < 45s. */
+  budgetRemainingMs: () => number = () => Infinity
 ): Promise<AbsenceVerificationResult> {
   const model = getModuleModel(moduleId, useOpus);
   const verificationLog: VerificationLogEntry[] = [];
@@ -334,6 +338,12 @@ export async function runAbsenceVerificationPhase(
   }
 
   // Process each finding sequentially (checkpoint after each)
+  // Budget-aware: break early if insufficient time for another finding (2 LLM calls).
+  // Worst case per finding: PER_CALL_TIMEOUT_MS × retries × 2 calls = 60s × 3 × 2 = 360s
+  // Practical per finding: ~15-30s. 45s threshold gives safe margin for 1 more finding.
+  const BUDGET_FLOOR_MS = 45_000;
+  let budgetExhausted = false;
+
   for (const { index, finding, absenceConfidence } of findingsToVerify) {
     // Skip if already checkpointed
     if (completedIndices.has(index)) {
@@ -346,6 +356,16 @@ export async function runAbsenceVerificationPhase(
         model,
       });
       continue;
+    }
+
+    // Budget check: break if insufficient time for another finding
+    const remaining = budgetRemainingMs();
+    if (remaining < BUDGET_FLOOR_MS) {
+      const verified = verificationLog.length;
+      const total = findingsToVerify.length;
+      console.log(`[absence-verify] Budget exhausted (${Math.round(remaining / 1000)}s < ${BUDGET_FLOOR_MS / 1000}s) — ${verified}/${total} verified, deferring remainder to next invocation`);
+      budgetExhausted = true;
+      break;
     }
 
     try {
@@ -514,5 +534,6 @@ export async function runAbsenceVerificationPhase(
   return {
     findings: updatedFindings,
     verificationLog,
+    completed: !budgetExhausted,
   };
 }

@@ -1763,12 +1763,33 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           finalFindings,
           moduleId,
           useOpus,
-          input.subjectDocumentIds ?? []
+          input.subjectDocumentIds ?? [],
+          timeRemaining
         );
         finalFindings = verifyResult.findings;
         const revised = verifyResult.verificationLog.filter(v => v.verdict.verdict === "REVISED").length;
         const upheld = verifyResult.verificationLog.filter(v => v.verdict.verdict === "UPHELD").length;
-        console.log(`[pipeline] Absence verification complete: ${revised} revised, ${upheld} upheld`);
+        console.log(`[pipeline] Absence verification: ${revised} revised, ${upheld} upheld, completed=${verifyResult.completed}`);
+
+        // If the phase broke early due to budget, return in_progress so next invocation resumes
+        if (!verifyResult.completed) {
+          return {
+            status: "in_progress",
+            runId: runId!,
+            phase: "absence_verification",
+            progress: {
+              analysisTotal: routed.length,
+              analysisCompleted: routed.length,
+              mergeRound: totalMergeRounds,
+              mergeTotal: totalMergeRounds,
+            },
+            result: null,
+            failedChunks,
+            truncatedChunks,
+            truncatedMerges,
+            firstError,
+          };
+        }
       } catch (verifyErr) {
         const msg = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
         console.error(`[pipeline] Absence verification phase failed (non-fatal, findings unchanged): ${msg}`);
