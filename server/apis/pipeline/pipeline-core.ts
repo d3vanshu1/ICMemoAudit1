@@ -67,6 +67,7 @@ import { getModuleModel, SONNET_MODEL } from "./model-config.js";
 import { runChecklistScan, formatCoverageMapForPrompt, type ChecklistScanResult } from "./checklist-scan-phase.js";
 import { runAbsenceVerificationPhase } from "./absence-verification-phase.js";
 import { getPipelineVersion } from "./pipeline-version.js";
+import { parseDateFromFileName } from "./parse-date-from-filename.js";
 import type { NumericVerifyResult } from "./numeric-verify-inline.js";
 
 // ---------------------------------------------------------------------------
@@ -1496,22 +1497,28 @@ A "## Numeric Verification Report" section appears in the input below. It contai
   baseMergePrompt += tagMapBlock;
 
   // --- Inject subject identity block: chronologically ordered IC memo record ---
-  const DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})\s/;
   const subjectDocumentIds: string[] = input.subjectDocumentIds ?? [];
   const subjectFiles = subjectDocumentIds
     .map((id) => ({ id, fileName: idToFileName.get(id) ?? id }))
     .map(({ id, fileName }) => {
-      const match = fileName.match(DATE_PREFIX_RE);
-      return { id, fileName, date: match ? match[1] : null };
-    })
-    .sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""));
+      const date = parseDateFromFileName(fileName);
+      return { id, fileName, date };
+    });
+
+  // Sort: undated first (treated as earliest), then by date ascending. LATEST = max dated.
+  subjectFiles.sort((a, b) => {
+    if (!a.date && !b.date) return 0;
+    if (!a.date) return -1;
+    if (!b.date) return 1;
+    return a.date.localeCompare(b.date);
+  });
 
   const subjectIdentityBlock = subjectFiles.length > 0
     ? `\n\n## Subject Under Review — The IC Memo Record
 
 The following document(s) collectively constitute the IC memo record under review, listed chronologically (earliest to latest):
 
-${subjectFiles.map((f, i) => `  ${i + 1}. "${f.fileName}"${f.date ? ` (date: ${f.date})` : ""}`).join("\n")}
+${subjectFiles.map((f, i) => `  ${i + 1}. "${f.fileName}"${f.date ? ` (date: ${f.date})` : " (undated \u2014 treated as earliest)"}`).join("\n")}
 
 The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earlier memos establish what was previously disclosed, asserted, or committed to.`
     : "";

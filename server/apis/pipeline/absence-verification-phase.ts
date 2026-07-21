@@ -16,6 +16,7 @@ import { getModuleModel } from "./model-config.js";
 import type { MergedFinding } from "../modules/build-merged-text.js";
 import type { PipelineContext } from "./pipeline-core.js";
 import { LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY } from "../modules/analyze-chunk.js";
+import { parseDateFromFileName } from "./parse-date-from-filename.js";
 import {
   CALL_A_SYSTEM,
   CALL_B_SYSTEM,
@@ -308,14 +309,13 @@ export async function runAbsenceVerificationPhase(
       { label: "Fetch document timeline for recency check" }
     );
     if (docs.length > 0) {
-      const DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})\s/;
       const dated: { date: string; fileName: string }[] = [];
       const undated: string[] = [];
 
       for (const d of docs) {
-        const match = d.file_name.match(DATE_PREFIX_RE);
-        if (match) {
-          dated.push({ date: match[1], fileName: d.file_name });
+        const date = parseDateFromFileName(d.file_name);
+        if (date) {
+          dated.push({ date, fileName: d.file_name });
         } else {
           undated.push(d.file_name);
         }
