@@ -68,6 +68,7 @@ import GetDocTables from './documents/get-doc-tables.js';
 import BackfillDocTablesFromText from './documents/backfill-doc-tables-from-text.js';
 import GetDocTablesSummary from './documents/get-doc-tables-summary.js';
 import UpdateParsedText from './documents/update-parsed-text.js';
+import ClearParsedText from './documents/clear-parsed-text.js';
 
 // Numeric verification
 import NumericVerify from './numeric/numeric-verify.js';
@@ -98,6 +99,8 @@ import ReconcileFindings from './checkpoints/reconcile-findings.js';
 import GetExtractionStatus from './checkpoints/get-extraction-status.js';
 import PurgeExtractions from './checkpoints/purge-extractions.js';
 import PurgeDocumentExtractions from './checkpoints/purge-document-extractions.js';
+import PurgeDealHistory from './checkpoints/purge-deal-history.js';
+import ResumeCompletedRun from './checkpoints/resume-completed-run.js';
 import DiagFailedExtractions from './checkpoints/diag-failed-extractions.js';
 
 // Audit
@@ -116,7 +119,7 @@ const apis = {
   ListDeals, GetDeal, CreateDeal, UpdateDeal, DeleteDeal,
   // Documents
   ListDocuments, SaveDocument, UpdateDocument, DeleteDocument, GetDocumentTexts,
-  SaveDocTables, GetDocTables, BackfillDocTablesFromText, GetDocTablesSummary, UpdateParsedText,
+  SaveDocTables, GetDocTables, BackfillDocTablesFromText, GetDocTablesSummary, UpdateParsedText, ClearParsedText,
   // Numeric verification
   NumericVerify, GetNumericReport, SearchNumericFindings, DiagSharedFormulas, DiagFormulaExtraction,
   // Q&A
@@ -124,7 +127,7 @@ const apis = {
   // Checkpoints
   SaveExtractions, LoadExtractions, SaveMergeCheckpoint, LoadMergeCheckpoints,
   UpdateRunStatus, GetRunProgress, SaveRunCoverage, LoadRunCoverage,
-  CancelModuleRun, CheckRunCancelled, PurgeStaleRuns, ResurrectModuleRun, ReconcileFindings, GetExtractionStatus, PurgeExtractions, PurgeDocumentExtractions, DiagFailedExtractions,
+  CancelModuleRun, CheckRunCancelled, PurgeStaleRuns, ResurrectModuleRun, ReconcileFindings, GetExtractionStatus, PurgeExtractions, PurgeDocumentExtractions, PurgeDealHistory, DiagFailedExtractions, ResumeCompletedRun,
   // Audit
   ExtractReportSnippets, FramingPatternAudit,
 } as const;

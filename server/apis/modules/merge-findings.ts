@@ -73,6 +73,8 @@ A JSON array. Each object has:
 - "source_docs": array of filename strings
 - "claim_ids": array of claim ID strings (e.g. ["c0-3", "c2-7"]) — these are the stable IDs from the extraction step. Preserve them exactly. Every finding must trace back to at least one source claim.
 - "absence_confidence": (REQUIRED for omission/gap findings) "verified_absent" | "likely_absent" | "unverified" — classification of whether the claimed absence has been cross-checked against all available extractions. Omit only for findings that do not assert something is missing.
+- "gap_type": (REQUIRED for omission/gap findings) "diligence_gap" | "memo_omission". Use "memo_omission" when the information IS present in evidence/reference documents but absent from the subject memo. Use "diligence_gap" when the information is absent from BOTH the subject memo AND all evidence documents. Omit for non-omission findings.
+- "evidence_docs": (REQUIRED when gap_type = "memo_omission") array of filenames of the evidence documents where the information WAS found. Omit when gap_type = "diligence_gap".
 </findings_json>
 
 {{FINDINGS_REQUIREMENT}}`;
@@ -84,12 +86,23 @@ export const FINDINGS_RULE_INTERMEDIATE = `Produce findings that represent the c
 export const MERGE_PROMPTS: Record<string, string> = {
   omission_audit: `You are a senior investment committee advisor conducting a deal data room omission audit. You are synthesizing analyst findings into a comprehensive assessment of what information is missing from the deal materials.
 
+## Document Role Context (derived at prompt time, not stored)
+
+The evidence pool you are reviewing contains ONLY reference documents (not the subject memo itself — that is excluded by ID). Documents are classified by their existing metadata:
+- **Objective sources** (document_tag ∈ financial_model, customer_data, consultant_report, legal, other with document_source = 'pep'): Treat as factual ground truth.
+- **Narrative sources** (document_tag ∈ cim, im, OR document_source = 'sellside'): These are ADVOCACY documents. They may contain spin, selective emphasis, or omissions of their own. Scrutinize narrative-source claims against objective-source data rather than treating them as authoritative. A claim made ONLY in a narrative source without objective backing is NOT confirmed evidence.
+
+All ic_memo-tagged documents have been excluded from the evidence pool entirely (they are either the subject or a prior version).
+
 ## Your Task
 
 1. **Consolidate Findings**: Combine all analyst observations into a unified set of findings. Where multiple analysts flagged the same gap, combine into one finding with the higher severity and all source docs.
-2. **Checklist Comparison**: Ensure coverage against: customer concentration, churn/retention, key man risk, revenue recognition, regulatory, competitive response, management incentives, exit assumptions, QoE items, capex requirements.
-3. **Identify Additional Gaps**: Based on the full body of evidence, flag any omissions the analysts may have missed.
-4. **Prioritize**: Rank all findings by potential impact on investment decision.
+2. **Classify Each Gap**: For every omission finding, determine:
+   - **memo_omission** — the information IS present in evidence documents but absent from the subject memo (the memo failed to mention it). MUST include "evidence_docs" listing which files contain the evidence.
+   - **diligence_gap** — the information is absent from BOTH the subject memo AND all evidence documents (a true gap in the data room).
+3. **Checklist Comparison**: Ensure coverage against: customer concentration, churn/retention, key man risk, revenue recognition, regulatory, competitive response, management incentives, exit assumptions, QoE items, capex requirements.
+4. **Identify Additional Gaps**: Based on the full body of evidence, flag any omissions the analysts may have missed.
+5. **Prioritize**: Rank all findings by potential impact on investment decision.
 
 ## CRITICAL: Adversarial Re-Verification of Absence Claims
 

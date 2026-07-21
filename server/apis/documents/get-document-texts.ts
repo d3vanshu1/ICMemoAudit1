@@ -35,7 +35,7 @@ const DocTextOutputSchema = z.object({
 
 export default api({
   name: "GetDocumentTexts",
-  description: "Fetches parsed text content for all documents in a deal, handling large texts via chunked reads",
+  description: "Fetches parsed text for deal documents, with subject/ic_memo exclusion for evidence retrieval",
 
   integrations: {
     db: postgres(IC_DILIGENCE_DB),
@@ -43,6 +43,10 @@ export default api({
 
   input: z.object({
     dealId: z.string(),
+    /** Exclude specific document IDs (e.g. the subject memo(s) chosen at run time). */
+    excludeDocumentIds: z.array(z.string()).optional(),
+    /** Exclude all documents tagged ic_memo from results (belt-and-suspenders for evidence pool). */
+    excludeIcMemos: z.boolean().optional(),
   }),
 
   output: z.object({
@@ -50,19 +54,33 @@ export default api({
     warnings: z.array(z.string()),
   }),
 
-  async run(ctx, { dealId }) {
+  async run(ctx, { dealId, excludeDocumentIds, excludeIcMemos }) {
     const warnings: string[] = [];
+
+    // Build dynamic WHERE filters
+    let exclusionFilter = "";
+    const params: unknown[] = [dealId];
+    let paramIdx = 2; // $1 = dealId
+
+    if (excludeDocumentIds && excludeDocumentIds.length > 0) {
+      exclusionFilter += ` AND id != ALL($${paramIdx}::uuid[])`;
+      params.push(excludeDocumentIds);
+      paramIdx++;
+    }
+    if (excludeIcMemos) {
+      exclusionFilter += ` AND document_tag != 'ic_memo'`;
+    }
 
     // Step 1: Load metadata only (no parsed_text) — always succeeds regardless of text size
     const metas = await ctx.integrations.db.query(
       `SELECT id, file_name, file_type, document_tag, document_source,
               COALESCE(length(parsed_text), 0) AS text_length
        FROM documents
-       WHERE deal_id = $1 AND parsed_text IS NOT NULL AND parsed_text != ''
+       WHERE deal_id = $1 AND parsed_text IS NOT NULL AND parsed_text != ''${exclusionFilter}
        ORDER BY uploaded_at DESC
        LIMIT 200`,
       DocMetaSchema,
-      [dealId],
+      params,
       { label: "Load document metadata (no text)" }
     );
 
@@ -119,7 +137,7 @@ export default api({
               { label: `Load slice ${i + 1}/${totalSlices}: ${meta.file_name}` }
             );
             const slice = rows[0]?.text_slice ?? "";
-            if (slice.length === 0) break; // No more data
+            if (slice.length === 0) break;
             slices.push(slice);
             offset += SLICE_SIZE;
           }

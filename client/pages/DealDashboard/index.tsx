@@ -20,6 +20,7 @@ import StatsRow from "@/components/ic/stats/StatsRow";
 import AlertBanner from "@/components/ic/alerts/AlertBanner";
 import ModuleGrid from "@/components/ic/modules/ModuleGrid";
 import RunAllModal from "@/components/ic/modules/RunAllModal";
+import SubjectSelector from "@/components/ic/analysis/SubjectSelector";
 import RerunSuggestionModal from "@/components/ic/modules/RerunSuggestionModal";
 import RunHistory from "@/components/ic/modules/RunHistory";
 import QAPanel from "@/components/ic/qa/QAPanel";
@@ -92,6 +93,8 @@ export default function DealDashboardPage() {
   const [rerunModal, setRerunModal] = useState<{ fileNames: string[]; suggestedIds: string[] } | null>(null);
   const [useOpus, setUseOpus] = useState(false);
   const [showReparseModal, setShowReparseModal] = useState(false);
+  // Subject memo selection — IDs of ic_memo docs chosen as "memo(s) under review"
+  const [selectedSubjectIds, setSelectedSubjectIds] = useState<string[]>([]);
 
   // Sync DB docs into local state — only on initial load
   const docsInitialized = useRef(false);
@@ -1413,6 +1416,7 @@ export default function DealDashboardPage() {
               moduleId,
               runId: runIdArg ?? undefined,
               useOpus: useOpus || undefined,
+              subjectDocumentIds: selectedSubjectIds.length > 0 ? selectedSubjectIds : undefined,
               numericReport,
               numericPartial: numericPartial || undefined,
             });
@@ -1556,7 +1560,7 @@ export default function DealDashboardPage() {
 
       toast.success(`${displayName} complete!`);
     },
-    [dealId, useOpus, numericVerifyApi, runModulePipelineApi, generateReport, saveModuleResult, setModuleProgress]
+    [dealId, useOpus, selectedSubjectIds, numericVerifyApi, runModulePipelineApi, generateReport, saveModuleResult, setModuleProgress]
   );
 
   // ---------------------------------------------------------------------------
@@ -2306,6 +2310,12 @@ export default function DealDashboardPage() {
             totalModules={stats.totalModules}
             totalFindings={stats.totalFindings}
             criticalFindings={stats.criticalFindings}
+          />
+
+          <SubjectSelector
+            documents={docs}
+            selectedIds={selectedSubjectIds}
+            onSelectionChange={setSelectedSubjectIds}
           />
 
           {stats.criticalFindings > 0 && (

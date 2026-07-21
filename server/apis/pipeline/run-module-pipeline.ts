@@ -32,6 +32,8 @@ export default api({
     moduleId: z.string(),
     runId: z.string().nullable().optional(),
     useOpus: z.boolean().nullable().optional(),
+    /** IDs of the memo(s) under review. Required for modules that need subject exclusion. */
+    subjectDocumentIds: z.array(z.string()).optional(),
     // Numeric report (pre-computed by client before kicking off pipeline)
     numericReport: z.object({
       figures: z.array(z.any()),
@@ -80,6 +82,7 @@ export default api({
       moduleId: input.moduleId,
       runId: input.runId,
       useOpus: input.useOpus,
+      subjectDocumentIds: input.subjectDocumentIds,
       numericReport: input.numericReport,
       numericPartial: input.numericPartial,
     });

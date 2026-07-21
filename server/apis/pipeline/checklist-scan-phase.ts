@@ -84,10 +84,16 @@ interface ScanContext {
 /**
  * Runs the full checklist scan for a deal. Executes all category queries
  * against document_chunks and returns the structured coverage map.
+ *
+ * IMPORTANT: Evidence pool excludes:
+ *  1. The subject memo(s) selected at run time (by document ID).
+ *  2. All ic_memo-tagged documents (belt-and-suspenders — no memo in its own evidence).
+ * Uses NOT EXISTS on document_id (immutable FK) — never file_name.
  */
 export async function runChecklistScan(
   ctx: ScanContext,
-  dealId: string
+  dealId: string,
+  subjectDocumentIds: string[] = []
 ): Promise<ChecklistScanResult> {
   const startTime = Date.now();
   let totalQueries = 0;
@@ -98,7 +104,7 @@ export async function runChecklistScan(
   for (let i = 0; i < DILIGENCE_CHECKLIST.length; i += SCAN_CONCURRENCY) {
     const batch = DILIGENCE_CHECKLIST.slice(i, i + SCAN_CONCURRENCY);
     const batchResults = await Promise.all(
-      batch.map(category => scanCategory(ctx, dealId, category))
+      batch.map(category => scanCategory(ctx, dealId, category, subjectDocumentIds))
     );
     for (const r of batchResults) {
       totalQueries += r.queriesRun;
@@ -120,11 +126,13 @@ export async function runChecklistScan(
 
 /**
  * Scans a single category — runs all its queries and aggregates hits.
+ * Excludes subject doc IDs + all ic_memo-tagged documents from evidence.
  */
 async function scanCategory(
   ctx: ScanContext,
   dealId: string,
-  category: ChecklistCategory
+  category: ChecklistCategory,
+  subjectDocumentIds: string[]
 ): Promise<CategoryCoverage> {
   const allHits: CategoryHit[] = [];
 
@@ -132,18 +140,21 @@ async function scanCategory(
     try {
       const rows = await ctx.integrations.db.query(
         `SELECT
-           file_name,
-           chunk_index,
-           content,
-           ts_rank_cd(tsv, q) AS rank
-         FROM document_chunks,
+           dc.file_name,
+           dc.chunk_index,
+           dc.content,
+           ts_rank_cd(dc.tsv, q) AS rank
+         FROM document_chunks dc
+              JOIN documents d ON d.id = dc.document_id,
               websearch_to_tsquery('english', $2) q
-         WHERE deal_id = $1
-           AND tsv @@ q
+         WHERE dc.deal_id = $1
+           AND dc.tsv @@ q
+           AND d.document_tag != 'ic_memo'
+           AND dc.document_id != ALL($4::uuid[])
          ORDER BY rank DESC
          LIMIT $3`,
         ChunkHitSchema,
-        [dealId, query, HITS_PER_QUERY],
+        [dealId, query, HITS_PER_QUERY, subjectDocumentIds.length > 0 ? subjectDocumentIds : ['00000000-0000-0000-0000-000000000000']],
         { label: `Checklist scan: ${category.id} — "${query.slice(0, 50)}"` }
       );
 

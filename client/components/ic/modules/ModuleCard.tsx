@@ -170,8 +170,9 @@ export default function ModuleCard({
         {/* Completed state */}
         {isComplete && hasOutput && (
           <div className="space-y-3">
-            {/* Executive summary */}
-            {status!.latestOutput!.executive_header && (
+            {/* Executive summary — suppress if it's just an error message */}
+            {status!.latestOutput!.executive_header &&
+              !/^(merge|analysis|extraction|pipeline)\s*(failed|error)/i.test(status!.latestOutput!.executive_header.trim()) && (
               <p className="text-xs text-ic-text/75 font-light leading-relaxed line-clamp-3">
                 {status!.latestOutput!.executive_header}
               </p>

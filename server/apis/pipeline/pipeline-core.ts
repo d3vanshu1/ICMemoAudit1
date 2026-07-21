@@ -162,6 +162,8 @@ export interface PipelineInput {
   moduleId: string;
   runId?: string | null;
   useOpus?: boolean | null;
+  /** IDs of the memo(s) under review — excluded from evidence pool at all retrieval call sites. */
+  subjectDocumentIds?: string[];
   numericReport?: { figures: any[]; discrepancies: any[] } | null;
   numericPartial?: boolean | null;
 }
@@ -567,6 +569,221 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     }
   }
 
+  // --- Fast-Path: Skip to formatting when merge tree is already complete ---
+  // When a prior invocation completed all analysis + merge but timed out during
+  // formatting (or formatting returned null), re-running the full pipeline wastes
+  // ~170s on redundant heavyweight steps (extraction, doc tables, numeric verify,
+  // merge loop). Instead, detect that the final merge node exists + no output saved,
+  // and jump straight to formatting with the full time budget available.
+  if (runId) {
+    const [topCheckpoint] = await ctx.integrations.db.query(
+      `SELECT tree_level, node_index, merged_json
+       FROM merge_checkpoints
+       WHERE module_run_id = $1
+       ORDER BY tree_level DESC, node_index ASC
+       LIMIT 1`,
+      MergeCheckpointSchema,
+      [runId],
+      { label: "Fast-path: check for final merge node" }
+    );
+
+    if (topCheckpoint) {
+      const cpData = typeof topCheckpoint.merged_json === "string"
+        ? JSON.parse(topCheckpoint.merged_json)
+        : topCheckpoint.merged_json;
+
+      // Only fast-path if: (a) it's a real success node (not error), (b) it's the
+      // sole node at its level (node_index=0 and no siblings), (c) no output saved yet
+      if (!cpData.error && topCheckpoint.node_index === 0) {
+        // Verify it's truly the final node: there should be exactly 1 node at this level
+        const [siblingCount] = await ctx.integrations.db.query(
+          `SELECT COUNT(*)::int AS cnt FROM merge_checkpoints WHERE module_run_id = $1 AND tree_level = $2`,
+          z.object({ cnt: z.coerce.number() }),
+          [runId, topCheckpoint.tree_level],
+          { label: "Fast-path: verify single final node" }
+        );
+
+        const isFinalNode = siblingCount && siblingCount.cnt === 1;
+
+        if (isFinalNode) {
+          // Check if output already exists (if so, skip — run should have been marked completed)
+          const [outputCheck] = await ctx.integrations.db.query(
+            `SELECT 1 AS exists FROM module_outputs WHERE module_run_id = $1 LIMIT 1`,
+            z.object({ exists: z.coerce.number() }),
+            [runId],
+            { label: "Fast-path: check module_outputs" }
+          );
+
+          if (!outputCheck) {
+            // ✅ Fast-path engaged: final merge node complete, no output yet → format directly
+            console.log(`[pipeline:fast-path] Final merge node found at level ${topCheckpoint.tree_level}, skipping to formatting`);
+
+            const finalNode = {
+              text: String(cpData.text ?? ""),
+              executiveHeader: String(cpData.executiveHeader ?? ""),
+              findings: (cpData.findings ?? []) as MergedFinding[],
+              truncated: cpData.truncated === true,
+            };
+
+            let finalFindings = finalNode.findings;
+
+            // Apply fabricated arithmetic suppression (no LLM, just regex — fast)
+            const { FABRICATED_ARITHMETIC_PATTERNS } = await import("./fabricated-arithmetic-patterns.js");
+            const preSuppressCount = finalFindings.length;
+            finalFindings = finalFindings.filter(f => {
+              const text = `${f.title} ${f.detail} ${f.full_analysis}`;
+              return !FABRICATED_ARITHMETIC_PATTERNS.some(pat => pat.test(text));
+            });
+            const suppressedCount = preSuppressCount - finalFindings.length;
+            if (suppressedCount > 0) {
+              console.log(`[pipeline:fast-path] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
+            }
+
+            // Format report with full time budget
+            const formatBudget = timeRemaining();
+            if (formatBudget < FORMAT_REPORT_MIN_BUDGET_MS) {
+              console.warn(`[pipeline:fast-path] Insufficient time even on fast-path (${Math.round(formatBudget / 1000)}s) — returning in_progress`);
+              return {
+                status: "in_progress",
+                runId,
+                phase: "fast_path_formatting",
+                progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
+                result: null,
+                failedChunks: 0,
+                truncatedChunks: 0,
+                truncatedMerges: 0,
+                firstError: null,
+              };
+            }
+
+            console.log(`[pipeline:fast-path] Formatting report (${Math.round(formatBudget / 1000)}s budget, ${finalFindings.length} findings)`);
+            const fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget);
+
+            if (!fullReport) {
+              console.warn(`[pipeline:fast-path] formatReportInline returned null — will retry on next invocation`);
+              return {
+                status: "in_progress",
+                runId,
+                phase: "formatting_retry",
+                progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
+                result: null,
+                failedChunks: 0,
+                truncatedChunks: 0,
+                truncatedMerges: 0,
+                firstError: "Report formatting failed — will retry on next invocation",
+              };
+            }
+
+            // Save to module_outputs
+            let outputSaved = false;
+            for (let attempt = 1; attempt <= 2; attempt++) {
+              try {
+                await upsertModuleOutput(ctx.integrations.db, {
+                  runId,
+                  dealId,
+                  executiveHeader: finalNode.executiveHeader,
+                  findings: finalFindings,
+                  fullReport,
+                });
+                console.log(`[pipeline:fast-path] Report saved (${fullReport.length} chars, attempt ${attempt})`);
+                outputSaved = true;
+                break;
+              } catch (saveErr) {
+                console.warn(`[pipeline:fast-path] Save failed (attempt ${attempt}/2):`, saveErr);
+                if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 2000));
+              }
+            }
+
+            if (!outputSaved) {
+              console.error(`[pipeline:fast-path] module_outputs save failed after 2 attempts — NOT marking completed`);
+              return {
+                status: "in_progress",
+                runId,
+                phase: "save_retry",
+                progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
+                result: null,
+                failedChunks: 0,
+                truncatedChunks: 0,
+                truncatedMerges: 0,
+                firstError: "module_outputs save failed — will retry on next invocation",
+              };
+            }
+
+            // Mark run completed
+            await ctx.integrations.db.execute(
+              `UPDATE module_runs SET status = 'completed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
+              [runId],
+              { label: "Fast-path: mark run completed" }
+            );
+
+            // Post-completion audit (non-blocking)
+            try {
+              runPostCompletionAudit({
+                runId,
+                moduleId,
+                reportText: finalNode.text,
+                findings: finalFindings,
+              });
+            } catch (auditErr) {
+              console.warn(`[pipeline:fast-path] Post-completion audit failed (non-fatal):`, auditErr);
+            }
+
+            // Cap mergedText for response
+            const MAX_MERGED_TEXT_CHARS = 150_000;
+            let mergedText = finalNode.text;
+            if (mergedText.length > MAX_MERGED_TEXT_CHARS) {
+              mergedText = mergedText.slice(0, MAX_MERGED_TEXT_CHARS) + "\n\n[…truncated for transport]";
+            }
+
+            return {
+              status: "completed",
+              runId,
+              phase: "done",
+              progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
+              result: {
+                executiveHeader: finalNode.executiveHeader,
+                findings: finalFindings,
+                mergedText,
+                fullReport,
+              },
+              failedChunks: 0,
+              truncatedChunks: 0,
+              truncatedMerges: 0,
+              firstError: null,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  // --- No-Subject Guard ---
+  // Modules that compare a subject memo against an evidence pool require at least
+  // one document ID in subjectDocumentIds. Hard-fail if empty — no silent empty-subject runs.
+  const SUBJECT_REQUIRED_MODULES = new Set(["omission_audit", "blind_spot_scanner", "diligence_completeness", "contradiction_check"]);
+  if (SUBJECT_REQUIRED_MODULES.has(moduleId)) {
+    const subjectIds = input.subjectDocumentIds ?? [];
+    if (subjectIds.length === 0) {
+      // Mark run failed with a clear error message
+      await ctx.integrations.db.execute(
+        `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
+        [runId],
+        { label: "Mark run failed — no subject document selected" }
+      );
+      return {
+        status: "failed",
+        runId,
+        phase: "no_subject_document",
+        progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
+        result: null,
+        failedChunks: 0,
+        truncatedChunks: 0,
+        truncatedMerges: 0,
+        firstError: "Cannot run this module without selecting a subject memo. Please choose the 'Memo(s) under review' before running.",
+      };
+    }
+  }
+
   // --- Step 0.4: Clean corrupted parsed_text (phantom columns from old parser) ---
   // Detects and trims phantom columns from spreadsheet documents whose parsed_text
   // was generated by the pre-used-range-fix parser. Idempotent: clean docs are no-ops.
@@ -895,7 +1112,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   let coverageMapBlock = "";
   if (CHECKLIST_MODULES.has(moduleId)) {
     try {
-      const scanResult = await runChecklistScan(ctx, dealId);
+      const scanResult = await runChecklistScan(ctx, dealId, input.subjectDocumentIds ?? []);
       coverageMapBlock = "\n\n" + formatCoverageMapForPrompt(scanResult);
       console.log(`[pipeline] Checklist scan complete: ${scanResult.coveredCount} covered, ${scanResult.notFoundCount} not found (${scanResult.scanDurationMs}ms, ${scanResult.totalQueries} queries)`);
     } catch (scanErr) {
@@ -1465,7 +1682,8 @@ A "## Numeric Verification Report" section appears in the input below. It contai
           runId!,
           finalFindings,
           moduleId,
-          useOpus
+          useOpus,
+          input.subjectDocumentIds ?? []
         );
         finalFindings = verifyResult.findings;
         const revised = verifyResult.verificationLog.filter(v => v.verdict.verdict === "REVISED").length;
@@ -1527,55 +1745,78 @@ A "## Numeric Verification Report" section appears in the input below. It contai
     };
   }
 
-  // If formatting succeeded, persist to module_outputs now so it's available
-  // even if the client disconnects before its own save call.
-  // CRITICAL: If this save fails, DO NOT mark the run completed — the client
-  // would get result:null and GetRunOutput would also find nothing.
+  // RULE: "Completed = Report". A run is only marked completed when a formatted
+  // report has been successfully generated AND saved to module_outputs.
+  // If formatting failed (fullReport is null), return in_progress so the next
+  // invocation retries with a fresh time budget. This prevents the silent-failure
+  // scenario where a run shows "completed" with no output.
+  if (!fullReport) {
+    console.warn(`[pipeline] formatReportInline returned null — NOT marking completed (completed = report). Will retry on next invocation.`);
+    return {
+      status: "in_progress",
+      runId,
+      phase: "formatting_retry",
+      progress: {
+        analysisTotal: routed.length,
+        analysisCompleted: routed.length,
+        mergeRound: totalMergeRounds,
+        mergeTotal: totalMergeRounds,
+      },
+      result: null,
+      failedChunks,
+      truncatedChunks,
+      truncatedMerges,
+      firstError: "Report formatting failed — will retry on next invocation",
+    };
+  }
+
+  // Persist formatted report to module_outputs.
+  // If this save fails, DO NOT mark the run completed — the client would get
+  // result:null and GetRunOutput would also find nothing.
   let outputSaved = false;
-  if (fullReport) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        await upsertModuleOutput(ctx.integrations.db, {
-          runId,
-          dealId,
-          executiveHeader: finalNode.executiveHeader,
-          findings: finalFindings,
-          fullReport,
-        });
-        console.log(`[pipeline] Report saved to module_outputs (${fullReport.length} chars, attempt ${attempt})`);
-        outputSaved = true;
-        break;
-      } catch (saveErr) {
-        console.warn(`[pipeline] Failed to save report to module_outputs (attempt ${attempt}/2):`, saveErr);
-        if (attempt < 2) {
-          // Brief pause before retry
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await upsertModuleOutput(ctx.integrations.db, {
+        runId,
+        dealId,
+        executiveHeader: finalNode.executiveHeader,
+        findings: finalFindings,
+        fullReport,
+      });
+      console.log(`[pipeline] Report saved to module_outputs (${fullReport.length} chars, attempt ${attempt})`);
+      outputSaved = true;
+      break;
+    } catch (saveErr) {
+      console.warn(`[pipeline] Failed to save report to module_outputs (attempt ${attempt}/2):`, saveErr);
+      if (attempt < 2) {
+        // Brief pause before retry
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }
+  }
 
-    if (!outputSaved) {
-      // Both save attempts failed — return in_progress so the client re-invokes.
-      // The merge tree is complete (checkpoints saved), so re-invocation will
-      // skip straight to formatting+save with a fresh time budget.
-      console.error(`[pipeline] module_outputs save failed after 2 attempts — NOT marking completed`);
-      return {
-        status: "in_progress",
-        runId,
-        phase: "save_retry",
-        progress: {
-          analysisTotal: routed.length,
-          analysisCompleted: routed.length,
-          mergeRound: totalMergeRounds,
-          mergeTotal: totalMergeRounds,
-        },
-        result: null,
-        failedChunks,
-        truncatedChunks,
-        truncatedMerges,
-        firstError: "module_outputs save failed — will retry on next invocation",
-      };
-    }
+  if (!outputSaved) {
+    // Both save attempts failed — return in_progress so the client re-invokes.
+    // The merge tree is complete (checkpoints saved), so re-invocation will
+    // skip straight to formatting+save with a fresh time budget.
+    console.error(`[pipeline] module_outputs save failed after 2 attempts — NOT marking completed`);
+    return {
+      status: "in_progress",
+      runId,
+      phase: "save_retry",
+      progress: {
+        analysisTotal: routed.length,
+        analysisCompleted: routed.length,
+        mergeRound: totalMergeRounds,
+        mergeTotal: totalMergeRounds,
+      },
+      result: null,
+      failedChunks,
+      truncatedChunks,
+      truncatedMerges,
+      firstError: "module_outputs save failed — will retry on next invocation",
+    };
   }
 
   // Mark run completed

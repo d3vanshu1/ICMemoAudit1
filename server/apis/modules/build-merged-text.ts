@@ -16,6 +16,11 @@ export interface MergedFinding {
   source_docs: string[];
   claim_ids?: string[];
   absence_confidence?: string;
+  /** Omission classification: diligence_gap = absent from subject AND evidence;
+   *  memo_omission = present in evidence but absent from subject memo */
+  gap_type?: "diligence_gap" | "memo_omission";
+  /** Which evidence documents contain the information (for memo_omission findings) */
+  evidence_docs?: string[];
   verification?: {
     status: "revised" | "upheld";
     evidenceQuoted?: string;

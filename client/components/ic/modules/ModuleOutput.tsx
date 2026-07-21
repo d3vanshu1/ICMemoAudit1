@@ -31,8 +31,9 @@ export default function ModuleOutput({ output }: ModuleOutputProps) {
 
   return (
     <div className="space-y-5">
-      {/* Executive header */}
-      {output.executive_header && (
+      {/* Executive header — suppress error messages */}
+      {output.executive_header &&
+        !/^(merge|analysis|extraction|pipeline)\s*(failed|error)/i.test(output.executive_header.trim()) && (
         <div className="p-4 rounded-lg bg-ic-surface-light border border-ic-border">
           <p className="text-sm text-ic-text leading-relaxed font-bold">
             {output.executive_header}

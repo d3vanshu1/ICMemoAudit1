@@ -167,13 +167,14 @@ async function callAnthropic(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: retrieve chunks via FTS
+// Helper: retrieve chunks via FTS (evidence pool only — excludes subject IDs + ic_memo tag)
 // ---------------------------------------------------------------------------
 
 async function retrieveChunks(
   ctx: PipelineContext,
   dealId: string,
-  queries: string[]
+  queries: string[],
+  subjectDocumentIds: string[] = []
 ): Promise<{ fileName: string; chunkIndex: number; content: string }[]> {
   const allHits: { fileName: string; chunkIndex: number; content: string; rank: number }[] = [];
 
@@ -181,18 +182,21 @@ async function retrieveChunks(
     try {
       const rows = await ctx.integrations.db.query(
         `SELECT
-           file_name,
-           chunk_index,
-           content,
-           ts_rank_cd(tsv, q) AS rank
-         FROM document_chunks,
+           dc.file_name,
+           dc.chunk_index,
+           dc.content,
+           ts_rank_cd(dc.tsv, q) AS rank
+         FROM document_chunks dc
+              JOIN documents d ON d.id = dc.document_id,
               websearch_to_tsquery('english', $2) q
-         WHERE deal_id = $1
-           AND tsv @@ q
+         WHERE dc.deal_id = $1
+           AND dc.tsv @@ q
+           AND d.document_tag != 'ic_memo'
+           AND dc.document_id != ALL($4::uuid[])
          ORDER BY rank DESC
          LIMIT $3`,
         ChunkHitSchema,
-        [dealId, query, HITS_PER_QUERY],
+        [dealId, query, HITS_PER_QUERY, subjectDocumentIds.length > 0 ? subjectDocumentIds : ['00000000-0000-0000-0000-000000000000']],
         { label: `Absence verify retrieve: "${query.slice(0, 60)}"` }
       );
 
@@ -253,7 +257,8 @@ export async function runAbsenceVerificationPhase(
   runId: string,
   findings: MergedFinding[],
   moduleId: string,
-  useOpus: boolean | null | undefined
+  useOpus: boolean | null | undefined,
+  subjectDocumentIds: string[] = []
 ): Promise<AbsenceVerificationResult> {
   const model = getModuleModel(moduleId, useOpus);
   const verificationLog: VerificationLogEntry[] = [];
@@ -378,7 +383,7 @@ export async function runAbsenceVerificationPhase(
       }
 
       // --- Retrieval: run queries against document_chunks ---
-      const hits = await retrieveChunks(ctx, dealId, callAOutput.queries);
+      const hits = await retrieveChunks(ctx, dealId, callAOutput.queries, subjectDocumentIds);
       const evidenceText = formatRetrievedEvidence(hits);
 
       console.log(`[absence-verify] "${finding.title.slice(0, 40)}": ${callAOutput.queries.length} queries → ${hits.length} unique hits`);
