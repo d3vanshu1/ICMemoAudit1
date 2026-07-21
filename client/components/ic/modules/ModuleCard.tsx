@@ -31,6 +31,9 @@ interface ModuleCardProps {
   onRun: () => void;
   onCancel: () => void;
   onViewHistory: () => void;
+  /** Externally disable the Run button (e.g. no subject/evidence selected) */
+  disabled?: boolean;
+  disabledReason?: string;
 }
 
 const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -53,6 +56,8 @@ export default function ModuleCard({
   onRun,
   onCancel,
   onViewHistory,
+  disabled = false,
+  disabledReason,
 }: ModuleCardProps) {
   const [showOutput, setShowOutput] = useState(false);
   const hasOutput = status?.latestOutput != null;
@@ -161,10 +166,15 @@ export default function ModuleCard({
 
         {/* Idle state — no run yet */}
         {!isComplete && !isRunning && (
-          <ICButton size="sm" onClick={onRun}>
-            <Play className="w-3.5 h-3.5" />
-            Run Analysis
-          </ICButton>
+          <div>
+            <ICButton size="sm" onClick={onRun} disabled={disabled}>
+              <Play className="w-3.5 h-3.5" />
+              Run Analysis
+            </ICButton>
+            {disabled && disabledReason && (
+              <p className="text-[10px] text-ic-coral/80 font-light mt-1.5">{disabledReason}</p>
+            )}
+          </div>
         )}
 
         {/* Completed state */}
@@ -209,7 +219,7 @@ export default function ModuleCard({
                 <Eye className="w-3.5 h-3.5" />
                 {showOutput ? "Hide" : "Details"}
               </ICButton>
-              <ICButton variant="ghost" size="sm" onClick={onRun} disabled={isRunning}>
+              <ICButton variant="ghost" size="sm" onClick={onRun} disabled={isRunning || disabled}>
                 {isRunning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
                 {isRunning ? "Running…" : "Re-run"}
               </ICButton>

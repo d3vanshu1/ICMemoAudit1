@@ -167,7 +167,8 @@ async function callAnthropic(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: retrieve chunks via FTS (evidence pool only — excludes subject IDs + ic_memo tag)
+// Helper: retrieve chunks via FTS (evidence pool — only subject IDs excluded)
+// Prior IC memos remain in the evidence pool; they carry `independent: false` downstream.
 // ---------------------------------------------------------------------------
 
 async function retrieveChunks(
@@ -186,12 +187,10 @@ async function retrieveChunks(
            dc.chunk_index,
            dc.content,
            ts_rank_cd(dc.tsv, q) AS rank
-         FROM document_chunks dc
-              JOIN documents d ON d.id = dc.document_id,
+         FROM document_chunks dc,
               websearch_to_tsquery('english', $2) q
          WHERE dc.deal_id = $1
            AND dc.tsv @@ q
-           AND d.document_tag != 'ic_memo'
            AND dc.document_id != ALL($4::uuid[])
          ORDER BY rank DESC
          LIMIT $3`,

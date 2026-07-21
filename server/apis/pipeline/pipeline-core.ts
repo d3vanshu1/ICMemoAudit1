@@ -757,31 +757,58 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     }
   }
 
-  // --- No-Subject Guard ---
-  // Modules that compare a subject memo against an evidence pool require at least
-  // one document ID in subjectDocumentIds. Hard-fail if empty — no silent empty-subject runs.
-  const SUBJECT_REQUIRED_MODULES = new Set(["omission_audit", "blind_spot_scanner", "diligence_completeness", "contradiction_check"]);
-  if (SUBJECT_REQUIRED_MODULES.has(moduleId)) {
-    const subjectIds = input.subjectDocumentIds ?? [];
-    if (subjectIds.length === 0) {
-      // Mark run failed with a clear error message
-      await ctx.integrations.db.execute(
-        `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
-        [runId],
-        { label: "Mark run failed — no subject document selected" }
-      );
-      return {
-        status: "failed",
-        runId,
-        phase: "no_subject_document",
-        progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
-        result: null,
-        failedChunks: 0,
-        truncatedChunks: 0,
-        truncatedMerges: 0,
-        firstError: "Cannot run this module without selecting a subject memo. Please choose the 'Memo(s) under review' before running.",
-      };
-    }
+  // --- Subject & Evidence Pool Guard ---
+  // ALL analysis modules (everything routed through pipeline-core) require:
+  //   1. At least one subject document ID — the memo(s) under review
+  //   2. At least one evidence document — reference material beyond the subject
+  // Executive Summary is NOT routed through pipeline-core so is unaffected.
+  const subjectIds = input.subjectDocumentIds ?? [];
+  if (subjectIds.length === 0) {
+    // Mark run failed with a clear error message
+    await ctx.integrations.db.execute(
+      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
+      [runId],
+      { label: "Mark run failed — no subject document selected" }
+    );
+    return {
+      status: "failed",
+      runId,
+      phase: "no_subject_document",
+      progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
+      result: null,
+      failedChunks: 0,
+      truncatedChunks: 0,
+      truncatedMerges: 0,
+      firstError: "Cannot run this module without selecting a subject memo. Please choose the 'Memo(s) under review' before running.",
+    };
+  }
+
+  // Check that the evidence pool (deal docs minus subject IDs) is non-empty.
+  // We query the DB for a quick count to avoid passing the full doc list as input.
+  const evidenceCountRows = await ctx.integrations.db.query(
+    `SELECT COUNT(*)::int AS cnt FROM documents WHERE deal_id = $1 AND id != ALL($2::uuid[])`,
+    z.object({ cnt: z.number() }),
+    [dealId, subjectIds],
+    { label: "Check evidence pool non-empty" }
+  );
+  const evidenceCount = evidenceCountRows[0]?.cnt ?? 0;
+  if (evidenceCount === 0) {
+    await ctx.integrations.db.execute(
+      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
+      [runId],
+      { label: "Mark run failed — no evidence documents" }
+    );
+    return {
+      status: "failed",
+      runId,
+      phase: "no_evidence_documents",
+      progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
+      result: null,
+      failedChunks: 0,
+      truncatedChunks: 0,
+      truncatedMerges: 0,
+      firstError: "Cannot run this module without at least one reference document in the evidence pool. Upload documents beyond the subject memo before running.",
+    };
   }
 
   // --- Step 0.4: Clean corrupted parsed_text (phantom columns from old parser) ---

@@ -9,6 +9,9 @@ interface DashboardHeaderProps {
   onToggleOpus: (v: boolean) => void;
   onRunAll: () => void;
   onBack: () => void;
+  /** Disable the Run All button */
+  disableRunAll?: boolean;
+  disableReason?: string;
 }
 
 export default function DashboardHeader({
@@ -17,6 +20,8 @@ export default function DashboardHeader({
   useOpus,
   onToggleOpus,
   onRunAll,
+  disableRunAll = false,
+  disableReason,
 }: DashboardHeaderProps) {
   return (
     <header className="sticky top-0 z-10 bg-ic-dark/80 backdrop-blur-md border-b border-ic-border px-8 py-5">
@@ -64,10 +69,13 @@ export default function DashboardHeader({
             )}
           </div>
 
-          <ICButton size="lg" glow onClick={onRunAll}>
+          <ICButton size="lg" glow onClick={onRunAll} disabled={disableRunAll}>
             <Play className="w-4 h-4" />
             Run All Modules
           </ICButton>
+          {disableRunAll && disableReason && (
+            <p className="text-[10px] text-ic-coral/80 font-light mt-1 text-right">{disableReason}</p>
+          )}
         </div>
       </div>
     </header>

@@ -15,6 +15,9 @@ interface ModuleGridProps {
   onRunModule: (moduleId: string) => void;
   onCancelModule: (moduleId: string) => void;
   onViewHistory: (moduleId: string) => void;
+  /** When true, disables Run buttons on all analysis modules (not exec summary) */
+  disableAnalysis?: boolean;
+  disableReason?: string;
 }
 
 export default function ModuleGrid({
@@ -24,6 +27,8 @@ export default function ModuleGrid({
   onRunModule,
   onCancelModule,
   onViewHistory,
+  disableAnalysis = false,
+  disableReason,
 }: ModuleGridProps) {
   return (
     <div>
@@ -32,6 +37,8 @@ export default function ModuleGrid({
         {MODULE_DEFINITIONS.map((mod) => {
           const status = moduleStatuses[mod.id] ?? null;
           const isRunning = runningModules.has(mod.id) || status?.latestRun?.status === "running";
+          // Executive Summary has its own gate (≥1 completed module); analysis modules use disableAnalysis
+          const isDisabled = mod.id !== "executive_summary" && disableAnalysis;
           return (
             <ModuleCard
               key={mod.id}
@@ -42,6 +49,8 @@ export default function ModuleGrid({
               onRun={() => onRunModule(mod.id)}
               onCancel={() => onCancelModule(mod.id)}
               onViewHistory={() => onViewHistory(mod.id)}
+              disabled={isDisabled}
+              disabledReason={disableReason}
             />
           );
         })}

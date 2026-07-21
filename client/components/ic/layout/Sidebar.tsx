@@ -5,6 +5,7 @@ import { MODULE_DEFINITIONS } from "@/lib/moduleConfig";
 import DealMetadata from "../deal/DealMetadata";
 import DocumentList from "../documents/DocumentList";
 import DocumentUpload from "../documents/DocumentUpload";
+import SubjectSelector from "../analysis/SubjectSelector";
 import ICButton from "../ui/ICButton";
 
 interface SidebarProps {
@@ -12,6 +13,8 @@ interface SidebarProps {
   documents: Document[];
   completedModules: string[];
   totalModules: number;
+  selectedSubjectIds: string[];
+  onSubjectSelectionChange: (ids: string[]) => void;
   onUpload: (files: File[]) => void;
   onDeleteDoc: (docId: string) => void;
   onUpdateTag: (docId: string, tag: DocumentTag) => void;
@@ -25,6 +28,8 @@ export default function Sidebar({
   documents,
   completedModules,
   totalModules,
+  selectedSubjectIds,
+  onSubjectSelectionChange,
   onUpload,
   onDeleteDoc,
   onUpdateTag,
@@ -53,6 +58,15 @@ export default function Sidebar({
           <div className="bg-ic-dark/50 rounded-xl p-4 border border-ic-border/50">
             <DealMetadata deal={deal} />
           </div>
+        </div>
+
+        {/* Subject Selector */}
+        <div className="p-4 border-b border-ic-border">
+          <SubjectSelector
+            documents={documents}
+            selectedIds={selectedSubjectIds}
+            onSelectionChange={onSubjectSelectionChange}
+          />
         </div>
 
         {/* Data Room */}

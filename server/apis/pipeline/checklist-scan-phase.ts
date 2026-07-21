@@ -85,10 +85,9 @@ interface ScanContext {
  * Runs the full checklist scan for a deal. Executes all category queries
  * against document_chunks and returns the structured coverage map.
  *
- * IMPORTANT: Evidence pool excludes:
- *  1. The subject memo(s) selected at run time (by document ID).
- *  2. All ic_memo-tagged documents (belt-and-suspenders — no memo in its own evidence).
- * Uses NOT EXISTS on document_id (immutable FK) — never file_name.
+ * Evidence pool = ALL documents for the deal EXCEPT the run’s selected subject ID(s).
+ * Prior IC memos ARE included — they are valid evidence (tagged `independent: false`
+ * downstream so the report distinguishes team-authored vs external evidence).
  */
 export async function runChecklistScan(
   ctx: ScanContext,
@@ -126,7 +125,7 @@ export async function runChecklistScan(
 
 /**
  * Scans a single category — runs all its queries and aggregates hits.
- * Excludes subject doc IDs + all ic_memo-tagged documents from evidence.
+ * Only the selected subject document ID(s) are excluded from evidence.
  */
 async function scanCategory(
   ctx: ScanContext,
@@ -144,12 +143,10 @@ async function scanCategory(
            dc.chunk_index,
            dc.content,
            ts_rank_cd(dc.tsv, q) AS rank
-         FROM document_chunks dc
-              JOIN documents d ON d.id = dc.document_id,
+         FROM document_chunks dc,
               websearch_to_tsquery('english', $2) q
          WHERE dc.deal_id = $1
            AND dc.tsv @@ q
-           AND d.document_tag != 'ic_memo'
            AND dc.document_id != ALL($4::uuid[])
          ORDER BY rank DESC
          LIMIT $3`,

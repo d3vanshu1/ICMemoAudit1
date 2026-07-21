@@ -21,6 +21,9 @@ export interface MergedFinding {
   gap_type?: "diligence_gap" | "memo_omission";
   /** Which evidence documents contain the information (for memo_omission findings) */
   evidence_docs?: string[];
+  /** false when evidence comes solely from prior IC memos (team-authored, not independent third-party).
+   *  true when corroborated by at least one non-ic_memo source. Omit when not applicable. */
+  independent?: boolean;
   verification?: {
     status: "revised" | "upheld";
     evidenceQuoted?: string;

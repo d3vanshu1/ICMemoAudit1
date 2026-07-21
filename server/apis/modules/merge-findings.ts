@@ -31,6 +31,9 @@ const FindingSchema = z.object({
   source_docs: z.array(z.string()),
   claim_ids: z.array(z.string()).optional(),
   absence_confidence: z.enum(["verified_absent", "likely_absent", "unverified"]).optional(),
+  gap_type: z.enum(["diligence_gap", "memo_omission"]).optional(),
+  evidence_docs: z.array(z.string()).optional(),
+  independent: z.boolean().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -75,6 +78,7 @@ A JSON array. Each object has:
 - "absence_confidence": (REQUIRED for omission/gap findings) "verified_absent" | "likely_absent" | "unverified" — classification of whether the claimed absence has been cross-checked against all available extractions. Omit only for findings that do not assert something is missing.
 - "gap_type": (REQUIRED for omission/gap findings) "diligence_gap" | "memo_omission". Use "memo_omission" when the information IS present in evidence/reference documents but absent from the subject memo. Use "diligence_gap" when the information is absent from BOTH the subject memo AND all evidence documents. Omit for non-omission findings.
 - "evidence_docs": (REQUIRED when gap_type = "memo_omission") array of filenames of the evidence documents where the information WAS found. Omit when gap_type = "diligence_gap".
+- "independent": (REQUIRED when gap_type = "memo_omission") boolean. Set to false when ALL evidence_docs are prior IC memos (document_tag = ic_memo) — meaning the corroboration comes only from the team's own prior work, not from independent third-party sources. Set to true when at least one evidence_doc is NOT an ic_memo (e.g. financial model, CIM, customer data, contract). This flag helps the IC distinguish findings backed by outside evidence from those merely restating prior internal positions.
 </findings_json>
 
 {{FINDINGS_REQUIREMENT}}`;
@@ -88,17 +92,16 @@ export const MERGE_PROMPTS: Record<string, string> = {
 
 ## Document Role Context (derived at prompt time, not stored)
 
-The evidence pool you are reviewing contains ONLY reference documents (not the subject memo itself — that is excluded by ID). Documents are classified by their existing metadata:
+The evidence pool contains ALL deal documents EXCEPT the subject memo itself (excluded by ID). This includes:
 - **Objective sources** (document_tag ∈ financial_model, customer_data, consultant_report, legal, other with document_source = 'pep'): Treat as factual ground truth.
 - **Narrative sources** (document_tag ∈ cim, im, OR document_source = 'sellside'): These are ADVOCACY documents. They may contain spin, selective emphasis, or omissions of their own. Scrutinize narrative-source claims against objective-source data rather than treating them as authoritative. A claim made ONLY in a narrative source without objective backing is NOT confirmed evidence.
-
-All ic_memo-tagged documents have been excluded from the evidence pool entirely (they are either the subject or a prior version).
+- **Prior IC memos** (document_tag = 'ic_memo', but NOT the subject): These are the team's own earlier work product. They are valid evidence for detecting memo_omission (e.g. "the 2nd memo discussed churn, the 3rd memo does not"), but they are NOT independent corroboration. When a finding's evidence comes solely from prior IC memos, you MUST set "independent": false. When at least one non-ic_memo source also supports the finding, set "independent": true.
 
 ## Your Task
 
 1. **Consolidate Findings**: Combine all analyst observations into a unified set of findings. Where multiple analysts flagged the same gap, combine into one finding with the higher severity and all source docs.
 2. **Classify Each Gap**: For every omission finding, determine:
-   - **memo_omission** — the information IS present in evidence documents but absent from the subject memo (the memo failed to mention it). MUST include "evidence_docs" listing which files contain the evidence.
+   - **memo_omission** — the information IS present in evidence documents but absent from the subject memo (the memo failed to mention it). MUST include "evidence_docs" listing which files contain the evidence, and "independent" indicating whether at least one non-ic_memo source corroborates.
    - **diligence_gap** — the information is absent from BOTH the subject memo AND all evidence documents (a true gap in the data room).
 3. **Checklist Comparison**: Ensure coverage against: customer concentration, churn/retention, key man risk, revenue recognition, regulatory, competitive response, management incentives, exit assumptions, QoE items, capex requirements.
 4. **Identify Additional Gaps**: Based on the full body of evidence, flag any omissions the analysts may have missed.
@@ -474,6 +477,15 @@ No deterministic numeric verification was performed for this analysis. All figur
               f.absence_confidence === "likely_absent" ||
               f.absence_confidence === "unverified"
               ? { absence_confidence: f.absence_confidence as string }
+              : {}),
+            ...(f.gap_type === "diligence_gap" || f.gap_type === "memo_omission"
+              ? { gap_type: f.gap_type as string }
+              : {}),
+            ...(Array.isArray(f.evidence_docs) && f.evidence_docs.length > 0
+              ? { evidence_docs: f.evidence_docs.map(String) }
+              : {}),
+            ...(typeof f.independent === "boolean"
+              ? { independent: f.independent }
               : {}),
           }));
         }

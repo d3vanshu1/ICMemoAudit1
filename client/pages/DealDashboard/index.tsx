@@ -20,7 +20,7 @@ import StatsRow from "@/components/ic/stats/StatsRow";
 import AlertBanner from "@/components/ic/alerts/AlertBanner";
 import ModuleGrid from "@/components/ic/modules/ModuleGrid";
 import RunAllModal from "@/components/ic/modules/RunAllModal";
-import SubjectSelector from "@/components/ic/analysis/SubjectSelector";
+
 import RerunSuggestionModal from "@/components/ic/modules/RerunSuggestionModal";
 import RunHistory from "@/components/ic/modules/RunHistory";
 import QAPanel from "@/components/ic/qa/QAPanel";
@@ -254,6 +254,16 @@ export default function DealDashboardPage() {
       criticalFindings,
     };
   }, [docs, statuses, completedModules]);
+
+  // --- Run gate: both subject and evidence pools must be non-empty ---
+  const evidenceDocs = useMemo(
+    () => docs.filter((d) => !selectedSubjectIds.includes(d.id)),
+    [docs, selectedSubjectIds]
+  );
+  const canRunAnalysis = selectedSubjectIds.length > 0 && evidenceDocs.length > 0;
+  const runDisabledReason = !canRunAnalysis
+    ? "Select the memo under review and upload at least one reference document to run modules."
+    : undefined;
 
   // ---------------------------------------------------------------------------
   // Progress helpers — scoped per module
@@ -2284,6 +2294,8 @@ export default function DealDashboardPage() {
         documents={docs}
         completedModules={completedModules}
         totalModules={MODULE_DEFINITIONS.length}
+        selectedSubjectIds={selectedSubjectIds}
+        onSubjectSelectionChange={setSelectedSubjectIds}
         onUpload={handleUpload}
         onDeleteDoc={handleDeleteDoc}
         onUpdateTag={handleUpdateDocTag}
@@ -2301,6 +2313,8 @@ export default function DealDashboardPage() {
           onToggleOpus={setUseOpus}
           onRunAll={() => setShowRunAll(true)}
           onBack={() => navigate("/")}
+          disableRunAll={!canRunAnalysis}
+          disableReason={runDisabledReason}
         />
 
         <div className="flex-1 px-8 py-8 space-y-8">
@@ -2310,12 +2324,6 @@ export default function DealDashboardPage() {
             totalModules={stats.totalModules}
             totalFindings={stats.totalFindings}
             criticalFindings={stats.criticalFindings}
-          />
-
-          <SubjectSelector
-            documents={docs}
-            selectedIds={selectedSubjectIds}
-            onSelectionChange={setSelectedSubjectIds}
           />
 
           {stats.criticalFindings > 0 && (
@@ -2329,6 +2337,8 @@ export default function DealDashboardPage() {
             onRunModule={handleRunModule}
             onCancelModule={handleCancelModule}
             onViewHistory={setHistoryModule}
+            disableAnalysis={!canRunAnalysis}
+            disableReason={runDisabledReason}
           />
 
           <QAPanel

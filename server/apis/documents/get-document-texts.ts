@@ -35,7 +35,7 @@ const DocTextOutputSchema = z.object({
 
 export default api({
   name: "GetDocumentTexts",
-  description: "Fetches parsed text for deal documents, with subject/ic_memo exclusion for evidence retrieval",
+  description: "Fetches parsed text for deal documents, with subject-ID exclusion for evidence retrieval",
 
   integrations: {
     db: postgres(IC_DILIGENCE_DB),
@@ -45,8 +45,6 @@ export default api({
     dealId: z.string(),
     /** Exclude specific document IDs (e.g. the subject memo(s) chosen at run time). */
     excludeDocumentIds: z.array(z.string()).optional(),
-    /** Exclude all documents tagged ic_memo from results (belt-and-suspenders for evidence pool). */
-    excludeIcMemos: z.boolean().optional(),
   }),
 
   output: z.object({
@@ -54,7 +52,7 @@ export default api({
     warnings: z.array(z.string()),
   }),
 
-  async run(ctx, { dealId, excludeDocumentIds, excludeIcMemos }) {
+  async run(ctx, { dealId, excludeDocumentIds }) {
     const warnings: string[] = [];
 
     // Build dynamic WHERE filters
@@ -66,9 +64,6 @@ export default api({
       exclusionFilter += ` AND id != ALL($${paramIdx}::uuid[])`;
       params.push(excludeDocumentIds);
       paramIdx++;
-    }
-    if (excludeIcMemos) {
-      exclusionFilter += ` AND document_tag != 'ic_memo'`;
     }
 
     // Step 1: Load metadata only (no parsed_text) — always succeeds regardless of text size
