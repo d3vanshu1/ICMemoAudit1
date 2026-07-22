@@ -29,9 +29,15 @@
  *    timeout via Promise.race. Without this, a single hanging Anthropic call
  *    blocks the entire time budget and the pipeline never returns `in_progress`.
  *
- * 5. TIME_BUDGET_MS MUST BE < PLATFORM TIMEOUT − 60s: The platform hard-kills
- *    APIs at 300s. TIME_BUDGET_MS = 200s ensures we have headroom for checkpoint
- *    writes, DB overhead, and the final status update.
+ * 5. NO SINGLE OPERATION MAY EXCEED REMAINING PLATFORM HEADROOM: The platform
+ *    hard-kills APIs at PLATFORM_CAP_MS (default 300s, read from env var
+ *    SB_API_TIMEOUT_MS so it self-adjusts when the cap moves to 600s+).
+ *    TIME_BUDGET_MS (200s) governs the pipeline's graceful exit point but does
+ *    NOT constrain long-running sub-operations like escalation retries. Those
+ *    are independently clamped by extraction-phase.ts to:
+ *      min(desiredBudget, PLATFORM_CAP_MS − elapsed − PLATFORM_HEADROOM_MS)
+ *    If remaining headroom < MIN_ESCALATION_BUDGET_MS (60s), the retry is
+ *    DEFERRED to the next invocation without incrementing attempt_count.
  *
  * 6. MERGE CHECKPOINT DE-DUPLICATION: When resuming, existing checkpoints for a
  *    given (run_id, round, group_index) are loaded and skipped. The pipeline must

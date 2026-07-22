@@ -29,6 +29,20 @@ import type { PipelineContext } from "./pipeline-core.js";
 // ---------------------------------------------------------------------------
 const EXTRACTION_MAX_TOKENS = 16000;
 
+/** Platform hard-kill timeout (ms). Read from env so it self-adjusts when
+ *  Superblocks raises the cap (expected: 600s soon, configurable after). */
+const PLATFORM_CAP_MS = Number(process.env.SB_API_TIMEOUT_MS) || 300_000;
+
+/** Safety buffer subtracted from remaining headroom before starting any
+ *  long-running operation. Covers final checkpoint writes + DB overhead. */
+const PLATFORM_HEADROOM_MS = 30_000;
+
+/** Minimum budget (ms) required to even attempt an escalation retry.
+ *  Below this, the retry is virtually certain to timeout → wastes an attempt.
+ *  Based on observed solo extraction times: median 40-60s, hard chunks 80-120s.
+ *  60s gives a realistic shot at success for most chunks. */
+const MIN_ESCALATION_BUDGET_MS = 60_000;
+
 /** How much time budget the extraction phase is allowed to consume (ms) */
 const EXTRACTION_TIME_BUDGET_MS = 150_000; // 2.5 minutes — leaves headroom for Steps 0.4/0.6/0.7 + platform 300s limit
 
@@ -54,14 +68,15 @@ const INTER_BATCH_COOLDOWN_MS = 5_000;
 const SMALL_TAIL_THRESHOLD = 8;
 
 /** Budget floor for the solo path (ms). Solo calls only bail when less than
- *  this much time remains — keeps a 10s safety margin for DB writes. */
-const SOLO_BUDGET_CHECK_MS = 10_000;
+ *  this much time remains. Set to 45s because a successful solo extraction
+ *  typically needs 40-80s of model time; anything less fires a doomed call
+ *  that wastes an attempt and increments toward permanent failure. */
+const SOLO_BUDGET_CHECK_MS = 45_000;
 
-/** Escalating budgets for extraction attempts (ms). Each entry is the total budget
- *  for that attempt level; effective timeout = budget - SOLO_BUDGET_CHECK_MS.
- *  Attempt 1 (first pass): 140s | Attempt 2: 200s | Attempt 3: 260s
- *  Graduated so we learn whether borderline chunks succeed at intermediate budgets.
- *  Worst-case invocation: 5s overhead + 260s + 1s write = 266s (34s under 300s platform limit). */
+/** Escalating budgets for extraction attempts (ms). Each entry is the DESIRED
+ *  budget for that attempt level; actual budget is clamped to platform headroom.
+ *  Attempt 1: 150s | Attempt 2: 210s | Attempt 3: 270s
+ *  Graduated so we learn whether borderline chunks succeed at intermediate budgets. */
 const ESCALATION_BUDGETS = [150_000, 210_000, 270_000] as const;
 const MAX_EXTRACTION_ATTEMPTS = ESCALATION_BUDGETS.length; // 3
 
@@ -582,7 +597,12 @@ export async function runExtractionPhase(
 
   // --- Step E: Escalation retries for previously-failed chunks ---
   // Runs only when no first-attempt chunks remain (all have had a first pass).
-  // Processes retries one-at-a-time with graduated budgets: 140s → 200s → 260s.
+  // Processes retries one-at-a-time with graduated budgets, CLAMPED to platform
+  // headroom so a single escalation can never blow the platform's hard-kill cap.
+  //
+  // Key invariant: if remaining headroom < MIN_ESCALATION_BUDGET_MS, the retry is
+  // DEFERRED to the next invocation WITHOUT incrementing attempt_count. This
+  // prevents doomed short-budget attempts from exhausting the chunk's retry limit.
   const firstPassChunks = chunksToProcess.filter(c =>
     (failedChunkAttempts.get(`${c.documentId}:${c.chunkIndex}`) ?? 0) === 0
   );
@@ -597,13 +617,39 @@ export async function runExtractionPhase(
   if (firstPassChunks.length === 0 && retryChunks.length > 0) {
     for (const chunk of retryChunks) {
       const attempts = failedChunkAttempts.get(`${chunk.documentId}:${chunk.chunkIndex}`) ?? 1;
-      const budget = ESCALATION_BUDGETS[Math.min(attempts, MAX_EXTRACTION_ATTEMPTS - 1)];
+      const desiredBudget = ESCALATION_BUDGETS[Math.min(attempts, MAX_EXTRACTION_ATTEMPTS - 1)];
+
+      // --- Headroom check: can we fit a meaningful retry before the platform kills us? ---
+      const pipelineElapsed = Date.now() - startTime;
+      const remainingHeadroom = PLATFORM_CAP_MS - pipelineElapsed - PLATFORM_HEADROOM_MS;
+
+      if (remainingHeadroom < MIN_ESCALATION_BUDGET_MS) {
+        // Not enough headroom for a real attempt — defer to next invocation.
+        // Do NOT increment attempt_count; the chunk stays in its current state.
+        console.log(
+          `[extraction:escalation] Deferring chunk ${chunk.chunkIndex} (${chunk.label}) — ` +
+          `headroom=${Math.round(remainingHeadroom / 1000)}s < min=${Math.round(MIN_ESCALATION_BUDGET_MS / 1000)}s, ` +
+          `pipelineElapsed=${Math.round(pipelineElapsed / 1000)}s, platformCap=${Math.round(PLATFORM_CAP_MS / 1000)}s`
+        );
+        break;
+      }
+
+      // Clamp the budget to remaining headroom — never exceed what we can safely fit
+      const clampedBudget = Math.min(desiredBudget, remainingHeadroom);
+      if (clampedBudget < desiredBudget) {
+        console.log(
+          `[extraction:escalation] Clamping budget for chunk ${chunk.chunkIndex}: ` +
+          `desired=${Math.round(desiredBudget / 1000)}s → clamped=${Math.round(clampedBudget / 1000)}s ` +
+          `(headroom=${Math.round(remainingHeadroom / 1000)}s)`
+        );
+      }
+
       const chunkStart = Date.now();
       const tag = tagByDocId[chunk.documentId] ?? "other";
 
       try {
         const { text: rawText, truncated } = await callExtractionLLM(
-          ctx, chunk, totalChunks, chunkStart, 3, true, budget
+          ctx, chunk, totalChunks, chunkStart, 3, true, clampedBudget
         );
 
         if (truncated) {
@@ -684,8 +730,8 @@ export async function runExtractionPhase(
         if (!firstError) firstError = errMsg;
       }
 
-      // Only attempt 1 escalation per invocation — each can take up to 260s,
-      // and the 300s platform limit leaves room for exactly one.
+      // Only attempt 1 escalation per invocation — preserves the single-retry-per-call
+      // policy. The headroom clamp above guarantees this one retry fits safely.
       break;
     }
   }
