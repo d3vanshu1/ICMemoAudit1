@@ -80,7 +80,7 @@ export default function DealDashboardPage() {
   const { data: moduleData, refetch: refetchModules } = useApiData(
     "LoadModuleResults",
     { dealId: dealId ?? "" },
-    { enabled: !!dealId }
+    { enabled: !!dealId, staleTime: 30_000, refetchOnWindowFocus: false }
   );
 
   const [docs, setDocs] = useState<Document[]>([]);
@@ -153,7 +153,24 @@ export default function DealDashboardPage() {
             : null,
         };
       }
-      setStatuses((prev) => ({ ...prev, ...loaded }));
+
+      // CRITICAL: Do NOT overwrite modules that are actively being driven by
+      // the pipeline polling loop. Their local state (progress, "running" status)
+      // is authoritative. Overwriting with DB state causes premature "complete"
+      // flicker when LoadModuleResults refetches (e.g., after tab focus or when
+      // another module finishes and triggers refetchModules()).
+      setStatuses((prev) => {
+        const merged = { ...prev };
+        for (const [id, status] of Object.entries(loaded)) {
+          if (runningModules.has(id) && pipelinePollingActive.current.has(id)) {
+            // This module is actively being polled by the pipeline loop — skip DB overwrite.
+            // Exception: if DB also says "running", allow the update (keeps run ID in sync).
+            if (status.latestRun?.status !== "running") continue;
+          }
+          merged[id] = status;
+        }
+        return merged;
+      });
 
       // If any module has a "running" status in DB, reflect it in the UI immediately
       // so the card shows progress state even before the resume logic kicks in
@@ -178,7 +195,7 @@ export default function DealDashboardPage() {
         });
       }
     }
-  }, [moduleData, dealId]);
+  }, [moduleData, dealId, runningModules]);
 
   // Cached chunks so we only process PDFs once even when multiple modules run
   const chunksCache = useRef<CoverageResult | null>(null);
