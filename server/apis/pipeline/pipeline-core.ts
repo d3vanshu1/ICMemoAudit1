@@ -164,7 +164,7 @@ export interface PipelineInput {
   runId?: string | null;
   useOpus?: boolean | null;
   /** IDs of the memo(s) under review — excluded from evidence pool at all retrieval call sites. */
-  subjectDocumentIds?: string[];
+  subjectDocumentIds?: string[] | null;
   numericReport?: { figures: any[]; discrepancies: any[] } | null;
   numericPartial?: boolean | null;
 }

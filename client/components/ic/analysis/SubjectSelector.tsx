@@ -25,7 +25,7 @@ export default function SubjectSelector({
       <div className="flex items-center gap-2 rounded-lg border border-ic-border/50 bg-ic-surface-light/50 px-4 py-2.5">
         <AlertCircle className="w-3.5 h-3.5 text-ic-coral flex-shrink-0" />
         <span className="text-xs text-ic-muted font-light">
-          No IC Memos uploaded. Upload a memo and tag it as <em>IC Memo</em> to enable omission analysis.
+          No documents tagged as <em>IC Memo</em>. Tag your IC memos using the document type dropdown in the file list, then select them here to run analysis.
         </span>
       </div>
     );
