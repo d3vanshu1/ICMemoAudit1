@@ -225,7 +225,7 @@ export async function runAbsenceVerificationPhase(
   /** Returns milliseconds of budget remaining. Phase breaks when < 45s. */
   budgetRemainingMs: () => number = () => Infinity,
   /** Pipeline invocation start time for LLM headroom enforcement */
-  pipelineStartTime: number = Date.now()
+  pipelineStartTime: number
 ): Promise<AbsenceVerificationResult> {
   const model = getModuleModel(moduleId, useOpus);
   const verificationLog: VerificationLogEntry[] = [];

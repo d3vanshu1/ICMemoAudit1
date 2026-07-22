@@ -10,7 +10,7 @@
  * Callers no longer manage their own Promise.race / setTimeout / retry loops.
  */
 import { z } from "@superblocksteam/sdk-api";
-import { PLATFORM_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS, type PipelineContext } from "./pipeline-config.js";
+import { EFFECTIVE_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS, type PipelineContext } from "./pipeline-config.js";
 
 // ---------------------------------------------------------------------------
 // Schema (same MessageResponseSchema used across pipeline-core & extraction)
@@ -78,7 +78,7 @@ export async function callLLMWithHeadroom(
   for (let attempt = 1; attempt <= retries; attempt++) {
     // --- Headroom check BEFORE every attempt ---
     const elapsed = Date.now() - pipelineStartTime;
-    const remainingHeadroom = PLATFORM_CAP_MS - elapsed - PLATFORM_HEADROOM_MS;
+    const remainingHeadroom = EFFECTIVE_CAP_MS - elapsed - PLATFORM_HEADROOM_MS;
 
     if (remainingHeadroom < minBudget) {
       const priorErrors = attemptErrors.length > 0

@@ -23,14 +23,14 @@ import {
   type TextChunk,
 } from "./extraction-prompt.js";
 import type { PipelineContext } from "./pipeline-core.js";
-import { PLATFORM_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS, EXTRACTION_TIME_BUDGET_MS } from "./pipeline-config.js";
+import { EFFECTIVE_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS, EXTRACTION_TIME_BUDGET_MS } from "./pipeline-config.js";
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 const EXTRACTION_MAX_TOKENS = 16000;
 
-// PLATFORM_CAP_MS, PLATFORM_HEADROOM_MS, EXTRACTION_TIME_BUDGET_MS imported from pipeline-config.ts (single source of truth)
+// EFFECTIVE_CAP_MS, PLATFORM_HEADROOM_MS, EXTRACTION_TIME_BUDGET_MS imported from pipeline-config.ts (single source of truth)
 
 /** Minimum budget (ms) required to even attempt an escalation retry.
  *  Below this, the retry is virtually certain to timeout → wastes an attempt.
@@ -45,7 +45,21 @@ const STAGGER_DELAY_MS = 250;
 /** Maximum number of gap-fill chunks to attempt per invocation.
  *  At 600s cap with 250s extraction budget, we can process ~6 full batches
  *  of 8 concurrently (48 chunks). Spreading load across invocations for
- *  larger gap sets still prevents rate-limit storms. */
+ *  larger gap sets still prevents rate-limit storms.
+ *
+ *  RATE-LIMIT MATH (Anthropic via Superblocks integration):
+ *  - Peak instantaneous concurrency: 8 (EXTRACTION_CONCURRENCY)
+ *  - Stagger: 250ms between calls in a batch → 8 calls over 1.75s
+ *  - Inter-batch cooldown: 5s (INTER_BATCH_COOLDOWN_MS)
+ *  - Observed extraction response time: 40-120s per call
+ *  - Effective batch cadence: ~45-125s per batch (response_time + cooldown)
+ *  - Peak RPM (extraction phase alone): ~8 req / 45s = ~10.7 RPM (best case)
+ *  - Total requests per invocation: 48 (spread over ~250s of wall-clock)
+ *  - This is 3× the prior 16-gap cap; validated against the same
+ *    EXTRACTION_CONCURRENCY=8 that was reduced from 12 specifically to avoid
+ *    429 storms. At 8 concurrent with 250ms stagger, we stay well under the
+ *    account-level RPM tier (empirically, 429s ceased at concurrency ≤ 8).
+ *  - If 429s return at 48 gaps, reduce MAX_GAPS back or increase COOLDOWN. */
 const MAX_GAPS_PER_INVOCATION = 48; // 6 full batches of 8
 
 /** Cooldown between batches (ms) when processing gap-fills.
@@ -569,7 +583,7 @@ export async function runExtractionPhase(
       // platform headroom. This prevents the boundary case where pipeline starts at
       // t=149.9s and a 150s budget would breach the 300s platform cap with zero margin.
       const pipelineElapsed = Date.now() - startTime;
-      const remainingHeadroom = PLATFORM_CAP_MS - pipelineElapsed - PLATFORM_HEADROOM_MS;
+      const remainingHeadroom = EFFECTIVE_CAP_MS - pipelineElapsed - PLATFORM_HEADROOM_MS;
 
       if (remainingHeadroom < MIN_ESCALATION_BUDGET_MS) {
         // Not enough headroom for a meaningful solo attempt — bail.
@@ -636,7 +650,7 @@ export async function runExtractionPhase(
 
       // --- Headroom check: can we fit a meaningful retry before the platform kills us? ---
       const pipelineElapsed = Date.now() - startTime;
-      const remainingHeadroom = PLATFORM_CAP_MS - pipelineElapsed - PLATFORM_HEADROOM_MS;
+      const remainingHeadroom = EFFECTIVE_CAP_MS - pipelineElapsed - PLATFORM_HEADROOM_MS;
 
       if (remainingHeadroom < MIN_ESCALATION_BUDGET_MS) {
         // Not enough headroom for a real attempt — defer to next invocation.
@@ -644,7 +658,7 @@ export async function runExtractionPhase(
         console.log(
           `[extraction:escalation] Deferring chunk ${chunk.chunkIndex} (${chunk.label}) — ` +
           `headroom=${Math.round(remainingHeadroom / 1000)}s < min=${Math.round(MIN_ESCALATION_BUDGET_MS / 1000)}s, ` +
-          `pipelineElapsed=${Math.round(pipelineElapsed / 1000)}s, platformCap=${Math.round(PLATFORM_CAP_MS / 1000)}s`
+          `pipelineElapsed=${Math.round(pipelineElapsed / 1000)}s, platformCap=${Math.round(EFFECTIVE_CAP_MS / 1000)}s`
         );
         break;
       }

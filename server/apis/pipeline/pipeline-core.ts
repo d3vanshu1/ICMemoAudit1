@@ -30,12 +30,11 @@
  *    blocks the entire time budget and the pipeline never returns `in_progress`.
  *
  * 5. NO SINGLE OPERATION MAY EXCEED REMAINING PLATFORM HEADROOM: The platform
- *    hard-kills APIs at PLATFORM_CAP_MS (default 300s, read from env var
- *    SB_API_TIMEOUT_MS so it self-adjusts when the cap moves to 600s+).
- *    TIME_BUDGET_MS (200s) governs the pipeline's graceful exit point but does
- *    NOT constrain long-running sub-operations like escalation retries. Those
- *    are independently clamped by extraction-phase.ts to:
- *      min(desiredBudget, PLATFORM_CAP_MS − elapsed − PLATFORM_HEADROOM_MS)
+ *    hard-kills APIs at EFFECTIVE_CAP_MS (pinned to 600s; verified via
+ *    DiagTimeoutProbe v2). TIME_BUDGET_MS (500s) governs the pipeline's graceful
+ *    exit point but does NOT constrain long-running sub-operations like escalation
+ *    retries. Those are independently clamped by extraction-phase.ts to:
+ *      min(desiredBudget, EFFECTIVE_CAP_MS − elapsed − PLATFORM_HEADROOM_MS)
  *    If remaining headroom < MIN_ESCALATION_BUDGET_MS (60s), the retry is
  *    DEFERRED to the next invocation without incrementing attempt_count.
  *
@@ -75,7 +74,7 @@ import { runAbsenceVerificationPhase } from "./absence-verification-phase.js";
 import { getPipelineVersion } from "./pipeline-version.js";
 import { parseDateFromFileName } from "./parse-date-from-filename.js";
 import { callLLMWithHeadroom, HeadroomExhaustedError, type LLMResponse } from "./call-llm.js";
-import { TIME_BUDGET_MS, PLATFORM_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS } from "./pipeline-config.js";
+import { TIME_BUDGET_MS, EFFECTIVE_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS } from "./pipeline-config.js";
 import type { NumericVerifyResult } from "./numeric-verify-inline.js";
 
 // ---------------------------------------------------------------------------
@@ -89,7 +88,7 @@ const MERGE_CONCURRENCY = 5;
 const MERGE_GROUP_SIZE = 4;
 const MAX_MERGE_GROUP_FAILURES = 5; // Skip (use fallback) after this many error checkpoints across invocations
 const MERGE_NODE_TEXT_CAP = 3000; // Max chars per node's text in merge input — prevents token overflow
-// TIME_BUDGET_MS is imported from pipeline-config.ts (derived from PLATFORM_CAP_MS - 100s)
+// TIME_BUDGET_MS is imported from pipeline-config.ts (derived from EFFECTIVE_CAP_MS - 100s, floor 120s)
 
 // Report formatting config (inline, post-merge)
 const FORMAT_REPORT_MIN_BUDGET_MS = 100_000; // Need at least 100s to attempt report formatting
@@ -218,14 +217,10 @@ async function callAnthropic(
   label: string,
   retries = 3,
   perCallTimeoutMs = 120_000,
-  pipelineStartTime?: number
+  pipelineStartTime: number
 ): Promise<LLMResponse> {
-  // If pipelineStartTime not passed (legacy call sites), use a fallback that
-  // assumes the pipeline started at most TIME_BUDGET_MS ago. This is conservative
-  // but safe — it just means the timeout might be slightly shorter than ideal.
-  const effectiveStart = pipelineStartTime ?? (Date.now() - TIME_BUDGET_MS + 60_000);
   return callLLMWithHeadroom(ctx, body, label, {
-    pipelineStartTime: effectiveStart,
+    pipelineStartTime,
     maxPerCallTimeout: perCallTimeoutMs,
     retries,
     minBudget: 30_000, // Analysis/merge can start with less headroom than extraction
@@ -357,7 +352,7 @@ async function formatReportInline(
   executiveHeader: string,
   findings: MergedFinding[],
   timeRemainingMs: number,
-  pipelineStartTime?: number
+  pipelineStartTime: number
 ): Promise<string | null> {
   if (findings.length === 0) {
     return `# ${moduleId.replace(/_/g, " ").replace(/\\b\\w/g, (c: string) => c.toUpperCase())}\n\n## Executive Summary\n\n${executiveHeader}\n\n## Findings\n\nNo findings identified in this analysis.`;
@@ -1526,6 +1521,13 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
     : "";
   baseMergePrompt += subjectIdentityBlock;
 
+  // Hierarchical merge loop — collapses N nodes → 1 across multiple rounds.
+  // STALENESS SAFETY: triggered_at is refreshed after each batch (see line below
+  // "Refresh triggered_at (merge batch heartbeat)"). Under STALENESS_THRESHOLD_MINUTES=12
+  // and a 600s cap, the worst-case inter-heartbeat gap is ~1 merge batch (~30-60s),
+  // well within the 12-minute threshold. If the cap is raised further, the per-batch
+  // heartbeat still fires often enough — unless a single merge call exceeds 12 min,
+  // which would require re-visiting the threshold derivation.
   while (nodes.length > 1) {
     currentRound++;
 
