@@ -14,7 +14,8 @@
 import { z } from "@superblocksteam/sdk-api";
 import { getModuleModel } from "./model-config.js";
 import type { MergedFinding } from "../modules/build-merged-text.js";
-import type { PipelineContext } from "./pipeline-core.js";
+import type { PipelineContext } from "./pipeline-config.js";
+import { callLLMWithHeadroom } from "./call-llm.js";
 import { LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY } from "../modules/analyze-chunk.js";
 import { parseDateFromFileName } from "./parse-date-from-filename.js";
 import {
@@ -55,16 +56,6 @@ export interface AbsenceVerificationResult {
 // ---------------------------------------------------------------------------
 // Schemas
 // ---------------------------------------------------------------------------
-
-const MessageResponseSchema = z.object({
-  id: z.string(),
-  type: z.literal("message"),
-  role: z.literal("assistant"),
-  content: z.array(z.object({ type: z.literal("text"), text: z.string() })),
-  model: z.string(),
-  stop_reason: z.string().nullable(),
-  usage: z.object({ input_tokens: z.number(), output_tokens: z.number() }),
-});
 
 const ChunkHitSchema = z.object({
   file_name: z.string(),
@@ -135,39 +126,9 @@ ${CALL_B_USER_INSTRUCTIONS}`;
 }
 
 // ---------------------------------------------------------------------------
-// Helper: call Anthropic with retry
+// callAnthropic — DELETED. All LLM calls now route through callLLMWithHeadroom
+// from ./call-llm.ts which enforces per-attempt headroom checks.
 // ---------------------------------------------------------------------------
-
-async function callAnthropic(
-  ctx: PipelineContext,
-  body: Record<string, unknown>,
-  label: string,
-  retries = 3,
-  perCallTimeoutMs = PER_CALL_TIMEOUT_MS
-): Promise<z.infer<typeof MessageResponseSchema>> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const result = await Promise.race([
-        ctx.integrations.ai.apiRequest(
-          { method: "POST", path: "/v1/messages", body },
-          { response: MessageResponseSchema },
-          { label }
-        ),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`Anthropic call timed out after ${perCallTimeoutMs / 1000}s: ${label}`)), perCallTimeoutMs)
-        ),
-      ]);
-      return result;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isRetryable = /503|429|rate.?limit|service.?unavailable|overloaded|timed out/i.test(msg);
-      if (!isRetryable || attempt === retries) throw err;
-      const delay = Math.min(2000 * Math.pow(2, attempt - 1), 15000);
-      await new Promise(r => setTimeout(r, delay));
-    }
-  }
-  throw new Error("Unreachable");
-}
 
 // ---------------------------------------------------------------------------
 // Helper: retrieve chunks via FTS (evidence pool — only subject IDs excluded)
@@ -262,7 +223,9 @@ export async function runAbsenceVerificationPhase(
   useOpus: boolean | null | undefined,
   subjectDocumentIds: string[] = [],
   /** Returns milliseconds of budget remaining. Phase breaks when < 45s. */
-  budgetRemainingMs: () => number = () => Infinity
+  budgetRemainingMs: () => number = () => Infinity,
+  /** Pipeline invocation start time for LLM headroom enforcement */
+  pipelineStartTime: number = Date.now()
 ): Promise<AbsenceVerificationResult> {
   const model = getModuleModel(moduleId, useOpus);
   const verificationLog: VerificationLogEntry[] = [];
@@ -370,7 +333,7 @@ export async function runAbsenceVerificationPhase(
 
     try {
       // --- Call A: Query Generation ---
-      const callAResult = await callAnthropic(
+      const callAResult = await callLLMWithHeadroom(
         ctx,
         {
           model,
@@ -378,7 +341,13 @@ export async function runAbsenceVerificationPhase(
           system: [{ type: "text", text: CALL_A_SYSTEM }],
           messages: [{ role: "user", content: buildCallAUser(finding) }],
         },
-        `Absence verify CallA: "${finding.title.slice(0, 50)}"`
+        `Absence verify CallA: "${finding.title.slice(0, 50)}"`,
+        {
+          pipelineStartTime,
+          maxPerCallTimeout: PER_CALL_TIMEOUT_MS,
+          retries: 3,
+          minBudget: 30_000,
+        }
       );
 
       const callAText = callAResult.content.find((c: { type: string }) => c.type === "text");
@@ -408,7 +377,7 @@ export async function runAbsenceVerificationPhase(
       console.log(`[absence-verify] "${finding.title.slice(0, 40)}": ${callAOutput.queries.length} queries → ${hits.length} unique hits`);
 
       // --- Call B: Verdict ---
-      const callBResult = await callAnthropic(
+      const callBResult = await callLLMWithHeadroom(
         ctx,
         {
           model,
@@ -416,7 +385,13 @@ export async function runAbsenceVerificationPhase(
           system: [{ type: "text", text: CALL_B_SYSTEM }],
           messages: [{ role: "user", content: buildCallBUser(finding, absenceConfidence, callAOutput.queries, evidenceText, documentTimeline) }],
         },
-        `Absence verify CallB: "${finding.title.slice(0, 50)}"`
+        `Absence verify CallB: "${finding.title.slice(0, 50)}"`,
+        {
+          pipelineStartTime,
+          maxPerCallTimeout: PER_CALL_TIMEOUT_MS,
+          retries: 3,
+          minBudget: 30_000,
+        }
       );
 
       const callBText = callBResult.content.find((c: { type: string }) => c.type === "text");

@@ -23,38 +23,30 @@ import {
   type TextChunk,
 } from "./extraction-prompt.js";
 import type { PipelineContext } from "./pipeline-core.js";
+import { PLATFORM_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS, EXTRACTION_TIME_BUDGET_MS } from "./pipeline-config.js";
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 const EXTRACTION_MAX_TOKENS = 16000;
 
-/** Platform hard-kill timeout (ms). Read from env so it self-adjusts when
- *  Superblocks raises the cap (expected: 600s soon, configurable after). */
-const PLATFORM_CAP_MS = Number(process.env.SB_API_TIMEOUT_MS) || 300_000;
-
-/** Safety buffer subtracted from remaining headroom before starting any
- *  long-running operation. Covers final checkpoint writes + DB overhead. */
-const PLATFORM_HEADROOM_MS = 30_000;
+// PLATFORM_CAP_MS, PLATFORM_HEADROOM_MS, EXTRACTION_TIME_BUDGET_MS imported from pipeline-config.ts (single source of truth)
 
 /** Minimum budget (ms) required to even attempt an escalation retry.
  *  Below this, the retry is virtually certain to timeout → wastes an attempt.
  *  Based on observed solo extraction times: median 40-60s, hard chunks 80-120s.
  *  60s gives a realistic shot at success for most chunks. */
-const MIN_ESCALATION_BUDGET_MS = 60_000;
-
-/** How much time budget the extraction phase is allowed to consume (ms) */
-const EXTRACTION_TIME_BUDGET_MS = 150_000; // 2.5 minutes — leaves headroom for Steps 0.4/0.6/0.7 + platform 300s limit
+const MIN_ESCALATION_BUDGET_MS = MIN_VIABLE_LLM_BUDGET_MS;
 
 /** Inter-call stagger delay within a batch (ms). Spreads 8 calls over ~1.75s
  *  instead of firing all simultaneously, reducing 429 bursts. */
 const STAGGER_DELAY_MS = 250;
 
 /** Maximum number of gap-fill chunks to attempt per invocation.
- *  When many gaps exist (e.g., 65), attempting all at once triggers rate-limit
- *  storms (429 → 100% failure → infinite retry loop). Processing fewer chunks
- *  per invocation spreads load across multiple re-invocations. */
-const MAX_GAPS_PER_INVOCATION = 16; // 2 full batches of 8
+ *  At 600s cap with 250s extraction budget, we can process ~6 full batches
+ *  of 8 concurrently (48 chunks). Spreading load across invocations for
+ *  larger gap sets still prevents rate-limit storms. */
+const MAX_GAPS_PER_INVOCATION = 48; // 6 full batches of 8
 
 /** Cooldown between batches (ms) when processing gap-fills.
  *  Only applied when total gaps exceed MAX_GAPS_PER_INVOCATION — gives the
@@ -229,7 +221,8 @@ async function callExtractionLLM(
 export async function runExtractionPhase(
   ctx: PipelineContext,
   dealId: string,
-  startTime: number
+  startTime: number,
+  runId?: string
 ): Promise<ExtractionPhaseResult> {
   // --- Step A: Load document metadata (no parsed_text) ---
   const docMetas: Array<{ id: string; file_name: string; document_tag: string | null; text_length: number }> = [];
@@ -385,6 +378,10 @@ export async function runExtractionPhase(
   let succeededThisPass = 0;
   let failedThisPass = 0;
 
+  // Budget override for solo mode — set per-iteration before calling processBatch.
+  // Clamped to platform headroom so solo chunks can't breach the platform cap.
+  let soloBudgetOverride: number | undefined;
+
   const processBatch = async (batch: TextChunk[]): Promise<void> => {
     // Stagger launches: each call starts STAGGER_DELAY_MS after the previous one.
     // All calls still run concurrently once launched — only the start is spread out.
@@ -407,11 +404,10 @@ export async function runExtractionPhase(
         }
 
         try {
-          // Solo chunks get a fresh startTime so their internal timeout is a full
-          // ~140s (EXTRACTION_TIME_BUDGET_MS - 10_000) rather than whatever's left
-          // after doc loading consumed the front of the pipeline's clock.
+          // Solo chunks get a fresh startTime so their internal timeout measures
+          // from call start. Budget is clamped to platform headroom via soloBudgetOverride.
           const chunkStart = isSolo ? Date.now() : startTime;
-          const { text: rawText, truncated } = await callExtractionLLM(ctx, chunk, totalChunks, chunkStart, 3, isSolo);
+          const { text: rawText, truncated } = await callExtractionLLM(ctx, chunk, totalChunks, chunkStart, 3, isSolo, soloBudgetOverride);
 
           // If truncated, mark it so future runs will retry this chunk
           if (truncated) {
@@ -556,13 +552,32 @@ export async function runExtractionPhase(
       await new Promise(r => setTimeout(r, INTER_BATCH_COOLDOWN_MS));
     }
 
+    // Heartbeat: update triggered_at so the stale-pipeline sweeper doesn't
+    // claim this run while extraction is still actively processing.
+    if (runId) {
+      await ctx.integrations.db.execute(
+        `UPDATE module_runs SET triggered_at = NOW() WHERE id = $1`,
+        [runId],
+        { label: "Extraction heartbeat" }
+      );
+    }
+
     const batch = chunksToProcess.slice(i, i + effectiveConcurrency);
 
     if (isSolo) {
-      // Solo: each chunk gets its own fresh budget clock (~140s internal timeout).
-      // No deadline race — the chunk's internal timeout is the sole time bound.
-      // This lets solo chunks exceed the pipeline's extraction budget slightly
-      // (safe: still well under the 300s platform limit).
+      // Solo: each chunk gets an escalation-level budget, but CLAMPED to remaining
+      // platform headroom. This prevents the boundary case where pipeline starts at
+      // t=149.9s and a 150s budget would breach the 300s platform cap with zero margin.
+      const pipelineElapsed = Date.now() - startTime;
+      const remainingHeadroom = PLATFORM_CAP_MS - pipelineElapsed - PLATFORM_HEADROOM_MS;
+
+      if (remainingHeadroom < MIN_ESCALATION_BUDGET_MS) {
+        // Not enough headroom for a meaningful solo attempt — bail.
+        return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError, passStats: makePassStats() };
+      }
+
+      // Clamp the solo budget to remaining headroom
+      soloBudgetOverride = Math.min(ESCALATION_BUDGETS[0], remainingHeadroom);
       await processBatch(batch);
     } else {
       // Concurrent: race the batch against remaining pipeline budget. Ensures we
@@ -699,6 +714,24 @@ export async function runExtractionPhase(
         }
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
+        const isTimeout = /timed out|timeout|ETIMEDOUT/i.test(errMsg);
+
+        // --- Item 3a fix: if budget was clamped AND the failure is a timeout,
+        // this was a doomed stunted attempt. Do NOT increment attempt_count —
+        // defer to next invocation exactly like the <60s headroom path.
+        // Only full-budget failures (or non-timeout errors at any budget) count.
+        if (clampedBudget < desiredBudget && isTimeout) {
+          console.log(
+            `[extraction:escalation] Timeout on clamped attempt for chunk ${chunk.chunkIndex} — ` +
+            `NOT incrementing attempt_count (was ${attempts}, budget was clamped ` +
+            `${Math.round(desiredBudget / 1000)}s → ${Math.round(clampedBudget / 1000)}s). ` +
+            `Deferring to next invocation.`
+          );
+          // Don't save a new failed row — leave existing state untouched so
+          // the chunk retries at full budget on next invocation.
+          break;
+        }
+
         const newAttemptCount = attempts + 1;
         const isFinal = newAttemptCount >= MAX_EXTRACTION_ATTEMPTS;
         const failedJson = {

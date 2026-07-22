@@ -251,6 +251,12 @@ export default function DealDashboardPage() {
   const cancelledRunsRef = useRef<Set<string>>(new Set());
   // Maps moduleId → active runId so we know what to cancel
   const activeRunIdRef = useRef<Record<string, string>>({});
+  // Modules permanently killed this session — never auto-resume
+  const killedModulesRef = useRef<Set<string>>(new Set());
+  // Track consecutive resume failures per module — kill after threshold
+  const resumeFailureCountRef = useRef<Record<string, number>>({});
+  // Consecutive progress poll failures (persists across effect re-runs)
+  const pollFailureCountRef = useRef(0);
 
   const completedModules = useMemo(
     () =>
@@ -1604,6 +1610,12 @@ export default function DealDashboardPage() {
 
   const handleRunModule = useCallback(
     async (moduleId: string, resumeRunId?: string) => {
+      // Hard kill — never resume a module that was explicitly killed this session
+      if (killedModulesRef.current.has(moduleId)) {
+        console.warn(`[handleRunModule] ${moduleId} is killed — ignoring`);
+        return;
+      }
+
       // Skip the "already running" guard when resuming — we're reconnecting to an existing run
       if (!resumeRunId && runningModules.has(moduleId)) {
         toast.info("This module is already running.");
@@ -1672,12 +1684,23 @@ export default function DealDashboardPage() {
         const displayName = MODULE_MAP[moduleId]?.displayName ?? moduleId;
 
         if (resumeRunId && isTimeoutOrNetwork) {
-          // Server pipeline is still running — just the client call timed out.
-          // Keep the module in "running" state so the progress poll continues to show updates.
-          toast.info(`[${displayName}] Connection to server pipeline timed out. The analysis continues server-side — progress will update automatically.`);
-          pipelinePollingActive.current.delete(moduleId);
-          exitedEarlyForResume = true;
-          return; // Don't clean up runningModules — let the progress poll handle it
+          // Track consecutive resume failures for this module
+          const count = (resumeFailureCountRef.current[moduleId] ?? 0) + 1;
+          resumeFailureCountRef.current[moduleId] = count;
+
+          if (count >= 2) {
+            // Two consecutive resume failures — server is unreachable, kill the module
+            console.warn(`[handleRunModule] ${moduleId}: ${count} consecutive resume failures — killing`);
+            killedModulesRef.current.add(moduleId);
+            toast.error(`[${displayName}] Server unreachable after ${count} attempts — stopped. Refresh to retry.`);
+            // Fall through to finally block cleanup (exitedEarlyForResume stays false)
+          } else {
+            // First failure — give it one more chance
+            toast.info(`[${displayName}] Connection to server pipeline timed out. The analysis continues server-side — progress will update automatically.`);
+            pipelinePollingActive.current.delete(moduleId);
+            exitedEarlyForResume = true;
+            return;
+          }
         }
 
         const hint = isTimeoutOrNetwork ? " Try with fewer or smaller files." : "";
@@ -1691,6 +1714,8 @@ export default function DealDashboardPage() {
           });
           clearModuleProgress(moduleId);
           pipelinePollingActive.current.delete(moduleId);
+          // Reset resume failure counter on clean exit (success or non-network error)
+          delete resumeFailureCountRef.current[moduleId];
           // Clean up cancellation tracking
           const finishedRunId = activeRunIdRef.current[moduleId];
           if (finishedRunId) {
@@ -1735,6 +1760,8 @@ export default function DealDashboardPage() {
 
       // Mark cancelled locally (immediate — extraction loop checks this ref)
       cancelledRunsRef.current.add(runId);
+      // Permanently kill — prevent auto-resume from re-triggering
+      killedModulesRef.current.add(moduleId);
 
       // Mark cancelled server-side
       try {
@@ -1825,6 +1852,7 @@ export default function DealDashboardPage() {
         toast.info(`Resuming ${inProgressRuns.length} interrupted run(s)…`);
         for (const run of inProgressRuns) {
           if (run.moduleId === "executive_summary") continue;
+          if (killedModulesRef.current.has(run.moduleId)) continue;
           handleRunModule(run.moduleId, run.runId);
         }
       } catch (err) {
@@ -1862,7 +1890,8 @@ export default function DealDashboardPage() {
       const orphanedModules = dbRunningIds.filter(
         (id) =>
           !pipelinePollingActive.current.has(id) &&
-          !resumingModulesRef.current.has(id)
+          !resumingModulesRef.current.has(id) &&
+          !killedModulesRef.current.has(id)
       );
 
       if (orphanedModules.length === 0) return;
@@ -1923,9 +1952,13 @@ export default function DealDashboardPage() {
     // the pipeline polling loop (which sets real progress messages)
     const dbRunningIds = Object.entries(statuses)
       .filter(([, s]) => s.latestRun?.status === "running")
-      .map(([id]) => id);
+      .map(([id]) => id)
+      .filter((id) => !killedModulesRef.current.has(id));
 
     if (dbRunningIds.length === 0) return;
+
+    // Bail immediately if the poll has already been killed (ref persists across re-runs)
+    if (pollFailureCountRef.current >= 3) return;
 
     let cancelled = false;
 
@@ -1934,6 +1967,7 @@ export default function DealDashboardPage() {
       try {
         const progress = await getRunProgressApi({ dealId });
         if (cancelled) return;
+        pollFailureCountRef.current = 0; // reset on success
         const runs = progress?.runs ?? [];
         const extractionCount = progress?.extractionCount ?? 0;
 
@@ -1976,7 +2010,25 @@ export default function DealDashboardPage() {
           });
         }
       } catch {
-        // Silently continue — poll will retry
+        pollFailureCountRef.current++;
+        if (pollFailureCountRef.current >= 3) {
+          // Server unreachable — stop polling and clear running state to prevent infinite loop
+          console.warn(`[progress-poll] 3 consecutive failures — stopping poll and clearing running state`);
+          cancelled = true;
+          for (const moduleId of dbRunningIds) {
+            killedModulesRef.current.add(moduleId);
+            setRunningModules((prev) => {
+              const next = new Set(prev);
+              next.delete(moduleId);
+              return next;
+            });
+            setProgressMap((prev) => {
+              const updated = { ...prev };
+              delete updated[moduleId];
+              return updated;
+            });
+          }
+        }
       }
     };
 

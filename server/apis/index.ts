@@ -42,6 +42,9 @@ import RunMigration004 from './pipeline/run-migration.js';
 import RunMigration005 from './pipeline/run-migration-005.js';
 import RunMigration006 from './pipeline/run-migration-006.js';
 import RunMigration007 from './pipeline/run-migration-007.js';
+import DiagTimeoutProbe from './pipeline/diag-timeout-probe.js';
+import ReadTimeoutProbeResult from './pipeline/read-timeout-probe-result.js';
+import ListTimeoutProbes from './pipeline/list-timeout-probes.js';
 
 // Database setup
 import SetupSchema from './db/setup-schema.js';
@@ -112,7 +115,7 @@ const apis = {
   AnalyzeChunk, UniversalExtract, MergeFindings, FormatReport, WebResearch,
   SaveModuleResult, LoadModuleResults, GetRunHistory, GetRunOutput,
   // Server-side pipeline
-  RunModulePipeline, ResumeStalePipelines, DiagnoseParsedText, CleanParsedTextDryRun, CountSheets, DiagnoseChunks, DiagnoseRuns, DiagnoseChunkCoverage, DiagnoseChunkDetail, DiagnoseRunEvidence, DiagnoseFindingTrace, DiagnoseExtractionRaw, ResetDealRun, ResetModuleMerge, RunMigration004, RunMigration005, RunMigration006, RunMigration007,
+  RunModulePipeline, ResumeStalePipelines, DiagnoseParsedText, CleanParsedTextDryRun, CountSheets, DiagnoseChunks, DiagnoseRuns, DiagnoseChunkCoverage, DiagnoseChunkDetail, DiagnoseRunEvidence, DiagnoseFindingTrace, DiagnoseExtractionRaw, ResetDealRun, ResetModuleMerge, RunMigration004, RunMigration005, RunMigration006, RunMigration007, DiagTimeoutProbe, ReadTimeoutProbeResult, ListTimeoutProbes,
   // DB setup
   SetupSchema, RunCheckpointMigration, CreatePipelineTable, CheckSchemaHealth, AddConcurrentRunIndex,
   // Deals

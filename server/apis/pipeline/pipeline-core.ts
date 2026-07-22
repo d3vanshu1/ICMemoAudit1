@@ -74,6 +74,8 @@ import { runChecklistScan, formatCoverageMapForPrompt, type ChecklistScanResult 
 import { runAbsenceVerificationPhase } from "./absence-verification-phase.js";
 import { getPipelineVersion } from "./pipeline-version.js";
 import { parseDateFromFileName } from "./parse-date-from-filename.js";
+import { callLLMWithHeadroom, HeadroomExhaustedError, type LLMResponse } from "./call-llm.js";
+import { TIME_BUDGET_MS, PLATFORM_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS } from "./pipeline-config.js";
 import type { NumericVerifyResult } from "./numeric-verify-inline.js";
 
 // ---------------------------------------------------------------------------
@@ -87,9 +89,7 @@ const MERGE_CONCURRENCY = 5;
 const MERGE_GROUP_SIZE = 4;
 const MAX_MERGE_GROUP_FAILURES = 5; // Skip (use fallback) after this many error checkpoints across invocations
 const MERGE_NODE_TEXT_CAP = 3000; // Max chars per node's text in merge input — prevents token overflow
-const TIME_BUDGET_MS = 200_000; // 3m20s — gives 100s headroom under platform's 300s API timeout
-// NOTE: Reduced from 250s because paginated extraction loading, checkpoint saves,
-// and DB overhead were pushing total wall-clock past the 300s platform limit.
+// TIME_BUDGET_MS is imported from pipeline-config.ts (derived from PLATFORM_CAP_MS - 100s)
 
 // Report formatting config (inline, post-merge)
 const FORMAT_REPORT_MIN_BUDGET_MS = 100_000; // Need at least 100s to attempt report formatting
@@ -135,15 +135,7 @@ const MergeCheckpointSchema = z.object({
   merged_json: z.any(),
 });
 
-const MessageResponseSchema = z.object({
-  id: z.string(),
-  type: z.literal("message"),
-  role: z.literal("assistant"),
-  content: z.array(z.object({ type: z.literal("text"), text: z.string() })),
-  model: z.string(),
-  stop_reason: z.string().nullable(),
-  usage: z.object({ input_tokens: z.number(), output_tokens: z.number() }),
-});
+// MessageResponseSchema is imported via call-llm.ts (LLMResponse type)
 
 const RunIdSchema = z.object({ run_id: z.string() });
 
@@ -199,6 +191,8 @@ export interface PipelineResult {
   truncatedChunks?: number; // analysis chunks where stop_reason was "max_tokens"
   truncatedMerges?: number; // merge groups where stop_reason was "max_tokens"
   firstError?: string | null;
+  /** Chunks that exhausted all extraction attempts and are permanently missing from the report. */
+  permanentlyFailedExtractions?: { chunkLabel: string; sourceFile: string; chunkIndex: number }[];
   extractionPassStats?: {
     attemptedThisPass: number;
     succeededThisPass: number;
@@ -210,35 +204,32 @@ export interface PipelineResult {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Call Anthropic via the shared budget-aware helper.
+ * This is the ONLY LLM entry point in pipeline-core.ts.
+ * It clamps each attempt's timeout to remaining platform headroom and re-checks
+ * headroom before every retry (unlike the old implementation which had no
+ * per-attempt headroom check, allowing 120s × 3 + backoffs ≈ 366s worst case).
+ */
 async function callAnthropic(
   ctx: PipelineContext,
   body: Record<string, unknown>,
   label: string,
   retries = 3,
-  perCallTimeoutMs = 120_000 // 2 minutes default — merge calls pass dynamic value
-): Promise<z.infer<typeof MessageResponseSchema>> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const result = await Promise.race([
-        ctx.integrations.ai.apiRequest(
-          { method: "POST", path: "/v1/messages", body },
-          { response: MessageResponseSchema },
-          { label }
-        ),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`Anthropic call timed out after ${perCallTimeoutMs / 1000}s: ${label}`)), perCallTimeoutMs)
-        ),
-      ]);
-      return result;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isRetryable = /503|429|rate.?limit|service.?unavailable|overloaded|timed out/i.test(msg);
-      if (!isRetryable || attempt === retries) throw err;
-      const delay = Math.min(2000 * Math.pow(2, attempt - 1), 15000);
-      await new Promise(r => setTimeout(r, delay));
-    }
-  }
-  throw new Error("Unreachable");
+  perCallTimeoutMs = 120_000,
+  pipelineStartTime?: number
+): Promise<LLMResponse> {
+  // If pipelineStartTime not passed (legacy call sites), use a fallback that
+  // assumes the pipeline started at most TIME_BUDGET_MS ago. This is conservative
+  // but safe — it just means the timeout might be slightly shorter than ideal.
+  const effectiveStart = pipelineStartTime ?? (Date.now() - TIME_BUDGET_MS + 60_000);
+  return callLLMWithHeadroom(ctx, body, label, {
+    pipelineStartTime: effectiveStart,
+    maxPerCallTimeout: perCallTimeoutMs,
+    retries,
+    minBudget: 30_000, // Analysis/merge can start with less headroom than extraction
+  });
 }
 
 function extractTag(text: string, tag: string): string {
@@ -365,7 +356,8 @@ async function formatReportInline(
   moduleId: string,
   executiveHeader: string,
   findings: MergedFinding[],
-  timeRemainingMs: number
+  timeRemainingMs: number,
+  pipelineStartTime?: number
 ): Promise<string | null> {
   if (findings.length === 0) {
     return `# ${moduleId.replace(/_/g, " ").replace(/\\b\\w/g, (c: string) => c.toUpperCase())}\n\n## Executive Summary\n\n${executiveHeader}\n\n## Findings\n\nNo findings identified in this analysis.`;
@@ -401,7 +393,8 @@ Rules:
       },
       "Inline format report",
       2, // retries
-      perCallTimeout
+      perCallTimeout,
+      pipelineStartTime
     );
 
     const textBlock = result.content.find((c: { type: string }) => c.type === "text");
@@ -695,7 +688,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
             }
 
             console.log(`[pipeline:fast-path] Formatting report (${Math.round(formatBudget / 1000)}s budget, ${finalFindings.length} findings)`);
-            const fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget);
+            const fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget, startTime);
 
             if (!fullReport) {
               console.warn(`[pipeline:fast-path] formatReportInline returned null — will retry on next invocation`);
@@ -892,7 +885,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // --- Step 0.5: Ensure extractions exist (self-sufficient extraction phase) ---
   // ALWAYS run extraction gap-fill regardless of analysis state.
   // Requirement: full extraction data must exist before merge proceeds.
-  const extractionResult = await runExtractionPhase(ctx, dealId, startTime);
+  const extractionResult = await runExtractionPhase(ctx, dealId, startTime, runId);
   if (extractionResult.needed && !extractionResult.completed) {
     // Time budget consumed by extraction — return in_progress so caller re-invokes
     return {
@@ -1241,7 +1234,10 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
             system: [{ type: "text", text: subAgentPrompt, cache_control: { type: "ephemeral" } }],
             messages: [{ role: "user", content: userContent }],
           },
-          `Sub-agent: ${chunkLabel} (${globalIdx + 1}/${routed.length})`
+          `Sub-agent: ${chunkLabel} (${globalIdx + 1}/${routed.length})`,
+          3,
+          120_000,
+          startTime
         );
 
         const textBlock = result.content.find((c: { type: string }) => c.type === "text");
@@ -1622,7 +1618,8 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
             },
             `Merge R${currentRound} G${group.idx + 1}/${totalGroupsThisRound}`,
             2, // 2 attempts, 1 retry
-            perCallTimeout
+            perCallTimeout,
+            startTime
           );
 
           const mergeText = mergeResult.content.find((c: { type: string }) => c.type === "text")?.text ?? "";
@@ -1802,7 +1799,8 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
           moduleId,
           useOpus,
           input.subjectDocumentIds ?? [],
-          timeRemaining
+          timeRemaining,
+          startTime
         );
         finalFindings = verifyResult.findings;
         const revised = verifyResult.verificationLog.filter(v => v.verdict.verdict === "REVISED").length;
@@ -1887,7 +1885,7 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
 
   if (formatBudget >= FORMAT_REPORT_MIN_BUDGET_MS) {
     console.log(`[pipeline] Formatting report inline (${Math.round(formatBudget / 1000)}s budget)`);
-    fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget);
+    fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget, startTime);
   } else {
     console.warn(`[pipeline] Insufficient time for inline formatting (${Math.round(formatBudget / 1000)}s < ${FORMAT_REPORT_MIN_BUDGET_MS / 1000}s needed) — deferring to next invocation`);
     // Return in_progress so the client re-invokes with a fresh time budget
@@ -1938,6 +1936,56 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
   // If this save fails, DO NOT mark the run completed — the client would get
   // result:null and GetRunOutput would also find nothing.
   let outputSaved = false;
+
+  // --- Surface permanently_failed extractions BEFORE saving the report ---
+  // Query for chunks that exhausted all extraction attempts. If any exist,
+  // inject a disclosure section into the report so the user is informed.
+  const PermFailedSchema = z.object({
+    chunk_index: z.coerce.number(),
+    label: z.string(),
+    source_file: z.string(),
+  });
+  let permanentlyFailedExtractions: { chunkLabel: string; sourceFile: string; chunkIndex: number }[] = [];
+  try {
+    const permFailed = await ctx.integrations.db.query(
+      `SELECT
+         ue.chunk_index,
+         COALESCE(ue.extraction_json->>'label', 'Chunk ' || ue.chunk_index) AS label,
+         COALESCE(ue.extraction_json->>'sourceFile', d.file_name, 'unknown') AS source_file
+       FROM universal_extractions ue
+       LEFT JOIN documents d ON d.id = ue.document_id
+       WHERE ue.deal_id = $1
+         AND (ue.extraction_json->>'permanently_failed')::boolean = true
+       ORDER BY ue.chunk_index`,
+      PermFailedSchema,
+      [dealId],
+      { label: "Query permanently_failed extractions" }
+    );
+    permanentlyFailedExtractions = permFailed.map(r => ({
+      chunkLabel: r.label,
+      sourceFile: r.source_file,
+      chunkIndex: r.chunk_index,
+    }));
+    if (permanentlyFailedExtractions.length > 0) {
+      console.warn(
+        `[pipeline] ⚠️  ${permanentlyFailedExtractions.length} permanently_failed extraction(s) — ` +
+        `these sections are MISSING from the report: ` +
+        permanentlyFailedExtractions.map(e => `"${e.chunkLabel}" (${e.sourceFile})`).join(", ")
+      );
+      // Inject disclosure into the report
+      const disclosureLines = permanentlyFailedExtractions.map(
+        e => `  • ${e.chunkLabel} — source: ${e.sourceFile}`
+      );
+      const disclosureSection =
+        `\n\n---\n\n⚠️ **Extraction Gaps — ${permanentlyFailedExtractions.length} section(s) could not be extracted:**\n\n` +
+        disclosureLines.join("\n") +
+        `\n\nThese sections were omitted from the analysis after exhausting all retry attempts. ` +
+        `Content from these source documents is NOT reflected in the findings above.`;
+      fullReport = fullReport + disclosureSection;
+    }
+  } catch (pfErr) {
+    console.warn("[pipeline] Failed to query permanently_failed extractions:", pfErr);
+  }
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
@@ -2032,5 +2080,6 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
     truncatedChunks,
     truncatedMerges,
     firstError,
+    permanentlyFailedExtractions: permanentlyFailedExtractions.length > 0 ? permanentlyFailedExtractions : undefined,
   };
 }

@@ -1,6 +1,7 @@
 import { api, z, postgres, anthropic } from "@superblocksteam/sdk-api";
 import { runPipelineCore } from "./pipeline-core.js";
 import { upsertModuleOutput } from "../modules/upsert-module-output.js";
+import { STALENESS_THRESHOLD_MINUTES, RESUME_JOB_TIME_BUDGET_MS } from "./pipeline-config.js";
 
 // ---------------------------------------------------------------------------
 // Background Pipeline Runner (Safety Net)
@@ -34,10 +35,6 @@ import { upsertModuleOutput } from "../modules/upsert-module-output.js";
 const IC_DILIGENCE_DB = "ba09e2b9-2715-4460-8131-896f50b0c414";
 const ANTHROPIC_ID = "8ccd43c8-5340-4ae2-8eee-7cbb3896df53";
 
-const STALENESS_THRESHOLD_MINUTES = 6;
-// Leave 30s headroom under the 300s platform limit for DB writes after pipeline completes
-const JOB_TIME_BUDGET_MS = 270_000;
-
 const NUMERIC_MODULES_SET = new Set(["contradiction_check", "model_assumptions_stress"]);
 
 const StaleRunSchema = z.object({
@@ -68,7 +65,7 @@ export default api({
 
   async run(ctx) {
     const jobStart = Date.now();
-    const timeRemaining = () => JOB_TIME_BUDGET_MS - (Date.now() - jobStart);
+    const timeRemaining = () => RESUME_JOB_TIME_BUDGET_MS - (Date.now() - jobStart);
 
     // Find all stale runs: status='running' and triggered_at older than threshold
     const staleRuns = await ctx.integrations.db.query(
