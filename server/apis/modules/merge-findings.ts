@@ -322,8 +322,8 @@ export default api({
     moduleId: z.string(),
     batches: z.array(z.string()).min(2).max(4),
     roundLabel: z.string(),
-    isFinalRound: z.boolean().optional(),
-    useOpus: z.boolean().optional(),
+    isFinalRound: z.boolean().nullable().optional(),
+    useOpus: z.boolean().nullable().optional(),
     numericReport: z.object({
       figures: z.array(z.any()),
       discrepancies: z.array(z.any()),

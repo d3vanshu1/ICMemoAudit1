@@ -21,7 +21,7 @@ export default api({
   input: z.object({
     dealId: z.string(),
     query: z.string(),
-    limit: z.number().optional(),
+    limit: z.number().nullable().optional(),
   }),
 
   output: z.object({

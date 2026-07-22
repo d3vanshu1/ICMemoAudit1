@@ -22,9 +22,9 @@ export default api({
     rowRange: z.object({
       start: z.number(),
       end: z.number(),
-    }).optional(),
+    }).nullable().optional(),
     /** If provided, filter to cells whose rowHeaders match this substring */
-    rowLabelSubstring: z.string().optional(),
+    rowLabelSubstring: z.string().nullable().optional(),
   }),
 
   output: z.object({

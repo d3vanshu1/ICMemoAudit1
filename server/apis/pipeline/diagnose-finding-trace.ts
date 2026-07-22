@@ -31,8 +31,8 @@ export default api({
   input: z.object({
     runId: z.string(),
     searchTerm: z.string().describe("Keyword to search for in result_json / merged_json (case-insensitive ILIKE)"),
-    contextChars: z.number().optional().describe("How many chars around the match to return (default 500)"),
-    maxHits: z.number().optional().describe("Max results per category (default 10)"),
+    contextChars: z.number().nullable().optional().describe("How many chars around the match to return (default 500)"),
+    maxHits: z.number().nullable().optional().describe("Max results per category (default 10)"),
   }),
 
   output: z.object({

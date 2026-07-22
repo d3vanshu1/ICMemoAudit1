@@ -32,7 +32,7 @@ export default api({
   input: z.object({
     runId: z.string(),
     dealId: z.string(),
-    moduleId: z.string().optional(),
+    moduleId: z.string().nullable().optional(),
   }),
 
   output: z.object({

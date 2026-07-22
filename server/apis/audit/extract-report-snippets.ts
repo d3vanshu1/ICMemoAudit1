@@ -37,7 +37,7 @@ export default api({
       figures: z.array(z.any()),
       discrepancies: z.array(z.any()),
     }).nullable().optional(),
-    searchTerms: z.array(z.string()).optional(),
+    searchTerms: z.array(z.string()).nullable().optional(),
   }),
 
   output: z.object({

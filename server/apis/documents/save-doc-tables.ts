@@ -7,7 +7,7 @@ const StructuredCellSchema = z.object({
   c: z.number(),
   value: z.union([z.number(), z.string(), z.null()]),
   type: z.enum(["number", "string", "date", "boolean", "empty"]),
-  formula: z.string().optional(),
+  formula: z.string().nullable().optional(),
 });
 
 const TableDataSchema = z.object({

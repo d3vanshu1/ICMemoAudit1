@@ -26,7 +26,7 @@ export default api({
 
   input: z.object({
     dealId: z.string(),
-    staleMinutes: z.number().optional(), // default 30
+    staleMinutes: z.number().nullable().optional(), // default 30
     excludeModuleId: z.string().nullable().optional(), // don't purge the module currently being started
   }),
 

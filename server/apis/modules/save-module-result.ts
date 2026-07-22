@@ -31,7 +31,7 @@ export default api({
     executiveHeader: z.string(),
     findings: z.array(FindingSchema),
     fullReport: z.string(),
-    documentsIncluded: z.array(z.string()).optional(),
+    documentsIncluded: z.array(z.string()).nullable().optional(),
     // When provided, attaches output to this existing run instead of creating a new one.
     // Used by the server-pipeline path where pipeline-core.ts already manages the module_runs row.
     runId: z.string().nullable().optional(),

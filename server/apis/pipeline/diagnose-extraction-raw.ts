@@ -26,8 +26,8 @@ export default api({
   input: z.object({
     dealId: z.string(),
     searchTerm: z.string().describe("Keyword to search in extraction_json (ILIKE)"),
-    contextChars: z.number().optional().describe("Chars to extract around match (default 1000)"),
-    maxHits: z.number().optional(),
+    contextChars: z.number().nullable().optional().describe("Chars to extract around match (default 1000)"),
+    maxHits: z.number().nullable().optional(),
   }),
 
   output: z.object({

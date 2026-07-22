@@ -107,7 +107,7 @@ export default api({
     chunkIndex: z.number(),
     totalChunks: z.number(),
     chunk: ChunkSchema,
-    model: z.string().optional(),
+    model: z.string().nullable().optional(),
   }),
 
   output: z.object({

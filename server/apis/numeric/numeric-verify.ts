@@ -9,11 +9,11 @@ const IC_DILIGENCE_DB = "ba09e2b9-2715-4460-8131-896f50b0c414";
 const StructuredCellSchema = z.object({
   r: z.number(),
   c: z.number(),
-  absR: z.number().optional(),
-  absC: z.number().optional(),
+  absR: z.number().nullable().optional(),
+  absC: z.number().nullable().optional(),
   value: z.union([z.number(), z.string(), z.null()]),
   type: z.enum(["number", "string", "date", "boolean", "empty"]),
-  formula: z.string().optional(),
+  formula: z.string().nullable().optional(),
 });
 
 const TableDataSchema = z.object({
@@ -35,7 +35,7 @@ const FigureSchema = z.object({
   recomputed_value: z.union([z.number(), z.string()]),
   source_doc: z.string(),
   source_cell: z.string(),
-  formula: z.string().optional(),
+  formula: z.string().nullable().optional(),
 });
 
 const DiscrepancySchema = z.object({
@@ -43,10 +43,10 @@ const DiscrepancySchema = z.object({
   severity: z.enum(["critical", "warning", "info"]),
   check_type: z.enum(["subtotal_reconciliation", "sign_consistency", "monotonicity", "cross_doc_agreement"]),
   sources: z.array(z.string()),
-  expected: z.union([z.number(), z.string()]).optional(),
-  actual: z.union([z.number(), z.string()]).optional(),
-  verification_method: z.enum(["formula", "heuristic"]).optional(),
-  diagnostic_range: z.array(z.string()).optional(),
+  expected: z.union([z.number(), z.string()]).nullable().optional(),
+  actual: z.union([z.number(), z.string()]).nullable().optional(),
+  verification_method: z.enum(["formula", "heuristic"]).nullable().optional(),
+  diagnostic_range: z.array(z.string()).nullable().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -56,11 +56,11 @@ const DiscrepancySchema = z.object({
 type Cell = {
   r: number;
   c: number;
-  absR?: number;
-  absC?: number;
+  absR?: number | null;
+  absC?: number | null;
   value: number | string | null;
   type: "number" | "string" | "date" | "boolean" | "empty";
-  formula?: string;
+  formula?: string | null;
 };
 
 type ParsedTable = {

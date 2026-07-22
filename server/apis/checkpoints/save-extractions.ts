@@ -12,7 +12,7 @@ const ExtractionInputSchema = z.object({
     chunkIndex: z.number(),
     sourceFile: z.string(),
     documentTag: z.string(),
-    failed: z.boolean().optional(),
+    failed: z.boolean().nullable().optional(),
   }),
 });
 

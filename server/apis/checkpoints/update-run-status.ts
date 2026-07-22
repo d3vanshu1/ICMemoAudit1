@@ -18,7 +18,7 @@ export default api({
     dealId: z.string(),
     moduleId: z.string(),
     status: z.enum(["pending", "running", "completed", "failed"]),
-    documentsIncluded: z.array(z.string()).optional(),
+    documentsIncluded: z.array(z.string()).nullable().optional(),
   }),
 
   output: z.object({

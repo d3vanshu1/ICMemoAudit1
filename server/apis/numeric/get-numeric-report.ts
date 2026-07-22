@@ -15,7 +15,7 @@ const FigureSchema = z.object({
   recomputed_value: z.union([z.number(), z.string()]),
   source_doc: z.string(),
   source_cell: z.string(),
-  formula: z.string().optional(),
+  formula: z.string().nullable().optional(),
 });
 
 const DiscrepancySchema = z.object({
@@ -23,8 +23,8 @@ const DiscrepancySchema = z.object({
   severity: z.enum(["critical", "warning", "info"]),
   check_type: z.enum(["subtotal_reconciliation", "sign_consistency", "monotonicity", "cross_doc_agreement"]),
   sources: z.array(z.string()),
-  expected: z.union([z.number(), z.string()]).optional(),
-  actual: z.union([z.number(), z.string()]).optional(),
+  expected: z.union([z.number(), z.string()]).nullable().optional(),
+  actual: z.union([z.number(), z.string()]).nullable().optional(),
 });
 
 export default api({

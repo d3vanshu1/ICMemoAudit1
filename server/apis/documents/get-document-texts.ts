@@ -44,7 +44,7 @@ export default api({
   input: z.object({
     dealId: z.string(),
     /** Exclude specific document IDs (e.g. the subject memo(s) chosen at run time). */
-    excludeDocumentIds: z.array(z.string()).optional(),
+    excludeDocumentIds: z.array(z.string()).nullable().optional(),
   }),
 
   output: z.object({

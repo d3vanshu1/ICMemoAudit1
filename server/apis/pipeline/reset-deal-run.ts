@@ -16,8 +16,8 @@ export default api({
 
   input: z.object({
     dealId: z.string(),
-    runId: z.string().optional(),
-    forcePurge: z.boolean().optional(),
+    runId: z.string().nullable().optional(),
+    forcePurge: z.boolean().nullable().optional(),
   }),
 
   output: z.object({

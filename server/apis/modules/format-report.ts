@@ -699,7 +699,7 @@ export default api({
     moduleId: z.string(),
     executiveHeader: z.string(),
     findings: z.array(FindingSchema),
-    useOpus: z.boolean().optional(),
+    useOpus: z.boolean().nullable().optional(),
     coverageLine: z.string().nullable().optional(),
     numericReport: z.object({
       figures: z.array(z.any()),

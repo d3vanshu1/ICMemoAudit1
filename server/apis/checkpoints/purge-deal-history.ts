@@ -19,7 +19,7 @@ export default api({
 
   input: z.object({
     dealId: z.string(),
-    moduleId: z.string().optional(),
+    moduleId: z.string().nullable().optional(),
   }),
 
   output: z.object({
