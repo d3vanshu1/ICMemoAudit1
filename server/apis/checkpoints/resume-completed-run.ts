@@ -34,6 +34,12 @@ export default api({
 
     const previousStatus = rows[0].status;
 
+    // REFUSE cancelled runs — server-authoritative cancellation is permanent.
+    // Use ResurrectModuleRun for deliberate operator overrides only.
+    if (previousStatus === "cancelled") {
+      return { reset: false, previousStatus };
+    }
+
     // Reset to running with fresh triggered_at, null out completed_at
     await ctx.integrations.db.execute(
       `UPDATE module_runs

@@ -176,7 +176,7 @@ export interface PipelineProgress {
 }
 
 export interface PipelineResult {
-  status: "completed" | "in_progress" | "failed";
+  status: "completed" | "in_progress" | "failed" | "cancelled";
   runId: string;
   phase: string;
   progress: PipelineProgress;
@@ -358,24 +358,106 @@ async function formatReportInline(
     return `# ${moduleId.replace(/_/g, " ").replace(/\\b\\w/g, (c: string) => c.toUpperCase())}\n\n## Executive Summary\n\n${executiveHeader}\n\n## Findings\n\nNo findings identified in this analysis.`;
   }
 
-  const perCallTimeout = Math.min(timeRemainingMs - 10_000, 150_000); // Leave 10s for DB writes after
+  const perCallTimeout = Math.min(timeRemainingMs - 10_000, 230_000); // Leave 10s for DB writes; cap at 230s (single shot)
   if (perCallTimeout < 30_000) {
     console.warn(`[pipeline:format] Insufficient time for formatting (${Math.round(timeRemainingMs / 1000)}s remaining) — skipping`);
     return null;
   }
 
-  const findingsJson = JSON.stringify(findings, null, 2);
+  // ---------------------------------------------------------------------------
+  // HYBRID FORMATTER: Mechanical appendix (all findings) + LLM narrative (criticals)
+  // ---------------------------------------------------------------------------
 
-  const systemPrompt = `You are a senior investment committee advisor. Write a detailed markdown report based on the structured findings provided.
+  // Partition findings
+  const criticals = findings.filter(f => f.severity === "critical");
+  const warnings = findings.filter(f => f.severity === "warning");
+  const infos = findings.filter(f => f.severity === "info");
+  const totalCount = findings.length;
+  const criticalCount = criticals.length;
+  const warningCount = warnings.length;
+  const infoCount = infos.length;
+
+  // --- Part 1: Build mechanical appendix (deterministic, no LLM) ---
+  const appendix = buildMechanicalAppendix(findings, criticalCount, warningCount, infoCount);
+
+  // --- Part 2: Build index of all 350 for LLM context (~20KB) ---
+  const findingsIndex = findings.map((f, i) => ({
+    idx: i + 1,
+    title: f.title,
+    severity: f.severity,
+    gap_type: f.gap_type ?? "unclassified",
+  }));
+  const indexJson = JSON.stringify(findingsIndex);
+
+  // --- Part 3: Determine how many criticals fit in the LLM call ---
+  // Target: all 75 criticals in full (~140KB). If that exceeds reasonable token
+  // budget, cut by evidence count (fewer source_docs = weaker evidence = lower priority).
+  // The 200K context window fits ~140KB of findings + ~20KB index + system prompt.
+  // Token estimate: ~4 chars/token. 200K tokens = ~800KB. We have headroom.
+  // Cut threshold: if criticals JSON > 500KB, start trimming.
+  const CRITICAL_JSON_CAP = 500_000;
+  let narratedCriticals = criticals;
+  let criticalsCut = false;
+  let narratedCount = criticals.length;
+
+  const criticalsFull = JSON.stringify(criticals, null, 2);
+  if (criticalsFull.length > CRITICAL_JSON_CAP) {
+    // Sort by evidence count descending — keep the most-evidenced findings
+    const sorted = [...criticals].sort((a, b) => {
+      const aEvidence = (a.source_docs?.length ?? 0) + (a.evidence_docs?.length ?? 0);
+      const bEvidence = (b.source_docs?.length ?? 0) + (b.evidence_docs?.length ?? 0);
+      return bEvidence - aEvidence;
+    });
+    // Binary search for max that fits
+    let lo = 1, hi = sorted.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (JSON.stringify(sorted.slice(0, mid), null, 2).length <= CRITICAL_JSON_CAP) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    narratedCriticals = sorted.slice(0, lo);
+    narratedCount = narratedCriticals.length;
+    criticalsCut = true;
+    console.warn(`[pipeline:format] Critical findings JSON (${criticalsFull.length} chars) exceeds ${CRITICAL_JSON_CAP} cap — cut to ${narratedCount}/${criticals.length} by evidence count`);
+  }
+
+  const criticalsJson = criticalsCut
+    ? JSON.stringify(narratedCriticals, null, 2)
+    : criticalsFull;
+
+  // --- Part 4: LLM call — executive summary + narrative of criticals ---
+  const cutDisclosure = criticalsCut
+    ? `\n\nNOTE: ${criticals.length - narratedCount} critical findings were excluded from narrative treatment due to context length constraints (cut by lowest evidence count). All ${criticals.length} appear in full in the Mechanical Appendix below.`
+    : "";
+
+  const systemPrompt = `You are a senior investment committee advisor writing a diligence report for an institutional audience. No emoji. Tone: direct, precise, analytical.
+
+You will produce:
+1. An executive summary (2-3 paragraphs) synthesizing the overall risk posture
+2. A narrative treatment of each critical finding provided
+
+For each critical finding, write:
+- A markdown heading (####) with the finding title
+- A "Detail" paragraph (the core issue)
+- A "Full Analysis" paragraph (the complete reasoning and evidence chain)
+- "Source Documents" listed
+- A "Recommended Action" specific to this finding
+
+You are also given a complete index of ALL ${totalCount} findings (${criticalCount} critical, ${warningCount} warning, ${infoCount} info) so your executive summary reflects the full picture — not just the criticals you are narrating.
 
 Rules:
-- Every finding must appear as a fully detailed write-up (heading + body). No finding may be omitted.
-- Critical findings: heading with [CRITICAL] tag, detail paragraph, full analysis, source docs, recommended action.
-- Warning findings: heading with [WARNING] tag, detail paragraph, condensed analysis (2-3 sentences), source docs.
-- Info findings: heading with [INFO] tag, single paragraph combining detail and takeaway, source docs.
-- Output ONLY markdown. Start directly with the report content.`;
+- Every critical finding in the input JSON must receive full narrative treatment. No omissions.
+- Do not fabricate findings not in the input.
+- Do not claim findings are absent when they appear in the index.
+- Output ONLY markdown. Start with "## Executive Summary" directly.`;
 
-  const userContent = `## Executive Header\n\n${executiveHeader}\n\n## Findings (${findings.length} total)\n\n${findingsJson}`;
+  const userContent = `## All Findings Index (${totalCount} total: ${criticalCount} critical, ${warningCount} warning, ${infoCount} info)\n\n${indexJson}\n\n## Critical Findings for Narrative Treatment (${narratedCount} findings)\n\n${criticalsJson}`;
+
+  let llmSection: string | null = null;
+  let truncated = false;
 
   try {
     const result = await callAnthropic(
@@ -386,23 +468,182 @@ Rules:
         system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
         messages: [{ role: "user", content: userContent }],
       },
-      "Inline format report",
-      2, // retries
+      "Hybrid format report (criticals narrative)",
+      1, // Single attempt — no wasted retry after 230s
       perCallTimeout,
       pipelineStartTime
     );
 
     const textBlock = result.content.find((c: { type: string }) => c.type === "text");
-    if (!textBlock || textBlock.type !== "text") return null;
-
-    return textBlock.text;
+    if (textBlock && textBlock.type === "text") {
+      llmSection = textBlock.text;
+      if (result.stop_reason === "max_tokens") {
+        truncated = true;
+        console.warn(`[pipeline:format] LLM narrative truncated (stop_reason=max_tokens, ${llmSection.length} chars)`);
+      }
+    }
   } catch (err) {
     const msg = err && typeof err === "object" && "message" in err
       ? String((err as { message: unknown }).message)
       : String(err);
-    console.warn(`[pipeline:format] Inline formatting failed (non-fatal): ${msg}`);
-    return null;
+    console.warn(`[pipeline:format] LLM narrative failed (non-fatal): ${msg}`);
   }
+
+  // --- Part 5: Assemble final report ---
+  const lines: string[] = [];
+
+  // Disclosure header
+  lines.push(`# Diligence Report`);
+  lines.push(``);
+  lines.push(`> **${totalCount} findings total: ${narratedCount} critical narrated below, all ${totalCount} in the appendix.**${criticalsCut ? ` ${criticals.length - narratedCount} criticals excluded from narrative (lowest evidence count).` : ""}`);
+  lines.push(``);
+
+  // Executive header from pipeline
+  if (executiveHeader) {
+    lines.push(`## Deal Context`);
+    lines.push(``);
+    lines.push(executiveHeader);
+    lines.push(``);
+  }
+
+  // LLM narrative section
+  if (llmSection) {
+    lines.push(llmSection);
+    if (truncated) {
+      lines.push(``);
+      lines.push(`---`);
+      lines.push(``);
+      lines.push(`> **Report Truncated**: The narrative section was truncated due to output token limits (${FORMAT_REPORT_MAX_TOKENS} max_tokens, single attempt, ~${Math.round(perCallTimeout / 1000)}s budget). ${criticalCount - narratedCount > 0 ? `${criticalCount - narratedCount} criticals were not narrated.` : "Some critical findings may have incomplete narrative above."} All findings appear in full in the Mechanical Appendix below.`);
+    }
+    if (cutDisclosure) {
+      lines.push(``);
+      lines.push(cutDisclosure);
+    }
+  } else {
+    // LLM failed entirely — report is appendix-only
+    lines.push(`## Executive Summary`);
+    lines.push(``);
+    lines.push(`> LLM narrative generation failed. All ${totalCount} findings are preserved in the Mechanical Appendix below.`);
+    lines.push(``);
+  }
+
+  // Separator
+  lines.push(``);
+  lines.push(`---`);
+  lines.push(``);
+
+  // Mechanical appendix
+  lines.push(appendix);
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Mechanical Appendix Builder (deterministic, zero LLM involvement)
+// ---------------------------------------------------------------------------
+
+/**
+ * Formats ALL findings into deterministic markdown grouped by gap_type then severity.
+ * Fields: title, severity, gap_type, detail, source citations.
+ * Zero omissions. This IS the findings record.
+ */
+function buildMechanicalAppendix(
+  findings: MergedFinding[],
+  criticalCount: number,
+  warningCount: number,
+  infoCount: number
+): string {
+  const lines: string[] = [];
+  lines.push(`## Mechanical Appendix: All ${findings.length} Findings`);
+  lines.push(``);
+  lines.push(`*Deterministic rendering. ${criticalCount} critical, ${warningCount} warning, ${infoCount} info. Grouped by category then severity. Zero LLM involvement.*`);
+  lines.push(``);
+
+  // Group by gap_type
+  const categories = new Map<string, MergedFinding[]>();
+  for (const f of findings) {
+    const cat = f.gap_type ?? "unclassified";
+    if (!categories.has(cat)) categories.set(cat, []);
+    categories.get(cat)!.push(f);
+  }
+
+  // Render order: memo_omission, diligence_gap, unclassified
+  const categoryOrder = ["memo_omission", "diligence_gap", "unclassified"];
+  const sortedCategories = [...categories.entries()].sort((a, b) => {
+    const aIdx = categoryOrder.indexOf(a[0]);
+    const bIdx = categoryOrder.indexOf(b[0]);
+    return (aIdx === -1 ? 99 : aIdx) - (bIdx === -1 ? 99 : bIdx);
+  });
+
+  const severityOrder: Record<string, number> = { critical: 0, warning: 1, info: 2 };
+
+  for (const [category, catFindings] of sortedCategories) {
+    const categoryLabel = category === "memo_omission" ? "Memo Omissions"
+      : category === "diligence_gap" ? "Diligence Gaps"
+      : "Other";
+
+    lines.push(`### ${categoryLabel} (${catFindings.length})`);
+    lines.push(``);
+
+    // Sort by severity within category
+    const sorted = [...catFindings].sort((a, b) => {
+      return (severityOrder[a.severity] ?? 9) - (severityOrder[b.severity] ?? 9);
+    });
+
+    for (const f of sorted) {
+      lines.push(`#### ${f.title}`);
+      lines.push(``);
+      lines.push(`**Severity:** ${f.severity.toUpperCase()} | **Category:** ${category}`);
+      lines.push(``);
+      lines.push(f.detail);
+      lines.push(``);
+      if (f.source_docs && f.source_docs.length > 0) {
+        lines.push(`**Source Documents:** ${f.source_docs.join("; ")}`);
+        lines.push(``);
+      }
+      if (f.evidence_docs && f.evidence_docs.length > 0) {
+        lines.push(`**Evidence Documents:** ${f.evidence_docs.join("; ")}`);
+        lines.push(``);
+      }
+    }
+  }
+
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation Gate
+// ---------------------------------------------------------------------------
+
+/** Lightweight single-row check — returns true if the run has been cancelled. */
+async function checkCancelled(ctx: PipelineContext, runId: string, gate: string): Promise<boolean> {
+  const rows = await ctx.integrations.db.query(
+    `SELECT status FROM module_runs WHERE id = $1 LIMIT 1`,
+    z.object({ status: z.string() }),
+    [runId],
+    { label: `Cancel gate: ${gate}` }
+  );
+  const status = rows[0]?.status;
+  if (status === "cancelled") {
+    console.log(`[pipeline:cancel-gate] Run ${runId} cancelled at gate: ${gate}`);
+    return true;
+  }
+  return false;
+}
+
+/** Build a terminal cancelled result. */
+function cancelledResult(runId: string, gate: string): PipelineResult {
+  return {
+    status: "cancelled",
+    runId,
+    phase: `cancelled_at_${gate}`,
+    progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
+    result: null,
+    failedChunks: 0,
+    truncatedChunks: 0,
+    truncatedMerges: 0,
+    firstError: "Cancelled by user",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -534,7 +775,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     if (status === "failed" || status === "cancelled") {
       // Terminated — don't resurrect. Return the terminal state.
       return {
-        status: "failed",
+        status: status === "cancelled" ? "cancelled" : "failed",
         runId,
         phase: "terminated",
         progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
@@ -592,25 +833,36 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // merge loop). Instead, detect that the final merge node exists + no output saved,
   // and jump straight to formatting with the full time budget available.
   if (runId) {
+    // Fast-path check: fetch the top checkpoint WITHOUT the potentially huge `text`
+    // field. We use jsonb operators to extract only the fields we need for the check,
+    // then reconstruct `text` from findings via buildMergedText() (avoids 4MB gRPC breach).
+    const FastPathCheckSchema = z.object({
+      tree_level: z.coerce.number(),
+      node_index: z.coerce.number(),
+      executive_header: z.string(),
+      findings_json: z.string(), // JSON-encoded findings array
+      is_truncated: z.boolean(),
+      has_error: z.boolean(),
+    });
     const [topCheckpoint] = await ctx.integrations.db.query(
-      `SELECT tree_level, node_index, merged_json
+      `SELECT tree_level, node_index,
+              COALESCE(merged_json->>'executiveHeader', '') AS executive_header,
+              COALESCE(merged_json->'findings', '[]'::jsonb)::text AS findings_json,
+              COALESCE((merged_json->>'truncated')::boolean, false) AS is_truncated,
+              jsonb_exists(merged_json, 'error') AS has_error
        FROM merge_checkpoints
        WHERE module_run_id = $1
        ORDER BY tree_level DESC, node_index ASC
        LIMIT 1`,
-      MergeCheckpointSchema,
+      FastPathCheckSchema,
       [runId],
-      { label: "Fast-path: check for final merge node" }
+      { label: "Fast-path: check for final merge node (lightweight)" }
     );
 
     if (topCheckpoint) {
-      const cpData = typeof topCheckpoint.merged_json === "string"
-        ? JSON.parse(topCheckpoint.merged_json)
-        : topCheckpoint.merged_json;
-
       // Only fast-path if: (a) it's a real success node (not error), (b) it's the
       // sole node at its level (node_index=0 and no siblings), (c) no output saved yet
-      if (!cpData.error && topCheckpoint.node_index === 0) {
+      if (!topCheckpoint.has_error && topCheckpoint.node_index === 0) {
         // Verify it's truly the final node: there should be exactly 1 node at this level
         const [siblingCount] = await ctx.integrations.db.query(
           `SELECT COUNT(*)::int AS cnt FROM merge_checkpoints WHERE module_run_id = $1 AND tree_level = $2`,
@@ -634,11 +886,13 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
             // ✅ Fast-path engaged: final merge node complete, no output yet → format directly
             console.log(`[pipeline:fast-path] Final merge node found at level ${topCheckpoint.tree_level}, skipping to formatting`);
 
+            // Reconstruct findings from the lightweight query (text is rebuilt from findings)
+            const findings = JSON.parse(topCheckpoint.findings_json) as MergedFinding[];
             const finalNode = {
-              text: String(cpData.text ?? ""),
-              executiveHeader: String(cpData.executiveHeader ?? ""),
-              findings: (cpData.findings ?? []) as MergedFinding[],
-              truncated: cpData.truncated === true,
+              text: buildMergedText(topCheckpoint.executive_header, findings),
+              executiveHeader: topCheckpoint.executive_header,
+              findings,
+              truncated: topCheckpoint.is_truncated,
             };
 
             let finalFindings = finalNode.findings;
@@ -665,10 +919,13 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
               }
             }
 
-            // Format report with full time budget
-            const formatBudget = timeRemaining();
+            // Fast-path format budget: derived from PLATFORM cap, not TIME_BUDGET.
+            // The fast-path has no post-format phases (no extraction, no merge remaining) —
+            // only a DB upsert after formatting. PLATFORM_HEADROOM_MS (30s) covers that.
+            const elapsedMs = Date.now() - startTime;
+            const formatBudget = EFFECTIVE_CAP_MS - elapsedMs - PLATFORM_HEADROOM_MS;
             if (formatBudget < FORMAT_REPORT_MIN_BUDGET_MS) {
-              console.warn(`[pipeline:fast-path] Insufficient time even on fast-path (${Math.round(formatBudget / 1000)}s) — returning in_progress`);
+              console.warn(`[pipeline:fast-path] Insufficient time even on fast-path (budget=${Math.round(formatBudget / 1000)}s, elapsed=${Math.round(elapsedMs / 1000)}s) — returning in_progress`);
               return {
                 status: "in_progress",
                 runId,
@@ -682,7 +939,9 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
               };
             }
 
-            console.log(`[pipeline:fast-path] Formatting report (${Math.round(formatBudget / 1000)}s budget, ${finalFindings.length} findings)`);
+            // Sanity telemetry: shows the clamp arithmetic in the wild
+            const perCallTimeoutPreview = Math.min(formatBudget - 10_000, 230_000);
+            console.log(`[pipeline:fast-path] Formatting report — elapsed=${Math.round(elapsedMs / 1000)}s, formatBudget=${Math.round(formatBudget / 1000)}s, perCallTimeout=${Math.round(perCallTimeoutPreview / 1000)}s, findings=${finalFindings.length}`);
             const fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget, startTime);
 
             if (!fullReport) {
@@ -902,6 +1161,9 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     };
   }
 
+  // === CANCEL GATE: post-extraction ===
+  if (await checkCancelled(ctx, runId, "post_extraction")) return cancelledResult(runId, "post_extraction");
+
   // --- Step 0.6: Ensure doc_tables is populated for spreadsheet documents ---
   // Same self-sufficiency pattern as extraction phase. Pure CPU (no LLM calls),
   // completes in seconds. If doc_tables is already populated, this is a no-op.
@@ -959,11 +1221,14 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // --- Step 1: Load universal extractions + route ---
   // Page sizes tuned per table to stay under the 4MB gRPC response limit.
   // Row payload varies significantly: extraction_json ~2-4KB, result_json ~3-6KB,
-  // merged_json ~8-20KB. These are conservative interim heuristics — a production
-  // fix would measure actual payload size and back off dynamically.
+  // merged_json ~8-20KB for intermediate nodes BUT up to 2MB+ for final-round nodes
+  // (which accumulate ALL findings from the full run). Page sizes MUST account for
+  // the worst-case row in each table, not just the average.
   const EXTRACTION_PAGE_SIZE = 200;  // ~2-4KB/row → ~400-800KB/page
   const ANALYSIS_PAGE_SIZE = 150;    // ~3-6KB/row → ~450-900KB/page
-  const MERGE_CP_PAGE_SIZE = 75;     // ~8-20KB/row → ~600KB-1.5MB/page
+  const MERGE_CP_PAGE_SIZE = 20;     // Reduced from 75: final-round nodes can be 200KB-2MB each
+                                       // (381 findings × 3-10KB/finding + mergedText). At 20 rows/page,
+                                       // worst case = ~2-3MB/page, safely under 4MB gRPC limit.
   const allExtractions: Array<{ document_id: string; chunk_index: number; extraction_json: any }> = [];
   let offset = 0;
   while (true) {
@@ -1280,6 +1545,9 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
       { label: "Refresh triggered_at (checkpoint heartbeat)" }
     );
 
+    // === CANCEL GATE: between analysis batches ===
+    if (await checkCancelled(ctx, runId, "analysis_batch")) return cancelledResult(runId, "analysis_batch");
+
     // Post-batch time check
     if (timeRemaining() < 60_000) {
       return returnInProgress("analysis");
@@ -1316,6 +1584,9 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     lines.push(`  TOTAL: ${analyzedSetNow.size}/${routed.length} (${failedChunks} failed this invocation)`);
     console.log(lines.join("\n"));
   }
+
+  // === CANCEL GATE: post-analysis ===
+  if (await checkCancelled(ctx, runId, "post_analysis")) return cancelledResult(runId, "post_analysis");
 
   // --- Step 3: Load all analysis results for merge ---
   // Paginated: result_json holds full chunk analysis text (~3-6KB/row)
@@ -1372,12 +1643,16 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     truncated?: boolean; // true when stop_reason was "max_tokens" — findings may be thin
   }
 
-  // Load existing merge checkpoints (paginated: merged_json is the largest per-row payload, ~8-20KB)
+  // Load existing merge checkpoints (paginated).
+  // CRITICAL: Strip `text` field from merged_json using `- 'text'` to prevent
+  // the final-round node (which accumulates ALL findings → can be >4MB) from
+  // breaching the gRPC 4MB response limit. `text` is reconstructable from
+  // findings via buildMergedText() and is only needed for the final output.
   const mergeCheckpoints: Array<{ tree_level: number; node_index: number; merged_json: any }> = [];
   let mcOffset = 0;
   while (true) {
     const page = await ctx.integrations.db.query(
-      `SELECT tree_level, node_index, merged_json
+      `SELECT tree_level, node_index, (merged_json - 'text') AS merged_json
        FROM merge_checkpoints
        WHERE module_run_id = $1
        ORDER BY tree_level, node_index
@@ -1406,10 +1681,13 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
       errorMessageMap.set(cpKey, String(data.error));
       continue;
     }
+    // `text` is stripped from the query (gRPC 4MB safety) — reconstruct from findings
+    const findings = (data.findings ?? []) as MergedFinding[];
+    const executiveHeader = String(data.executiveHeader ?? "");
     checkpointMap.set(cpKey, {
-      text: String(data.text ?? ""),
-      executiveHeader: String(data.executiveHeader ?? ""),
-      findings: (data.findings ?? []) as MergedFinding[],
+      text: data.text ? String(data.text) : buildMergedText(executiveHeader, findings),
+      executiveHeader,
+      findings,
       truncated: data.truncated === true,
     });
   }
@@ -1530,6 +1808,9 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
   // which would require re-visiting the threshold derivation.
   while (nodes.length > 1) {
     currentRound++;
+
+    // === CANCEL GATE: between merge rounds ===
+    if (await checkCancelled(ctx, runId, "merge_round")) return cancelledResult(runId, "merge_round");
 
     if (timeRemaining() < 60_000) {
       return returnInProgress("merge", currentRound - 1, 0, 0);
@@ -1689,11 +1970,17 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
           groupsDone++;
 
           // Save merge checkpoint
+          // Cap `text` in checkpoint to prevent single-row gRPC breach (4MB limit).
+          // `text` is reconstructable from findings via buildMergedText() on read-back.
+          const MAX_CHECKPOINT_TEXT = 500_000; // ~500KB text cap
+          const cpText = node.text.length > MAX_CHECKPOINT_TEXT
+            ? node.text.slice(0, MAX_CHECKPOINT_TEXT) + "\n[…checkpoint text truncated]"
+            : node.text;
           await ctx.integrations.db.execute(
             `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json, model_used, prompt_version)
              VALUES ($1, $2, $3, $4::jsonb, $5, $6)
              ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb, model_used = $5, prompt_version = $6`,
-            [runId, currentRound, group.idx, JSON.stringify({ text: node.text, executiveHeader: node.executiveHeader, findings: node.findings, truncated: node.truncated ?? false }), getModuleModel(moduleId, useOpus), currentVersion],
+            [runId, currentRound, group.idx, JSON.stringify({ text: cpText, executiveHeader: node.executiveHeader, findings: node.findings, truncated: node.truncated ?? false }), getModuleModel(moduleId, useOpus), currentVersion],
             { label: `Save merge checkpoint R${currentRound}:G${group.idx}` }
           );
         } else {
@@ -1781,6 +2068,9 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
   if (suppressedCount > 0) {
     console.log(`[pipeline] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
   }
+
+  // === CANCEL GATE: pre-absence-verification ===
+  if (await checkCancelled(ctx, runId, "pre_absence_verification")) return cancelledResult(runId, "pre_absence_verification");
 
   // --- Step 5.5: Absence Verification Phase ---
   // For omission_audit / blind_spot_scanner / diligence_completeness, run adversarial
@@ -1877,6 +2167,9 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
   if (independentOverrides > 0) {
     console.log(`[pipeline] Deterministic independent override: corrected ${independentOverrides} finding(s)`);
   }
+
+  // === CANCEL GATE: pre-formatting ===
+  if (await checkCancelled(ctx, runId, "pre_formatting")) return cancelledResult(runId, "pre_formatting");
 
   // --- Step 6: Inline Report Formatting ---
   // Attempt to format the full report server-side so the client doesn't need a separate

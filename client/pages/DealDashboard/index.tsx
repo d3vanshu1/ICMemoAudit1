@@ -162,6 +162,13 @@ export default function DealDashboardPage() {
       setStatuses((prev) => {
         const merged = { ...prev };
         for (const [id, status] of Object.entries(loaded)) {
+          // CRITICAL: DB 'cancelled' status ALWAYS overrides client state.
+          // Cancellation is server-authoritative and must survive reload, other tabs,
+          // and the anti-flicker guard. cancelledRunsRef is UX-only.
+          if (status.latestRun?.status === "cancelled") {
+            merged[id] = status;
+            continue;
+          }
           if (runningModules.has(id) && pipelinePollingActive.current.has(id)) {
             // This module is actively being polled by the pipeline loop — skip DB overwrite.
             // Exception: if DB also says "running", allow the update (keeps run ID in sync).
@@ -179,6 +186,9 @@ export default function DealDashboardPage() {
         .map(([id]) => id);
       if (dbRunningModuleIds.length > 0) {
         setRunningModules((prev) => {
+          // Only create a new Set if there are actually new IDs to add
+          const hasNew = dbRunningModuleIds.some((id) => !prev.has(id));
+          if (!hasNew) return prev; // no-op — preserve reference identity
           const next = new Set(prev);
           dbRunningModuleIds.forEach((id) => next.add(id));
           return next;
@@ -195,7 +205,11 @@ export default function DealDashboardPage() {
         });
       }
     }
-  }, [moduleData, dealId, runningModules]);
+  // NOTE: runningModules intentionally excluded — reading it inside setStatuses
+  // callback. Including it causes infinite loop because setRunningModules below
+  // creates a new Set reference on every call → effect re-fires → infinite depth.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moduleData, dealId]);
 
   // Cached chunks so we only process PDFs once even when multiple modules run
   const chunksCache = useRef<CoverageResult | null>(null);
@@ -1544,6 +1558,12 @@ export default function DealDashboardPage() {
         pipelineResult = pollResult;
       }
 
+      if (pipelineResult.status === "cancelled") {
+        // Server confirmed cancellation — exit cleanly without error toast
+        console.log(`[pipeline] Run ${runId} confirmed cancelled at gate: ${pipelineResult.phase}`);
+        return;
+      }
+
       if (pipelineResult.status === "in_progress") {
         throw new Error("Pipeline timed out after maximum poll attempts");
       }
@@ -1763,9 +1783,9 @@ export default function DealDashboardPage() {
       // Permanently kill — prevent auto-resume from re-triggering
       killedModulesRef.current.add(moduleId);
 
-      // Mark cancelled server-side
+      // Mark cancelled server-side (module-scoped: cancels all running/pending for this module)
       try {
-        await cancelModuleRunApi({ runId });
+        await cancelModuleRunApi({ dealId: dealId ?? undefined, moduleId, runId });
         toast.info(`${MODULE_MAP[moduleId]?.displayName ?? moduleId} cancelled.`);
       } catch (err) {
         console.error("Failed to cancel run in DB:", err);
@@ -1773,7 +1793,8 @@ export default function DealDashboardPage() {
       }
 
       // Clean up local state — update statuses so isRunning flips immediately
-      // (statuses is used by ModuleGrid's isRunning check and the progress poll effect)
+      // DB status of 'cancelled' ALWAYS overrides client state (survives reload).
+      // cancelledRunsRef is UX-only for instant button feedback.
       setStatuses((prev) => {
         const current = prev[moduleId];
         if (!current?.latestRun) return prev;
@@ -1781,7 +1802,7 @@ export default function DealDashboardPage() {
           ...prev,
           [moduleId]: {
             ...current,
-            latestRun: { ...current.latestRun, status: "failed" as const },
+            latestRun: { ...current.latestRun, status: "cancelled" as const },
           },
         };
       });
@@ -1794,7 +1815,7 @@ export default function DealDashboardPage() {
       pipelinePollingActive.current.delete(moduleId);
       delete activeRunIdRef.current[moduleId];
     },
-    [cancelModuleRunApi, clearModuleProgress, statuses]
+    [cancelModuleRunApi, clearModuleProgress, statuses, dealId]
   );
 
   // ---------------------------------------------------------------------------

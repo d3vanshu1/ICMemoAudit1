@@ -44,7 +44,7 @@ export default api({
   }),
 
   output: z.object({
-    status: z.enum(["completed", "in_progress", "failed"]),
+    status: z.enum(["completed", "in_progress", "failed", "cancelled"]),
     runId: z.string(),
     phase: z.string(),
     progress: z.object({
