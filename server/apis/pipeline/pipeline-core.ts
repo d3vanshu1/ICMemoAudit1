@@ -347,28 +347,24 @@ export { truncateMergeNodeText as _truncateMergeNodeText };
  * but this inline Sonnet pass eliminates the client-side timeout risk.
  */
 async function formatReportInline(
-  ctx: PipelineContext,
-  moduleId: string,
+  _ctx: PipelineContext,
+  _moduleId: string,
   executiveHeader: string,
   findings: MergedFinding[],
-  timeRemainingMs: number,
-  pipelineStartTime: number
+  _timeRemainingMs: number,
+  _pipelineStartTime: number
 ): Promise<string | null> {
+  // ---------------------------------------------------------------------------
+  // PURE MECHANICAL RENDERER — zero Anthropic calls.
+  // Signature and budget plumbing preserved for Track 2 (chunked-LLM demo artifact).
+  // Completes in milliseconds; budget machinery is trivially satisfied.
+  // ---------------------------------------------------------------------------
+
   if (findings.length === 0) {
-    return `# ${moduleId.replace(/_/g, " ").replace(/\\b\\w/g, (c: string) => c.toUpperCase())}\n\n## Executive Summary\n\n${executiveHeader}\n\n## Findings\n\nNo findings identified in this analysis.`;
+    return `# Diligence Report\n\n> 0 findings. No analysis output.\n`;
   }
 
-  const perCallTimeout = Math.min(timeRemainingMs - 10_000, 230_000); // Leave 10s for DB writes; cap at 230s (single shot)
-  if (perCallTimeout < 30_000) {
-    console.warn(`[pipeline:format] Insufficient time for formatting (${Math.round(timeRemainingMs / 1000)}s remaining) — skipping`);
-    return null;
-  }
-
-  // ---------------------------------------------------------------------------
-  // HYBRID FORMATTER: Mechanical appendix (all findings) + LLM narrative (criticals)
-  // ---------------------------------------------------------------------------
-
-  // Partition findings
+  // Partition
   const criticals = findings.filter(f => f.severity === "critical");
   const warnings = findings.filter(f => f.severity === "warning");
   const infos = findings.filter(f => f.severity === "info");
@@ -377,128 +373,27 @@ async function formatReportInline(
   const warningCount = warnings.length;
   const infoCount = infos.length;
 
-  // --- Part 1: Build mechanical appendix (deterministic, no LLM) ---
-  const appendix = buildMechanicalAppendix(findings, criticalCount, warningCount, infoCount);
+  // Count by gap_type
+  const memoOmissions = findings.filter(f => f.gap_type === "memo_omission").length;
+  const diligenceGaps = findings.filter(f => f.gap_type === "diligence_gap").length;
+  const otherType = totalCount - memoOmissions - diligenceGaps;
 
-  // --- Part 2: Build index of all 350 for LLM context (~20KB) ---
-  const findingsIndex = findings.map((f, i) => ({
-    idx: i + 1,
-    title: f.title,
-    severity: f.severity,
-    gap_type: f.gap_type ?? "unclassified",
-  }));
-  const indexJson = JSON.stringify(findingsIndex);
-
-  // --- Part 3: Determine how many criticals fit in the LLM call ---
-  // Target: all 75 criticals in full (~140KB). If that exceeds reasonable token
-  // budget, cut by evidence count (fewer source_docs = weaker evidence = lower priority).
-  // The 200K context window fits ~140KB of findings + ~20KB index + system prompt.
-  // Token estimate: ~4 chars/token. 200K tokens = ~800KB. We have headroom.
-  // Cut threshold: if criticals JSON > 500KB, start trimming.
-  const CRITICAL_JSON_CAP = 500_000;
-  let narratedCriticals = criticals;
-  let criticalsCut = false;
-  let narratedCount = criticals.length;
-
-  const criticalsFull = JSON.stringify(criticals, null, 2);
-  if (criticalsFull.length > CRITICAL_JSON_CAP) {
-    // Sort by evidence count descending — keep the most-evidenced findings
-    const sorted = [...criticals].sort((a, b) => {
-      const aEvidence = (a.source_docs?.length ?? 0) + (a.evidence_docs?.length ?? 0);
-      const bEvidence = (b.source_docs?.length ?? 0) + (b.evidence_docs?.length ?? 0);
-      return bEvidence - aEvidence;
-    });
-    // Binary search for max that fits
-    let lo = 1, hi = sorted.length;
-    while (lo < hi) {
-      const mid = Math.ceil((lo + hi) / 2);
-      if (JSON.stringify(sorted.slice(0, mid), null, 2).length <= CRITICAL_JSON_CAP) {
-        lo = mid;
-      } else {
-        hi = mid - 1;
-      }
-    }
-    narratedCriticals = sorted.slice(0, lo);
-    narratedCount = narratedCriticals.length;
-    criticalsCut = true;
-    console.warn(`[pipeline:format] Critical findings JSON (${criticalsFull.length} chars) exceeds ${CRITICAL_JSON_CAP} cap — cut to ${narratedCount}/${criticals.length} by evidence count`);
-  }
-
-  const criticalsJson = criticalsCut
-    ? JSON.stringify(narratedCriticals, null, 2)
-    : criticalsFull;
-
-  // --- Part 4: LLM call — executive summary + narrative of criticals ---
-  const cutDisclosure = criticalsCut
-    ? `\n\nNOTE: ${criticals.length - narratedCount} critical findings were excluded from narrative treatment due to context length constraints (cut by lowest evidence count). All ${criticals.length} appear in full in the Mechanical Appendix below.`
-    : "";
-
-  const systemPrompt = `You are a senior investment committee advisor writing a diligence report for an institutional audience. No emoji. Tone: direct, precise, analytical.
-
-You will produce:
-1. An executive summary (2-3 paragraphs) synthesizing the overall risk posture
-2. A narrative treatment of each critical finding provided
-
-For each critical finding, write:
-- A markdown heading (####) with the finding title
-- A "Detail" paragraph (the core issue)
-- A "Full Analysis" paragraph (the complete reasoning and evidence chain)
-- "Source Documents" listed
-- A "Recommended Action" specific to this finding
-
-You are also given a complete index of ALL ${totalCount} findings (${criticalCount} critical, ${warningCount} warning, ${infoCount} info) so your executive summary reflects the full picture — not just the criticals you are narrating.
-
-Rules:
-- Every critical finding in the input JSON must receive full narrative treatment. No omissions.
-- Do not fabricate findings not in the input.
-- Do not claim findings are absent when they appear in the index.
-- Output ONLY markdown. Start with "## Executive Summary" directly.`;
-
-  const userContent = `## All Findings Index (${totalCount} total: ${criticalCount} critical, ${warningCount} warning, ${infoCount} info)\n\n${indexJson}\n\n## Critical Findings for Narrative Treatment (${narratedCount} findings)\n\n${criticalsJson}`;
-
-  let llmSection: string | null = null;
-  let truncated = false;
-
-  try {
-    const result = await callAnthropic(
-      ctx,
-      {
-        model: FORMAT_REPORT_MODEL,
-        max_tokens: FORMAT_REPORT_MAX_TOKENS,
-        system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
-        messages: [{ role: "user", content: userContent }],
-      },
-      "Hybrid format report (criticals narrative)",
-      1, // Single attempt — no wasted retry after 230s
-      perCallTimeout,
-      pipelineStartTime
-    );
-
-    const textBlock = result.content.find((c: { type: string }) => c.type === "text");
-    if (textBlock && textBlock.type === "text") {
-      llmSection = textBlock.text;
-      if (result.stop_reason === "max_tokens") {
-        truncated = true;
-        console.warn(`[pipeline:format] LLM narrative truncated (stop_reason=max_tokens, ${llmSection.length} chars)`);
-      }
-    }
-  } catch (err) {
-    const msg = err && typeof err === "object" && "message" in err
-      ? String((err as { message: unknown }).message)
-      : String(err);
-    console.warn(`[pipeline:format] LLM narrative failed (non-fatal): ${msg}`);
-  }
-
-  // --- Part 5: Assemble final report ---
   const lines: string[] = [];
 
-  // Disclosure header
+  // =========================================================================
+  // (a) DISCLOSURE HEADER
+  // =========================================================================
   lines.push(`# Diligence Report`);
   lines.push(``);
-  lines.push(`> **${totalCount} findings total: ${narratedCount} critical narrated below, all ${totalCount} in the appendix.**${criticalsCut ? ` ${criticals.length - narratedCount} criticals excluded from narrative (lowest evidence count).` : ""}`);
+  lines.push(`> **${totalCount} findings, mechanically rendered, no LLM synthesis.**`);
+  lines.push(`>`);
+  lines.push(`> Severity: ${criticalCount} critical, ${warningCount} warning, ${infoCount} info.`);
+  lines.push(`> Category: ${memoOmissions} memo\_omission, ${diligenceGaps} diligence\_gap${otherType > 0 ? `, ${otherType} other` : ""}.`);
+  lines.push(`>`);
+  lines.push(`> All detail text reproduced verbatim from pipeline output. Zero paraphrase, zero trimming.`);
   lines.push(``);
 
-  // Executive header from pipeline
+  // Executive header (deal context from pipeline)
   if (executiveHeader) {
     lines.push(`## Deal Context`);
     lines.push(``);
@@ -506,68 +401,51 @@ Rules:
     lines.push(``);
   }
 
-  // LLM narrative section
-  if (llmSection) {
-    lines.push(llmSection);
-    if (truncated) {
-      lines.push(``);
-      lines.push(`---`);
-      lines.push(``);
-      lines.push(`> **Report Truncated**: The narrative section was truncated due to output token limits (${FORMAT_REPORT_MAX_TOKENS} max_tokens, single attempt, ~${Math.round(perCallTimeout / 1000)}s budget). ${criticalCount - narratedCount > 0 ? `${criticalCount - narratedCount} criticals were not narrated.` : "Some critical findings may have incomplete narrative above."} All findings appear in full in the Mechanical Appendix below.`);
-    }
-    if (cutDisclosure) {
-      lines.push(``);
-      lines.push(cutDisclosure);
-    }
-  } else {
-    // LLM failed entirely — report is appendix-only
-    lines.push(`## Executive Summary`);
-    lines.push(``);
-    lines.push(`> LLM narrative generation failed. All ${totalCount} findings are preserved in the Mechanical Appendix below.`);
-    lines.push(``);
+  // =========================================================================
+  // (b) FULL INDEX — title + severity + category for every finding
+  // =========================================================================
+  lines.push(`## Findings Index`);
+  lines.push(``);
+  lines.push(`| # | Severity | Category | Title |`);
+  lines.push(`|---|----------|----------|-------|`);
+
+  // Stable ordering: category → severity → title (deterministic)
+  const indexed = findings.map((f, i) => ({ ...f, _origIdx: i }));
+  const severityRank: Record<string, number> = { critical: 0, warning: 1, info: 2 };
+  const categoryRank: Record<string, number> = { memo_omission: 0, diligence_gap: 1 };
+  indexed.sort((a, b) => {
+    const catA = categoryRank[a.gap_type ?? ""] ?? 9;
+    const catB = categoryRank[b.gap_type ?? ""] ?? 9;
+    if (catA !== catB) return catA - catB;
+    const sevA = severityRank[a.severity] ?? 9;
+    const sevB = severityRank[b.severity] ?? 9;
+    if (sevA !== sevB) return sevA - sevB;
+    return a.title.localeCompare(b.title);
+  });
+
+  for (let i = 0; i < indexed.length; i++) {
+    const f = indexed[i];
+    const cat = f.gap_type ?? "unclassified";
+    // Escape pipes in titles to avoid breaking table rendering
+    const safeTitle = f.title.replace(/\|/g, "\\|");
+    lines.push(`| ${i + 1} | ${f.severity.toUpperCase()} | ${cat} | ${safeTitle} |`);
   }
-
-  // Separator
-  lines.push(``);
-  lines.push(`---`);
   lines.push(``);
 
-  // Mechanical appendix
-  lines.push(appendix);
-
-  return lines.join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// Mechanical Appendix Builder (deterministic, zero LLM involvement)
-// ---------------------------------------------------------------------------
-
-/**
- * Formats ALL findings into deterministic markdown grouped by gap_type then severity.
- * Fields: title, severity, gap_type, detail, source citations.
- * Zero omissions. This IS the findings record.
- */
-function buildMechanicalAppendix(
-  findings: MergedFinding[],
-  criticalCount: number,
-  warningCount: number,
-  infoCount: number
-): string {
-  const lines: string[] = [];
-  lines.push(`## Mechanical Appendix: All ${findings.length} Findings`);
-  lines.push(``);
-  lines.push(`*Deterministic rendering. ${criticalCount} critical, ${warningCount} warning, ${infoCount} info. Grouped by category then severity. Zero LLM involvement.*`);
+  // =========================================================================
+  // (c) FINDINGS — grouped category → severity, verbatim detail, stable anchors
+  // =========================================================================
+  lines.push(`## Findings`);
   lines.push(``);
 
   // Group by gap_type
-  const categories = new Map<string, MergedFinding[]>();
-  for (const f of findings) {
+  const categories = new Map<string, Array<MergedFinding & { _origIdx: number }>>();
+  for (const f of indexed) {
     const cat = f.gap_type ?? "unclassified";
     if (!categories.has(cat)) categories.set(cat, []);
     categories.get(cat)!.push(f);
   }
 
-  // Render order: memo_omission, diligence_gap, unclassified
   const categoryOrder = ["memo_omission", "diligence_gap", "unclassified"];
   const sortedCategories = [...categories.entries()].sort((a, b) => {
     const aIdx = categoryOrder.indexOf(a[0]);
@@ -575,8 +453,7 @@ function buildMechanicalAppendix(
     return (aIdx === -1 ? 99 : aIdx) - (bIdx === -1 ? 99 : bIdx);
   });
 
-  const severityOrder: Record<string, number> = { critical: 0, warning: 1, info: 2 };
-
+  let globalIdx = 0;
   for (const [category, catFindings] of sortedCategories) {
     const categoryLabel = category === "memo_omission" ? "Memo Omissions"
       : category === "diligence_gap" ? "Diligence Gaps"
@@ -585,30 +462,69 @@ function buildMechanicalAppendix(
     lines.push(`### ${categoryLabel} (${catFindings.length})`);
     lines.push(``);
 
-    // Sort by severity within category
-    const sorted = [...catFindings].sort((a, b) => {
-      return (severityOrder[a.severity] ?? 9) - (severityOrder[b.severity] ?? 9);
-    });
-
-    for (const f of sorted) {
+    // Already sorted by severity then title from the index sort
+    for (const f of catFindings) {
+      globalIdx++;
+      // Stable anchor ID: finding-{globalIdx}
+      lines.push(`<a id="finding-${globalIdx}"></a>`);
+      lines.push(``);
       lines.push(`#### ${f.title}`);
       lines.push(``);
-      lines.push(`**Severity:** ${f.severity.toUpperCase()} | **Category:** ${category}`);
+      lines.push(`**Severity:** ${f.severity.toUpperCase()} | **Category:** ${category} | **ID:** finding-${globalIdx}`);
       lines.push(``);
-      lines.push(f.detail);
+
+      // Detail — VERBATIM, no paraphrase, no trimming
+      // Only escape: bare < or > that would create unintended HTML tags
+      const safeDetail = escapeMarkdownBreakers(f.detail);
+      lines.push(safeDetail);
       lines.push(``);
+
+      // Source documents — VERBATIM
       if (f.source_docs && f.source_docs.length > 0) {
-        lines.push(`**Source Documents:** ${f.source_docs.join("; ")}`);
+        lines.push(`**Source Documents:**`);
+        for (const doc of f.source_docs) {
+          lines.push(`- ${doc}`);
+        }
         lines.push(``);
       }
+
+      // Evidence documents — VERBATIM
       if (f.evidence_docs && f.evidence_docs.length > 0) {
-        lines.push(`**Evidence Documents:** ${f.evidence_docs.join("; ")}`);
+        lines.push(`**Evidence Documents:**`);
+        for (const doc of f.evidence_docs) {
+          lines.push(`- ${doc}`);
+        }
         lines.push(``);
       }
+
+      // Claim IDs (if present)
+      if (f.claim_ids && f.claim_ids.length > 0) {
+        lines.push(`**Claim IDs:** ${f.claim_ids.join(", ")}`);
+        lines.push(``);
+      }
+
+      // Separator between findings
+      lines.push(`---`);
+      lines.push(``);
     }
   }
 
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Markdown Escaping — only where raw text would break markdown rendering
+// ---------------------------------------------------------------------------
+
+/**
+ * Escapes characters in verbatim detail text that would break markdown rendering.
+ * Does NOT paraphrase or trim — only prevents structural markdown breakage.
+ */
+function escapeMarkdownBreakers(text: string): string {
+  // Escape bare angle brackets that look like HTML tags (not part of intentional markdown)
+  // but preserve legitimate markdown syntax.
+  // Only escape < when followed by a word char (looks like an HTML tag)
+  return text.replace(/<(?=[a-zA-Z/])/g, "&lt;");
 }
 
 // ---------------------------------------------------------------------------
