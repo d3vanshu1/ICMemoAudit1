@@ -752,17 +752,26 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
       status = currentStatus[0].status;
       isCancelled = currentStatus[0].is_cancelled;
     } catch (err: unknown) {
-      // Discriminate: 42703 = undefined_column (pre-migration-009) → fallback without is_cancelled
-      const errMsg = err instanceof Error ? err.message : String(err);
-      const isUndefinedColumn = errMsg.includes("42703") || errMsg.includes("does not exist");
+      // Dump full error structure — SDK errors strip Postgres detail; we need to
+      // learn where the platform actually hides it for future hardening.
+      const errDetail = (() => {
+        try {
+          return JSON.stringify(err, Object.getOwnPropertyNames(err as object));
+        } catch {
+          return String(err);
+        }
+      })();
+      console.error(`[pipeline:resume-status-check] ERROR for run ${runId}. Full structure: ${errDetail}`);
 
-      if (isUndefinedColumn) {
-        // Column doesn't exist yet — query status only, treat as not-cancelled
+      // Fallback-probe: status-only query references no missing column.
+      // Succeeds → failure was column-related (pre-migration or SDK stripping detail); proceed.
+      // Fails → integration genuinely down; rethrow original.
+      try {
         const fallbackRows = await ctx.integrations.db.query(
           `SELECT status FROM module_runs WHERE id = $1 LIMIT 1`,
           z.object({ status: z.string() }),
           [runId],
-          { label: "Check run status before resume (pre-migration fallback)" }
+          { label: "Check run status before resume (fallback-probe)" }
         );
 
         if (fallbackRows.length === 0) {
@@ -771,16 +780,10 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
         status = fallbackRows[0].status;
         isCancelled = false;
-      } else {
-        // Unexpected error — log loudly but proceed with safe defaults
-        console.error(`[pipeline:resume-status-check] UNEXPECTED ERROR for run ${runId}: ${errMsg}`);
-        // Re-throw "not found" errors; for anything else proceed defensively
-        if (errMsg.includes("not found")) {
-          throw err;
-        }
-        // Proceed: assume running + not cancelled to let normal flow handle it
-        status = "running";
-        isCancelled = false;
+      } catch (fallbackErr: unknown) {
+        // Fallback also failed — integration is genuinely unreachable; rethrow original
+        console.error(`[pipeline:resume-status-check] Fallback-probe ALSO FAILED for run ${runId}. Rethrowing original.`);
+        throw err;
       }
     }
     if (status === "completed") {

@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## Freeze Exception #2 — 2026-07-24
+
+**Cause:** Run `0e4cc96d` invocation 2 hit resume-status-check failure at pipeline-core.ts:738. The catch-level SDK error carried no Postgres detail — string-discrimination (`42703` / `does not exist`) was blind to the actual failure mode. Platform demonstrably strips error structure from integration responses.
+
+**Exhibit (verbatim):** Integration error with no SQLSTATE or column reference — only generic `Integration "ba09e2b9..." failed during "query"`.
+
+**Fix:** Replaced string-matching gate with fallback-probe pattern:
+1. On ANY caught error → dump full error object (`JSON.stringify(err, Object.getOwnPropertyNames(err))`) for future forensics
+2. Attempt status-only fallback: `SELECT status FROM module_runs WHERE id = $1`
+3. Fallback succeeds → proceed with `isCancelled = false` (failure was column-related or transient)
+4. Fallback also fails → rethrow original (integration genuinely down)
+
+**Post-gate queue:** The same string-discrimination pattern exists at ~10 other sites (all fail-soft). Scheduled for wholesale replacement with fallback-probe in hygiene pass, informed by whatever the error-object dump reveals.
+
+**Run status:** `0e4cc96d` NOT touched. Invocation 1's extraction work banked in checkpoints. This resume IS the checkpoint-recovery demonstration.
+
+---
+
 ## Clear Runway Protocol — 2026-07-24
 
 **Executed by:** Clark (consent record: Devanshu, this session)
