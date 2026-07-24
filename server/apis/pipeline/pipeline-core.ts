@@ -189,6 +189,7 @@ export interface PipelineResult {
   failedChunks?: number;
   truncatedChunks?: number; // analysis chunks where stop_reason was "max_tokens"
   truncatedMerges?: number; // merge groups where stop_reason was "max_tokens"
+  mergeGroupsFallenBack?: number; // groups that exhausted retries and used unconsolidated fallback text
   firstError?: string | null;
   /** Chunks that exhausted all extraction attempts and are permanently missing from the report. */
   permanentlyFailedExtractions?: { chunkLabel: string; sourceFile: string; chunkIndex: number }[];
@@ -355,6 +356,7 @@ async function formatReportInline(
   _pipelineStartTime: number,
   housekeepingFindings: MergedFinding[] = [],
   verificationPhaseErrored: boolean = false,
+  mergeGroupsFallenBack: number = 0,
 ): Promise<string | null> {
   // ---------------------------------------------------------------------------
   // PURE MECHANICAL RENDERER — zero Anthropic calls.
@@ -402,6 +404,10 @@ async function formatReportInline(
   if (verificationPhaseErrored) {
     lines.push(`>`);
     lines.push(`> ⚠️ **Absence claims in this report were not adversarially verified (phase error).**`);
+  }
+  if (mergeGroupsFallenBack > 0) {
+    lines.push(`>`);
+    lines.push(`> ⚠️ **${mergeGroupsFallenBack} merge group(s) fell back to unconsolidated text after repeated timeouts.** Findings from those groups are carried forward from sub-analysis but were not synthesized by the merge layer.`);
   }
   lines.push(``);
 
@@ -1469,6 +1475,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   let failedChunks = 0;
   let truncatedChunks = 0;
   let truncatedMerges = 0;
+  let mergeGroupsFallenBack = 0; // groups that exhausted MAX_MERGE_GROUP_FAILURES and used fallback text
   let firstError: string | null = null;
 
   // --- Checklist Coverage Scan (runs once, before analysis) ---
@@ -1935,6 +1942,7 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
       if (priorFailures >= MAX_MERGE_GROUP_FAILURES) {
         const lastError = errorMessageMap.get(cpKey) ?? "unknown";
         console.warn(`[pipeline] Skipping group R${currentRound}:G${group.idx} — ${priorFailures} prior failures (last: ${lastError.slice(0, 120)}), using fallback`);
+        mergeGroupsFallenBack++;
         const memberFindings = group.members.flatMap(m => m.findings ?? []);
         accumulatedFindings.push(...memberFindings);
         const fallback: MergeNode = { text: group.members[0].text, executiveHeader: "Merge skipped (repeated failures)", findings: memberFindings };
@@ -1969,10 +1977,11 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
           const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock + coverageMapBlock + dealProcessContextBlock;
 
           // Dynamic timeout: later rounds have much larger payloads and need more time.
-          // Round 0-1: cap at 120s. Round 2+: cap at 180s (final merge can be very large).
+          // Round 0-1: cap at 165s (raised from 120s — Freeze Exception #3, prompt growth).
+          // Round 2+: cap at 180s (final merge can be very large).
           // Merge calls run in parallel within a batch (MERGE_CONCURRENCY=5),
           // so a batch takes ~maxTimeout wall-clock, not N×maxTimeout.
-          const timeoutCap = currentRound >= 2 ? 180_000 : 120_000;
+          const timeoutCap = currentRound >= 2 ? 180_000 : 165_000;
           const perCallTimeout = Math.min(timeoutCap, Math.max(30_000, timeRemaining() - 30_000));
           console.log(`[pipeline:merge] R${currentRound}:G${group.idx + 1}/${totalGroupsThisRound} — timeout=${Math.round(perCallTimeout / 1000)}s, budget=${Math.round(timeRemaining() / 1000)}s, inputLen=${setBlocks.join("").length}`);
           const mergeResult = await callAnthropic(
@@ -2304,7 +2313,7 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
 
   if (formatBudget >= FORMAT_REPORT_MIN_BUDGET_MS) {
     console.log(`[pipeline] Formatting report inline (${Math.round(formatBudget / 1000)}s budget)`);
-    fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget, startTime, finalHousekeepingFindings, verificationPhaseErrored);
+    fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget, startTime, finalHousekeepingFindings, verificationPhaseErrored, mergeGroupsFallenBack);
   } else {
     console.warn(`[pipeline] Insufficient time for inline formatting (${Math.round(formatBudget / 1000)}s < ${FORMAT_REPORT_MIN_BUDGET_MS / 1000}s needed) — deferring to next invocation`);
     // Return in_progress so the client re-invokes with a fresh time budget
@@ -2498,6 +2507,7 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
     failedChunks,
     truncatedChunks,
     truncatedMerges,
+    mergeGroupsFallenBack: mergeGroupsFallenBack > 0 ? mergeGroupsFallenBack : undefined,
     firstError,
     permanentlyFailedExtractions: permanentlyFailedExtractions.length > 0 ? permanentlyFailedExtractions : undefined,
   };

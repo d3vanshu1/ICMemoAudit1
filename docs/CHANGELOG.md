@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## Freeze Exception #3 — 2026-07-24
+
+**Cause:** Run `0e4cc96d` merge phase — all Round 1 groups timing out at 120s ceiling. Root cause: system prompt growth (+4–5K chars from materiality gate, housekeeping appendix, evidence arrays, numeric trace-back, six-point rubric) accumulated since the prior successful run. Per-call merge input is ~32–36K chars / ~9–10K tokens — within the model's context budget, but the 120s response-time ceiling is too tight given current API latency at that payload size.
+
+**Diagnosis (verbatim errors from `merge_checkpoints`):**
+```
+"LLM call timed out after 120s: Merge R1 G1/94"
+"LLM call timed out after 120s: Merge R1 G2/94"
+"LLM call timed out after 120s: Merge R1 G3/94"
+"LLM call timed out after 120s: Merge R1 G4/94"
+"LLM call timed out after 120s: Merge R1 G5/94"
+```
+5 of 94 planned groups attempted before invocation time-budget expired. All 5 timed out. `failureCount` per group = 1 (well under `MAX_MERGE_GROUP_FAILURES=5`).
+
+**Fix (two parts):**
+1. **Timeout cap bump:** Round 0–1 `timeoutCap` raised from `120_000` → `165_000` ms. Round 2+ remains at `180_000`. The `Math.min(timeoutCap, Math.max(30_000, timeRemaining() - 30_000))` structure is unchanged — only the hard ceiling moves.
+2. **Fallback disclosure:** If any merge group exhausts `MAX_MERGE_GROUP_FAILURES` and falls back to unconsolidated first-member text, the formatted report now carries a visible `⚠️` warning in its disclosure header: "N merge group(s) fell back to unconsolidated text after repeated timeouts." Degraded merges are never silent.
+
+**Expected behavior post-deploy:** On next invocation, the 5 failed groups retry with `perCallTimeout` up to 165s (assuming sufficient time budget). If they complete, the merge proceeds normally. If they still timeout at 165s, the problem is model-side latency (not a tuning issue), and the next move is prompt workload descoping (e.g., split materiality/dedup into a separate lighter pass).
+
+**Run status:** `0e4cc96d` NOT touched. Existing checkpoints (376 analysis + 5 error-only merge) remain intact.
+
+---
+
 ## Freeze Exception #2 — 2026-07-24
 
 **Cause:** Run `0e4cc96d` invocation 2 hit resume-status-check failure at pipeline-core.ts:738. The catch-level SDK error carried no Postgres detail — string-discrimination (`42703` / `does not exist`) was blind to the actual failure mode. Platform demonstrably strips error structure from integration responses.
