@@ -183,7 +183,8 @@ export default function DealDashboardPage() {
       // so the card shows progress state even before the resume logic kicks in
       const dbRunningModuleIds = Object.entries(loaded)
         .filter(([, s]) => s.latestRun?.status === "running")
-        .map(([id]) => id);
+        .map(([id]) => id)
+        .filter((id) => !killedModulesRef.current.has(id));
       if (dbRunningModuleIds.length > 0) {
         setRunningModules((prev) => {
           // Only create a new Set if there are actually new IDs to add
