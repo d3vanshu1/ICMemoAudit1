@@ -734,19 +734,55 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     // Only resume runs that are still in 'running' status.
     // Completed or failed runs must NOT be resurrected — that causes the
     // "zombie run" bug where terminated runs get re-opened.
-    const currentStatus = await ctx.integrations.db.query(
-      `SELECT status, COALESCE(is_cancelled, FALSE) AS is_cancelled FROM module_runs WHERE id = $1 LIMIT 1`,
-      z.object({ status: z.string(), is_cancelled: z.boolean() }),
-      [runId],
-      { label: "Check run status before resume" }
-    );
+    let status: string;
+    let isCancelled: boolean;
 
-    if (currentStatus.length === 0) {
-      throw new Error(`Run ${runId} not found`);
+    try {
+      const currentStatus = await ctx.integrations.db.query(
+        `SELECT status, COALESCE(is_cancelled, FALSE) AS is_cancelled FROM module_runs WHERE id = $1 LIMIT 1`,
+        z.object({ status: z.string(), is_cancelled: z.boolean() }),
+        [runId],
+        { label: "Check run status before resume" }
+      );
+
+      if (currentStatus.length === 0) {
+        throw new Error(`Run ${runId} not found`);
+      }
+
+      status = currentStatus[0].status;
+      isCancelled = currentStatus[0].is_cancelled;
+    } catch (err: unknown) {
+      // Discriminate: 42703 = undefined_column (pre-migration-009) → fallback without is_cancelled
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isUndefinedColumn = errMsg.includes("42703") || errMsg.includes("does not exist");
+
+      if (isUndefinedColumn) {
+        // Column doesn't exist yet — query status only, treat as not-cancelled
+        const fallbackRows = await ctx.integrations.db.query(
+          `SELECT status FROM module_runs WHERE id = $1 LIMIT 1`,
+          z.object({ status: z.string() }),
+          [runId],
+          { label: "Check run status before resume (pre-migration fallback)" }
+        );
+
+        if (fallbackRows.length === 0) {
+          throw new Error(`Run ${runId} not found`);
+        }
+
+        status = fallbackRows[0].status;
+        isCancelled = false;
+      } else {
+        // Unexpected error — log loudly but proceed with safe defaults
+        console.error(`[pipeline:resume-status-check] UNEXPECTED ERROR for run ${runId}: ${errMsg}`);
+        // Re-throw "not found" errors; for anything else proceed defensively
+        if (errMsg.includes("not found")) {
+          throw err;
+        }
+        // Proceed: assume running + not cancelled to let normal flow handle it
+        status = "running";
+        isCancelled = false;
+      }
     }
-
-    const status = currentStatus[0].status;
-    const isCancelled = currentStatus[0].is_cancelled;
     if (status === "completed") {
       // Already done — return immediately with a synthetic completed result
       // so the caller knows not to keep polling.

@@ -157,3 +157,52 @@ All `flags`/`data_points`/`key_claims` = 0 in `universal_extractions`. The extra
 5. **Paper trace row 10 + Fix-1 code quote**
    - "Customer cube never reported" → Fix 2 mechanism documented (Call A alternate terms → retrieval hit → Call B REVISED)
    - Fix-1 snippet-injection code quoted verbatim from `checklist-scan-phase.ts`
+
+---
+
+## Hot-Fix — Line 738 Guard + Site Audit — 2026-07-24
+
+### Incident
+
+`RunModulePipeline` DOA on resume path pre-migration: unguarded `SELECT status, COALESCE(is_cancelled, FALSE) AS is_cancelled` at `pipeline-core.ts:738` throws `column "is_cancelled" does not exist` (Postgres error 42703). The `checkCancelled()` helper (line 598) was properly guarded; this separate status-check on the resume-existing-run path was not wrapped in try/catch.
+
+### Fix Applied
+
+`pipeline-core.ts` line 738 now wrapped in identical pattern:
+- try → COALESCE query (happy path)
+- catch → discriminate 42703 / "does not exist" → fallback `SELECT status` only, `isCancelled = false`
+- other errors → `console.error` loud, proceed with `status = "running"`, `isCancelled = false`
+
+### `is_cancelled` Site Audit — All Server References
+
+Every `is_cancelled` occurrence in `server/` examined. Each site classified as:
+- **Query** = SQL referencing `is_cancelled`
+- **DML** = SQL writing `is_cancelled`
+- **JS** = JavaScript/TypeScript comparison of the value
+- **DDL** = Schema definition (migration)
+
+| # | File | Line(s) | Type | Guard Status |
+|---|------|---------|------|-------------|
+| 1 | `pipeline/pipeline-core.ts` | 598–606 | Query + JS | ✅ try/catch + 42703 discrimination |
+| 2 | `pipeline/pipeline-core.ts` | 738–749 | Query + JS | ✅ **FIXED** — try/catch + 42703 discrimination (this commit) |
+| 3 | `checkpoints/check-run-cancelled.ts` | 30–40 | Query + JS | ✅ try/catch + status-only fallback |
+| 4 | `checkpoints/cancel-module-run.ts` | 65–82 | DML (`SET is_cancelled = TRUE`) | ✅ try/catch + status-only fallback |
+| 5 | `checkpoints/resurrect-module-run.ts` | 55–65 | DML (`SET is_cancelled = FALSE`) | ✅ try/catch + without-column fallback |
+| 6 | `checkpoints/resume-completed-run.ts` | 27–37 | Query + JS | ✅ try/catch + status-only fallback |
+| 7 | `checkpoints/update-run-status.ts` | 35–40 | Query + JS | ✅ try/catch + empty catch (silent proceed) |
+| 8 | `pipeline/reset-module-merge.ts` | 35–43 | Query + JS | ✅ try/catch + status-only fallback |
+| 9 | `modules/get-run-history.ts` | 33–52 | Query (SELECT expr) | ✅ try/catch + `FALSE AS is_cancelled` fallback |
+| 10 | `modules/load-module-results.ts` | 85–98 | Query (template replacement) | ✅ try/catch + template swaps to `FALSE AS` |
+| 11 | `pipeline/run-migration-009.ts` | 38–64 | DDL + introspection | ✅ Safe-by-construction (IS the migration itself) |
+
+**Result: 11 sites total. All 11 guarded (10 explicit try/catch, 1 safe-by-construction). Zero unguarded references remain.**
+
+### Deploy Gate
+
+This commit is deploy-gated pending Devanshu's `RunMigration009` execution:
+- **If 009 succeeds** → guard + audit ride the post-gate hygiene zip; deploy freeze holds.
+- **If 009 fails** → deploy this as pre-run hot-fix (deploy-freeze exception); paste verbatim 009 error here for escalation record.
+
+### Testing Note
+
+The addendum-era "tested both pass" exercised admin APIs against all-zeros UUIDs — it never exercised the resume path a real client invocation takes. Line 738 escaped because no integration test runs `RunModulePipeline` against a pre-existing run_id in a database missing `is_cancelled`. The staged cancel acceptance test now includes a pre-migration-state clause only if 009 fails; otherwise this class of gap dies with the migration.
