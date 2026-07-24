@@ -211,6 +211,7 @@ export function formatCoverageMapForPrompt(scan: ChecklistScanResult): string {
   ];
 
   // First: categories with evidence (prevents false "missing" claims)
+  // Fix 1: Include verbatim source snippets so the merge layer can anchor findings
   const covered = scan.categories.filter(c => c.status === "covered");
   if (covered.length > 0) {
     lines.push("### CONFIRMED PRESENT in the deal room (DO NOT flag as missing):");
@@ -218,6 +219,13 @@ export function formatCoverageMapForPrompt(scan: ChecklistScanResult): string {
     for (const cat of covered) {
       const docs = [...new Set(cat.hits.map(h => h.fileName))];
       lines.push(`- **${cat.categoryLabel}** — found in: ${docs.join(", ")} (${cat.totalHits} matching chunks)`);
+      // Include top 3 verbatim snippets as anchoring evidence
+      const topHits = cat.hits.slice(0, 3);
+      for (const hit of topHits) {
+        if (hit.snippet) {
+          lines.push(`  > [${hit.fileName}, chunk ${hit.chunkIndex}]: "${hit.snippet}"`);
+        }
+      }
     }
     lines.push("");
   }

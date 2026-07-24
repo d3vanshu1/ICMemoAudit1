@@ -23,6 +23,13 @@ const ExtractionSchema = z.object({
   chunkIndex: z.number(),
 });
 
+const EvidenceItemSchema = z.object({
+  figure: z.string(),
+  source_doc: z.string(),
+  verbatim_snippet: z.string(),
+  verified: z.boolean(),
+});
+
 const FindingSchema = z.object({
   severity: z.enum(["critical", "warning", "info"]),
   title: z.string(),
@@ -31,9 +38,13 @@ const FindingSchema = z.object({
   source_docs: z.array(z.string()),
   claim_ids: z.array(z.string()).optional(),
   absence_confidence: z.enum(["verified_absent", "likely_absent", "unverified"]).optional(),
-  gap_type: z.enum(["diligence_gap", "memo_omission"]).optional(),
+  gap_type: z.enum(["diligence_gap", "memo_omission", "open_item_acknowledged"]).optional(),
   evidence_docs: z.array(z.string()).optional(),
   independent: z.boolean().optional(),
+  evidence: z.array(EvidenceItemSchema).optional(),
+  materiality_rationale: z.string().optional(),
+  category: z.enum(["principal_finding", "housekeeping", "human_review_flag"]).optional(),
+  numeric_unverified: z.boolean().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -59,6 +70,25 @@ are injected when available. Any arithmetic claim not sourced from NumericVerify
 If you see numeric findings in the input extractions that appear to be ad-hoc arithmetic,
 DISCARD them — do not propagate or consolidate them into your output.
 
+## MATERIALITY GATE — IC-Chair Standard
+
+Apply this test to EVERY finding before including it in principal output:
+
+"Would this plausibly change an IC member's assessment of a £655m transaction, or is it a standard DD-workstream, post-close housekeeping, or process-stage item?"
+
+**Principal findings** (category = "principal_finding"): Items that meet the materiality threshold. Target envelope: single digits to low teens of findings. These appear in the main findings output.
+
+**Housekeeping items** (category = "housekeeping"): Sub-threshold items that are factually correct but immaterial to the IC decision. These include:
+- Standard DD workstream tracking items
+- Post-close administrative tasks
+- Process-stage confirmations
+- Minor procedural observations
+These are DEMOTED, not deleted. They appear in a separate housekeeping appendix section (after principal findings).
+
+**Human review flags** (category = "human_review_flag"): Emphasis-judgment findings that failed the six-point rubric. These are opinions ("underweighted", "de-emphasised") not facts.
+
+Every finding MUST include a "materiality_rationale" field — one sentence justifying its IC relevance. A finding without a clear materiality rationale is automatically demoted to housekeeping.
+
 ## Output Structure
 
 You MUST respond with these XML tags exactly:
@@ -68,7 +98,7 @@ You MUST respond with these XML tags exactly:
 </executive_header>
 
 <findings_json>
-A JSON array. Each object has:
+A JSON array of PRINCIPAL findings only (category = "principal_finding"). Each object has:
 - "severity": "critical" | "warning" | "info"
 - "title": short title, 5-10 words
 - "detail": 2-3 sentences with specific document references
@@ -79,7 +109,66 @@ A JSON array. Each object has:
 - "gap_type": (REQUIRED for omission/gap findings) "diligence_gap" | "memo_omission". Use "memo_omission" when the information IS present in evidence/reference documents but absent from the subject memo. Use "diligence_gap" when the information is absent from BOTH the subject memo AND all evidence documents. Omit for non-omission findings.
 - "evidence_docs": (REQUIRED when gap_type = "memo_omission") array of filenames of the evidence documents where the information WAS found. Omit when gap_type = "diligence_gap".
 - "independent": (REQUIRED when gap_type = "memo_omission") boolean. Set to false when ALL evidence_docs are prior IC memos (document_tag = ic_memo) — meaning the corroboration comes only from the team's own prior work, not from independent third-party sources. Set to true when at least one evidence_doc is NOT an ic_memo (e.g. financial model, CIM, customer data, contract). This flag helps the IC distinguish findings backed by outside evidence from those merely restating prior internal positions.
+- "evidence": array of evidence trace objects. REQUIRED for any finding that cites a specific number or quantitative claim. Each object: {"figure": "the number cited", "source_doc": "filename", "verbatim_snippet": "exact text from source containing this figure", "verified": true/false}. A figure with verified=false means it could not be traced to source text and is labeled numeric_unverified.
+- "materiality_rationale": (REQUIRED for all findings) One sentence explaining why this finding would plausibly change an IC member's assessment of a £655m transaction. Sub-threshold items are demoted to housekeeping.
+- "category": "principal_finding" | "housekeeping" | "human_review_flag". Default is "principal_finding". Use "housekeeping" for sub-materiality items (standard DD workstreams, post-close admin, process-stage items). Use "human_review_flag" for emphasis-judgment findings that failed the six-point rubric.
+- "numeric_unverified": boolean. Set to true when the finding's core quantitative claim could NOT be traced to verbatim source text (e.g., chart-derived or vision-inferred figures). Such findings MUST be severity "info" maximum.
+- "gap_type": (REQUIRED for omission/gap findings) "diligence_gap" | "memo_omission" | "open_item_acknowledged". Use "open_item_acknowledged" when the deal record itself discloses the item as open/pending (e.g., results TBD, workstream staged post-IC). This is distinct from omission — the record acknowledges the gap.
 </findings_json>
+
+<housekeeping_appendix>
+A JSON array of sub-materiality findings (category = "housekeeping"). Same schema as findings_json.
+These are factually correct observations that do NOT meet the IC-chair materiality threshold.
+Include them here rather than deleting — they serve as a completeness record.
+Also include any "human_review_flag" items here (emphasis-judgment findings demoted by the rubric).
+</housekeeping_appendix>
+
+## SEMANTIC DEDUPLICATION — Same-Issue Consolidation
+
+Before outputting findings, perform a final normalization pass:
+
+1. **Cluster by issue identity, not title string**: Two findings describe the same underlying issue if they reference the same factual gap, the same document deficiency, or the same risk — regardless of how the title is worded.
+2. **Merge duplicates**: When multiple findings describe the same underlying issue, consolidate into ONE finding with:
+   - The highest severity from the cluster
+   - Combined source_docs from all duplicates
+   - Combined evidence arrays
+   - The most complete full_analysis
+3. **Known dedup targets** (from corpus analysis):
+   - Tax-documentation findings appearing verbatim multiple times → consolidate to one
+   - Stale-legal-DD and no-reliance findings that describe the same issue from different angles → consolidate
+   - Multi-way clusters around the same contractual feature (e.g., dealer buyout mechanics) → consolidate to one finding with full evidence
+4. **Size guideline**: The DiagMergeFunnel shows collapse stops at level 3 (95 leaves → 6 nodes). Target output should be single digits to low teens of principal findings. If you have >15 principal findings, you likely have unresolved duplicates.
+
+## ADVERSARIAL NUMERIC TRACE-BACK — Mandatory Pre-Output Pass
+
+Before finalizing findings, execute this numeric verification pass on EVERY drafted finding that contains a specific number:
+
+1. **Identify all numeric claims**: For each finding, extract every specific figure (percentages, currency amounts, ratios, counts).
+2. **Source retrieval**: For each figure, search the input extraction sets for a verbatim text snippet containing that exact number. The snippet must come from a named source document.
+3. **Match verification**: The figure in the finding must EXACTLY match the figure in the source snippet. Transpositions (e.g., 49% cited as 94%), rounding artifacts, and cross-document arithmetic are ALL failures.
+4. **Label unverifiable figures**: Any figure that cannot be matched to verbatim source text — including chart-derived values, vision-inferred numbers, or AI-computed aggregates — MUST be:
+   - Labeled with "numeric_unverified": true on the finding
+   - Capped at severity "info"
+   - Flagged in the evidence array with verified=false
+5. **Populate evidence array**: For EVERY numeric finding, produce an evidence object per figure: {"figure": "the number", "source_doc": "filename", "verbatim_snippet": "exact surrounding text", "verified": true/false}.
+
+Known failure patterns to catch:
+- NPS transposition: citing segment scores in wrong order or transposed digits
+- Revenue fabrication: asserting decline when P&L actually shows growth (e.g., claiming £250m→£194m when actuals are £144.8m→£168.2m→£192.5m)
+- Coupon mismatch: confusing 12% vs 14% preference coupon rates across instruments
+
+## RETRIEVAL VERIFICATION GATE — Mandatory Pre-Output Check (Six-Point Rubric)
+
+Before emitting ANY finding, apply ALL six checks. A finding that fails ANY check is DEMOTED to severity "info" with category "human_review_flag" or DROPPED entirely:
+
+1. **Quote-anchored**: The finding cites a verbatim quote or specific numeric figure from a named source document. Paraphrased or inferred claims without direct textual evidence FAIL.
+2. **Fact-of-process, not emphasis-judgment**: The finding states an objective factual gap or contradiction — NOT a subjective judgment about emphasis, tone, or weighting. Phrases like "underweighted", "de-emphasised", "insufficiently discussed", "should have been highlighted more" are emphasis-judgments and FAIL. Demote to human_review_flag.
+3. **Two-sided verified**: For any absence/omission claim, the opposite has been checked — the analyst searched for the topic under alternate terminology and across all document sets. A claim with no verification trail FAILS.
+4. **Numbers traced**: Every specific number in the finding matches a verbatim figure in the source text. A number that cannot be traced to exact source text is labeled numeric_unverified. Findings whose core claim depends on an unverified number FAIL.
+5. **Post-IC staging respected**: If the deal's own DD/adviser table explicitly stages a workstream as "post IC" or "kick off post IC", that topic is classified as open_item_acknowledged, NEVER as an omission or gap. A finding that flags explicitly staged work as missing FAILS.
+6. **IC-chair materiality**: The finding would plausibly change an IC member's assessment of the transaction. Standard housekeeping, process-stage items, and minor administrative matters are below threshold — demote to housekeeping appendix.
+
+Findings that contain emphasis-judgment language ("underweighted", "de-emphasised", "insufficiently stressed", "could have been more prominent") MUST be demoted to category "human_review_flag" with severity "info" — they represent editorial opinion, not factual findings.
 
 {{FINDINGS_REQUIREMENT}}`;
 
@@ -334,6 +423,7 @@ export default api({
   output: z.object({
     executiveHeader: z.string(),
     findings: z.array(FindingSchema),
+    housekeepingFindings: z.array(FindingSchema).optional(),
     mergedText: z.string(),
   }),
 
@@ -470,43 +560,73 @@ No deterministic numeric verification was performed for this analysis. All figur
       full_analysis: string;
       source_docs: string[];
       claim_ids?: string[];
+      absence_confidence?: string;
+      gap_type?: "diligence_gap" | "memo_omission" | "open_item_acknowledged";
+      evidence_docs?: string[];
+      independent?: boolean;
+      evidence?: Array<{ figure: string; source_doc: string; verbatim_snippet: string; verified: boolean }>;
+      materiality_rationale?: string;
+      category?: string;
+      numeric_unverified?: boolean;
     }> = [];
 
     if (findingsRaw) {
       try {
         const parsed = JSON.parse(findingsRaw);
         if (Array.isArray(parsed)) {
-          findings = parsed.map((f: Record<string, unknown>) => ({
-            severity:
-              f.severity === "critical" ||
-              f.severity === "warning" ||
-              f.severity === "info"
-                ? f.severity
-                : "info",
-            title: String(f.title ?? "Untitled"),
-            detail: String(f.detail ?? ""),
-            full_analysis: String(f.full_analysis ?? f.detail ?? ""),
-            source_docs: Array.isArray(f.source_docs)
-              ? f.source_docs.map(String)
-              : [],
-            ...(Array.isArray(f.claim_ids) && f.claim_ids.length > 0
-              ? { claim_ids: f.claim_ids.map(String) }
+          findings = parsed.map((f: Record<string, unknown>) => {
+            // Enforce: numeric_unverified findings capped at info
+            const rawSeverity = f.severity === "critical" || f.severity === "warning" || f.severity === "info"
+              ? f.severity : "info";
+            const isNumericUnverified = f.numeric_unverified === true;
+            const severity = isNumericUnverified && rawSeverity !== "info" ? "info" as const : rawSeverity;
+
+            return {
+              severity,
+              title: String(f.title ?? "Untitled"),
+              detail: String(f.detail ?? ""),
+              full_analysis: String(f.full_analysis ?? f.detail ?? ""),
+              source_docs: Array.isArray(f.source_docs)
+                ? f.source_docs.map(String)
+                : [],
+              ...(Array.isArray(f.claim_ids) && f.claim_ids.length > 0
+                ? { claim_ids: f.claim_ids.map(String) }
+                : {}),
+              ...(f.absence_confidence === "verified_absent" ||
+                f.absence_confidence === "likely_absent" ||
+                f.absence_confidence === "unverified"
+                ? { absence_confidence: f.absence_confidence as string }
+                : {}),
+            ...(f.gap_type === "diligence_gap" || f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged"
+              ? { gap_type: f.gap_type as "diligence_gap" | "memo_omission" | "open_item_acknowledged" }
               : {}),
-            ...(f.absence_confidence === "verified_absent" ||
-              f.absence_confidence === "likely_absent" ||
-              f.absence_confidence === "unverified"
-              ? { absence_confidence: f.absence_confidence as string }
-              : {}),
-            ...(f.gap_type === "diligence_gap" || f.gap_type === "memo_omission"
-              ? { gap_type: f.gap_type as string }
-              : {}),
-            ...(Array.isArray(f.evidence_docs) && f.evidence_docs.length > 0
-              ? { evidence_docs: f.evidence_docs.map(String) }
-              : {}),
-            ...(typeof f.independent === "boolean"
-              ? { independent: f.independent }
-              : {}),
-          }));
+              ...(Array.isArray(f.evidence_docs) && f.evidence_docs.length > 0
+                ? { evidence_docs: f.evidence_docs.map(String) }
+                : {}),
+              ...(typeof f.independent === "boolean"
+                ? { independent: f.independent }
+                : {}),
+              // Fix 3: evidence trace array
+              ...(Array.isArray(f.evidence)
+                ? { evidence: (f.evidence as Array<Record<string, unknown>>).map(e => ({
+                    figure: String(e.figure ?? ""),
+                    source_doc: String(e.source_doc ?? ""),
+                    verbatim_snippet: String(e.verbatim_snippet ?? ""),
+                    verified: e.verified === true,
+                  })) }
+                : {}),
+              // Fix 4: materiality rationale
+              ...(typeof f.materiality_rationale === "string" && f.materiality_rationale
+                ? { materiality_rationale: f.materiality_rationale }
+                : {}),
+              // Fix 4/cross-cutting: category classification
+              ...(f.category === "principal_finding" || f.category === "housekeeping" || f.category === "human_review_flag"
+                ? { category: f.category as string }
+                : {}),
+              // Fix 3: numeric_unverified flag
+              ...(isNumericUnverified ? { numeric_unverified: true } : {}),
+            };
+          });
         }
       } catch {
         findings = [
@@ -521,11 +641,37 @@ No deterministic numeric verification was performed for this analysis. All figur
       }
     }
 
+    // Fix 6: Parse housekeeping appendix (sub-materiality + human_review_flag items)
+    const housekeepingRaw = extractTag(output, "housekeeping_appendix");
+    let housekeepingFindings: typeof findings = [];
+    if (housekeepingRaw) {
+      try {
+        const parsed = JSON.parse(housekeepingRaw);
+        if (Array.isArray(parsed)) {
+          housekeepingFindings = parsed.map((f: Record<string, unknown>) => ({
+            severity: f.severity === "critical" || f.severity === "warning" || f.severity === "info"
+              ? f.severity : "info" as const,
+            title: String(f.title ?? "Untitled"),
+            detail: String(f.detail ?? ""),
+            full_analysis: String(f.full_analysis ?? f.detail ?? ""),
+            source_docs: Array.isArray(f.source_docs) ? f.source_docs.map(String) : [],
+            ...(typeof f.materiality_rationale === "string" ? { materiality_rationale: f.materiality_rationale } : {}),
+            ...(f.category === "housekeeping" || f.category === "human_review_flag"
+              ? { category: f.category as string }
+              : { category: "housekeeping" as const }),
+          }));
+        }
+      } catch {
+        // Non-fatal: housekeeping parse failure doesn't break the pipeline
+        console.warn("[merge] Failed to parse housekeeping_appendix JSON");
+      }
+    }
+
     // Build a merged text representation for the next round of tree-reduce.
     // Uses the shared buildMergedText() so checkpoint-resumed merges produce
     // byte-identical output.
     const mergedText = buildMergedText(executiveHeader, findings);
 
-    return JSON.parse(JSON.stringify({ executiveHeader, findings, mergedText }));
+    return JSON.parse(JSON.stringify({ executiveHeader, findings, housekeepingFindings: housekeepingFindings.length > 0 ? housekeepingFindings : undefined, mergedText }));
   },
 });

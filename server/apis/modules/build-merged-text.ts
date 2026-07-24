@@ -17,8 +17,9 @@ export interface MergedFinding {
   claim_ids?: string[];
   absence_confidence?: string;
   /** Omission classification: diligence_gap = absent from subject AND evidence;
-   *  memo_omission = present in evidence but absent from subject memo */
-  gap_type?: "diligence_gap" | "memo_omission";
+   *  memo_omission = present in evidence but absent from subject memo;
+   *  open_item_acknowledged = record itself discloses item as open/pending */
+  gap_type?: "diligence_gap" | "memo_omission" | "open_item_acknowledged";
   /** Which evidence documents contain the information (for memo_omission findings) */
   evidence_docs?: string[];
   /** false when evidence comes solely from prior IC memos (team-authored, not independent third-party).

@@ -1362,6 +1362,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // that prevents sub-agents AND the merge layer from fabricating absence claims.
   const CHECKLIST_MODULES = new Set(["omission_audit", "blind_spot_scanner", "diligence_completeness"]);
   let coverageMapBlock = "";
+  let dealProcessContextBlock = "";
   if (CHECKLIST_MODULES.has(moduleId)) {
     try {
       const scanResult = await runChecklistScan(ctx, dealId, input.subjectDocumentIds ?? []);
@@ -1369,6 +1370,43 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
       console.log(`[pipeline] Checklist scan complete: ${scanResult.coveredCount} covered, ${scanResult.notFoundCount} not found (${scanResult.scanDurationMs}ms, ${scanResult.totalQueries} queries)`);
     } catch (scanErr) {
       console.warn("[pipeline] Checklist scan failed (non-fatal, proceeding without coverage map):", scanErr);
+    }
+
+    // Fix 5: Extract deal-process context (DD/adviser table with post-IC staging)
+    // Search for workstreams explicitly staged "post IC" or "kick off post IC" in the deal documents.
+    // These are ground truth: work the record stages post-IC is open_item_acknowledged, never an omission.
+    try {
+      const processRows = await ctx.integrations.db.query(
+        `SELECT dc.file_name, dc.chunk_text
+         FROM document_chunks dc
+         JOIN deal_documents dd ON dd.id = dc.document_id
+         WHERE dd.deal_id = $1
+           AND dc.chunk_text_search @@ to_tsquery('english', 'adviser | advisor | workstream | "kick off" | "post IC" | "due diligence" & provider')
+         ORDER BY ts_rank_cd(dc.chunk_text_search, to_tsquery('english', 'adviser | advisor | workstream | "kick off" | "post IC"')) DESC
+         LIMIT 5`,
+        z.object({ file_name: z.string(), chunk_text: z.string() }),
+        [dealId],
+        { label: "Fix 5: Extract DD/adviser table context" }
+      );
+      if (processRows.length > 0) {
+        const contextLines = [
+          "\n\n## DEAL-PROCESS CONTEXT — Staged Workstreams (Ground Truth)",
+          "",
+          "The following excerpts from the deal's own documents describe workstreams explicitly",
+          "staged for post-IC or post-close completion. These are OPEN ITEMS by design, NOT omissions.",
+          "Any finding that flags an item listed here as 'missing' or 'absent' MUST be reclassified",
+          "as gap_type = 'open_item_acknowledged' — the record itself discloses these as pending.",
+          "",
+        ];
+        for (const row of processRows) {
+          contextLines.push(`### From: ${row.file_name}`);
+          contextLines.push(`> ${row.chunk_text.slice(0, 500)}`);
+          contextLines.push("");
+        }
+        dealProcessContextBlock = contextLines.join("\n");
+      }
+    } catch (processErr) {
+      console.warn("[pipeline] Deal-process context extraction failed (non-fatal):", processErr);
     }
   }
 
@@ -1811,7 +1849,7 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
       const results = await Promise.allSettled(
         batch.map(async (group) => {
           const setBlocks = group.members.map((m, i) => `## Analysis Set ${i + 1}\n\n${truncateMergeNodeText(m.text, MERGE_NODE_TEXT_CAP)}`);
-          const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock + coverageMapBlock;
+          const mergeInput = setBlocks.join("\n\n---\n\n") + numericBlock + coverageMapBlock + dealProcessContextBlock;
 
           // Dynamic timeout: later rounds have much larger payloads and need more time.
           // Round 0-1: cap at 120s. Round 2+: cap at 180s (final merge can be very large).

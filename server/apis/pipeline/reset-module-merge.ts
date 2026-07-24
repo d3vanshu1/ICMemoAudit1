@@ -58,7 +58,7 @@ export default api({
         mergeCheckpointsDeleted: 0,
         outputsDeleted: 0,
         runReset: false,
-        currentStatus: `${currentStatus} (cancelled — pass override:true to force)`,
+        currentStatus: `${currentStatus} (cancelled — use ResurrectModuleRun to revive a cancelled run, or pass override:true to force)`,
         analysisRowsFound: 0,
       };
     }

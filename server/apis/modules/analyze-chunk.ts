@@ -109,6 +109,7 @@ Before flagging ANYTHING as "missing", "absent", "not addressed", "not found", o
 5. **Classify your finding**:
    - "not_found_in_this_chunk" — you looked, it's not here, but could be elsewhere (use this by default)
    - "verified_absent" — the document structure strongly implies this information SHOULD be here (e.g., a financial model with no revenue assumptions) AND you tried all alternate phrasings
+   - "open_item_acknowledged" — the document ITSELF discloses this as an open item, pending workstream, or "results TBD". This is NOT an omission — the record explicitly acknowledges the gap. Examples: "kick off post IC", "results to be determined", "workstream to complete post-close". Do NOT flag these as missing — they are intentionally staged.
 
 In the flags array, EVERY gap/omission flag MUST include a "verification" key (string) that states:
 - The search terms you tried (at least 3)
