@@ -271,6 +271,10 @@ export default function DealDashboardPage() {
   const killedModulesRef = useRef<Set<string>>(new Set());
   // Track consecutive resume failures per module — kill after threshold
   const resumeFailureCountRef = useRef<Record<string, number>>({});
+  // Last-known checkpoint count per module — used to detect server progress
+  // despite client-side fetch timeouts. If checkpoints advance between resume
+  // attempts, the server is working and we should NOT count the timeout as a failure.
+  const lastKnownCheckpointsRef = useRef<Record<string, number>>({});
   // Consecutive progress poll failures (persists across effect re-runs)
   const pollFailureCountRef = useRef(0);
 
@@ -1558,6 +1562,13 @@ export default function DealDashboardPage() {
 
         if (!pollResult) throw new Error("Pipeline continuation returned no result");
         pipelineResult = pollResult;
+
+        // Track checkpoint progress so the resume-failure handler knows if the server advanced
+        if (pipelineResult.progress) {
+          const prog = pipelineResult.progress;
+          const total = (prog.analysisCompleted ?? 0) + (prog.mergeRound ?? 0);
+          if (total > 0) lastKnownCheckpointsRef.current[moduleId] = total;
+        }
       }
 
       if (pipelineResult.status === "cancelled") {
@@ -1623,7 +1634,7 @@ export default function DealDashboardPage() {
 
       toast.success(`${displayName} complete!`);
     },
-    [dealId, useOpus, selectedSubjectIds, numericVerifyApi, runModulePipelineApi, generateReport, saveModuleResult, setModuleProgress]
+    [dealId, useOpus, selectedSubjectIds, numericVerifyApi, runModulePipelineApi, getRunProgressApi, generateReport, saveModuleResult, setModuleProgress]
   );
 
   // ---------------------------------------------------------------------------
@@ -1705,19 +1716,49 @@ export default function DealDashboardPage() {
         const isTimeoutOrNetwork = /timeout|timed out|abort|cancel|failed to fetch|network/i.test(message);
         const displayName = MODULE_MAP[moduleId]?.displayName ?? moduleId;
 
-        if (resumeRunId && isTimeoutOrNetwork) {
-          // Track consecutive resume failures for this module
+        if (resumeRunId && isTimeoutOrNetwork && dealId) {
+          // Before counting as a failure, check if the server actually made progress
+          // (wrote new checkpoints). If it did, the server is working — the fetch just
+          // timed out at the platform's 300s limit. Reset the counter and let heartbeat retry.
+          let serverMadeProgress = false;
+          try {
+            const progress = await getRunProgressApi({ dealId });
+            const runs = progress?.runs ?? [];
+            const run = runs.find((r: { moduleId: string }) => r.moduleId === moduleId);
+            if (run) {
+              const currentCheckpoints = (run.analysisCheckpointCount ?? 0) + (run.mergeCheckpointCount ?? 0);
+              const lastKnown = lastKnownCheckpointsRef.current[moduleId] ?? 0;
+              if (currentCheckpoints > lastKnown) {
+                serverMadeProgress = true;
+                lastKnownCheckpointsRef.current[moduleId] = currentCheckpoints;
+              }
+            }
+          } catch {
+            // GetRunProgress failed too — can't determine progress, fall through to failure logic
+          }
+
+          if (serverMadeProgress) {
+            // Server IS working (checkpoints advanced) — reset failure counter, let heartbeat retry
+            resumeFailureCountRef.current[moduleId] = 0;
+            console.log(`[handleRunModule] ${moduleId}: fetch timed out but server made progress (checkpoints advanced) — will retry`);
+            toast.info(`[${displayName}] Server pipeline is making progress. Reconnecting…`);
+            pipelinePollingActive.current.delete(moduleId);
+            exitedEarlyForResume = true;
+            return;
+          }
+
+          // Server did NOT advance — count as a genuine failure
           const count = (resumeFailureCountRef.current[moduleId] ?? 0) + 1;
           resumeFailureCountRef.current[moduleId] = count;
 
-          if (count >= 2) {
-            // Two consecutive resume failures — server is unreachable, kill the module
-            console.warn(`[handleRunModule] ${moduleId}: ${count} consecutive resume failures — killing`);
+          if (count >= 3) {
+            // Three consecutive failures with no checkpoint progress — server genuinely stalled
+            console.warn(`[handleRunModule] ${moduleId}: ${count} consecutive resume failures with no progress — killing`);
             killedModulesRef.current.add(moduleId);
-            toast.error(`[${displayName}] Server unreachable after ${count} attempts — stopped. Refresh to retry.`);
+            toast.error(`[${displayName}] Server stalled after ${count} attempts with no progress — stopped. Refresh to retry.`);
             // Fall through to finally block cleanup (exitedEarlyForResume stays false)
           } else {
-            // First failure — give it one more chance
+            // Not yet at kill threshold — give it another chance
             toast.info(`[${displayName}] Connection to server pipeline timed out. The analysis continues server-side — progress will update automatically.`);
             pipelinePollingActive.current.delete(moduleId);
             exitedEarlyForResume = true;
