@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## Clear Runway Protocol — 2026-07-24
+
+**Executed by:** Clark (consent record: Devanshu, this session)
+
+### Evidence Preserved
+- `docs/evidence/262-run-report-32087fa4.md` — 233,334-char report from completed run `72a682bd` (module: omission_audit, 262 findings)
+- DiagMergeFunnel baseline verified in CHANGELOG: 826 → 434 → 350 → 350 → 350
+
+### Purge Results (SCG deal `c46b4129`)
+
+| Table | Rows Deleted |
+|-------|-------------|
+| `universal_extractions` | 381 |
+| `pipeline_analysis` | 792 |
+| `doc_tables` | 39 |
+| `module_outputs` | 1 |
+| `merge_checkpoints` | 256 |
+| `module_runs` | 3 |
+
+**Tables untouched:** `documents`, `parsed_text`, `parsed_text_backups`, `document_tag`, `sub_agent_prompts`, deal record.
+
+### Invocation 1 Timing Expectation
+
+> **By design, the first pipeline invocation post-purge will be the longest.**
+> - `doc_tables` regeneration (Step 0.6): 30–90 seconds
+> - First extraction pass follows immediately: ~200–260 seconds total for invocation 1
+> - Subsequent invocations will not incur `doc_tables` cost (data persists once generated)
+> - This is expected behaviour, not a stall.
+
+---
+
 ## Fixes Zip — 2026-07-24
 
 ### Gate Item (RunMigration008)
