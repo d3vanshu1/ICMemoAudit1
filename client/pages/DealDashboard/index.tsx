@@ -1751,12 +1751,64 @@ export default function DealDashboardPage() {
           const count = (resumeFailureCountRef.current[moduleId] ?? 0) + 1;
           resumeFailureCountRef.current[moduleId] = count;
 
-          if (count >= 3) {
-            // Three consecutive failures with no checkpoint progress — server genuinely stalled
-            console.warn(`[handleRunModule] ${moduleId}: ${count} consecutive resume failures with no progress — killing`);
-            killedModulesRef.current.add(moduleId);
-            toast.error(`[${displayName}] Server stalled after ${count} attempts with no progress — stopped. Refresh to retry.`);
-            // Fall through to finally block cleanup (exitedEarlyForResume stays false)
+          if (count >= 5) {
+            // Five consecutive failures with no checkpoint progress — enter backoff-and-retry
+            // (Freeze Exception #4): instead of permanently killing, wait 2 minutes and try
+            // one last resume. ResumeStalePipelines is idempotent and safe to call speculatively.
+            console.warn(`[handleRunModule] ${moduleId}: ${count} consecutive resume failures with no progress — entering 2-min backoff`);
+            toast.warning(`[${displayName}] Server appears stalled after ${count} attempts with no progress. Waiting 2 minutes before final retry…`);
+            pipelinePollingActive.current.delete(moduleId);
+            exitedEarlyForResume = true;
+
+            // Fire-and-forget: backoff then one last attempt
+            setTimeout(async () => {
+              try {
+                // Check progress one more time after the 2-min wait
+                let progressAfterWait = false;
+                try {
+                  const progress = await getRunProgressApi({ dealId: dealId! });
+                  const runs = progress?.runs ?? [];
+                  const run = runs.find((r: { moduleId: string }) => r.moduleId === moduleId);
+                  if (run) {
+                    const currentCp = (run.analysisCheckpointCount ?? 0) + (run.mergeCheckpointCount ?? 0);
+                    const lastKnown = lastKnownCheckpointsRef.current[moduleId] ?? 0;
+                    if (currentCp > lastKnown) {
+                      progressAfterWait = true;
+                      lastKnownCheckpointsRef.current[moduleId] = currentCp;
+                    }
+                  }
+                } catch { /* ignore */ }
+
+                if (progressAfterWait) {
+                  // Server recovered during backoff — reset and let heartbeat continue
+                  resumeFailureCountRef.current[moduleId] = 0;
+                  console.log(`[handleRunModule] ${moduleId}: progress detected during backoff — recovered`);
+                  toast.success(`[${MODULE_MAP[moduleId]?.displayName ?? moduleId}] Server recovered — resuming.`);
+                  return;
+                }
+
+                // No progress during backoff — attempt one final resume
+                console.log(`[handleRunModule] ${moduleId}: backoff complete, attempting final resume`);
+                resumeFailureCountRef.current[moduleId] = 0; // Reset for the last attempt
+                await handleRunModule(moduleId, resumeRunId);
+
+                // If handleRunModule returned without throw, it's either running or heartbeat handles it
+              } catch (backoffErr) {
+                // Final attempt also failed — now permanently kill
+                console.error(`[handleRunModule] ${moduleId}: post-backoff resume also failed — permanently killing`, backoffErr);
+                killedModulesRef.current.add(moduleId);
+                toast.error(`[${MODULE_MAP[moduleId]?.displayName ?? moduleId}] Server stalled after backoff retry — stopped. Refresh to retry.`);
+                setRunningModules((prev) => {
+                  const next = new Set(prev);
+                  next.delete(moduleId);
+                  return next;
+                });
+                clearModuleProgress(moduleId);
+                pipelinePollingActive.current.delete(moduleId);
+              }
+            }, 120_000); // 2-minute backoff
+
+            return;
           } else {
             // Not yet at kill threshold — give it another chance
             toast.info(`[${displayName}] Connection to server pipeline timed out. The analysis continues server-side — progress will update automatically.`);
@@ -1798,6 +1850,7 @@ export default function DealDashboardPage() {
       runServerPipeline,
       runExecutiveSummary,
       clearModuleProgress,
+      getRunProgressApi,
     ]
   );
 

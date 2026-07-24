@@ -90,6 +90,20 @@ export async function callLLMWithHeadroom(
       );
     }
 
+    // Budget-aware retry guard (Freeze Exception #4):
+    // For retry attempts (not the first), require enough headroom for a FULL attempt
+    // at maxPerCallTimeout. A clamped retry with insufficient headroom almost certainly
+    // times out again, wasting seconds before the platform kill hits.
+    if (attempt > 1 && remainingHeadroom < maxPerCallTimeout) {
+      const priorErrors = attemptErrors.length > 0
+        ? ` | prior_errors: [${attemptErrors.join("; ")}]`
+        : "";
+      throw new HeadroomExhaustedError(
+        remainingHeadroom,
+        `${label} — insufficient headroom for retry (attempt ${attempt}/${retries}, need ${Math.round(maxPerCallTimeout / 1000)}s, have ${Math.round(remainingHeadroom / 1000)}s)${priorErrors}`
+      );
+    }
+
     // Clamp per-call timeout to remaining headroom (minus 5s buffer for post-call work)
     const callTimeout = Math.min(maxPerCallTimeout, remainingHeadroom - 5_000);
 

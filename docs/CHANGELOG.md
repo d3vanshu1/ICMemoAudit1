@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## Freeze Exception #4 — 2026-07-24
+
+**Cause:** Pre-existing architectural gap surfaced by golden run `0e4cc96d`. Two related failure modes:
+
+1. **Budget-blind retries in merge path:** When a merge LLM call times out (e.g., at 165s in Round 1), `callLLMWithHeadroom` would attempt a retry with only ~30–50s of headroom remaining. That retry could never complete at the required budget — it would either timeout again or get killed by the platform's 300s hard cap, which the client then misinterprets as a network error.
+
+2. **Permanent kill trap in client poll loop:** After 3 consecutive resume-failures with no checkpoint progress, the client permanently added the module to `killedModulesRef` — no recovery possible without a full page refresh. For a 30+ minute merge phase with 10+ invocations, network-level timeouts at the 300s platform kill boundary are EXPECTED, not exceptional.
+
+**Fix (two parts):**
+
+### Part 1: Budget-aware retries (`server/apis/pipeline/call-llm.ts`)
+- Added guard on retry attempts (attempt > 1): if `remainingHeadroom < maxPerCallTimeout`, throw `HeadroomExhaustedError` immediately rather than starting a clamped retry that cannot complete.
+- First attempt still uses the existing `minBudget` check (give it a shot even with reduced budget).
+- Retries (attempt 2+) require enough headroom for a full call at `maxPerCallTimeout` ceiling.
+- This prevents the pattern: call times out → retry starts with insufficient time → that retry also times out → platform kills the HTTP response → client sees "network error" for what was actually a server-side budget problem.
+
+### Part 2: Backoff-and-retry client recovery (`client/pages/DealDashboard/index.tsx`)
+- Threshold raised from 3 → 5 consecutive no-progress failures before escalation.
+- At threshold: instead of permanent kill, enters 2-minute backoff period with user notification.
+- After backoff: checks progress one more time (server may have recovered during the wait).
+- If progress detected during backoff → reset counter, let heartbeat continue normally.
+- If no progress → attempts one final `handleRunModule` resume (ResumeStalePipelines is idempotent).
+- Only permanently kills if the post-backoff resume also fails with no progress.
+- Net effect: tab self-recovers from transient platform-boundary timeout storms without manual refresh.
+
+**Diagnosis:** This is a genuine pre-existing gap the golden run surfaced — not scar tissue from tonight's changes. The 300s platform kill is an immovable constraint; the retry logic and client recovery were designed for shorter calls where 3 failures genuinely means "stalled." With merge groups that legitimately take 120–165s per call, the boundary between "server is working" and "fetch timed out" is razor-thin.
+
+**Run status:** `0e4cc96d` NOT touched. Run continues at 42/94 Round 1 merge groups complete.
+
+---
+
 ## Freeze Exception #3 — 2026-07-24
 
 **Cause:** Run `0e4cc96d` merge phase — all Round 1 groups timing out at 120s ceiling. Root cause: system prompt growth (+4–5K chars from materiality gate, housekeeping appendix, evidence arrays, numeric trace-back, six-point rubric) accumulated since the prior successful run. Per-call merge input is ~32–36K chars / ~9–10K tokens — within the model's context budget, but the 120s response-time ceiling is too tight given current API latency at that payload size.
