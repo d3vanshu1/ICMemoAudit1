@@ -33,7 +33,7 @@ export default api({
     }
 
     const { status: previousStatus, deal_id, module_id } = rows[0];
-    if (previousStatus !== "failed" && previousStatus !== "cancelled") {
+    if (previousStatus !== "failed") {
       // Only resurrect terminated runs — don't touch running or completed
       return { resurrected: false, previousStatus };
     }
@@ -52,13 +52,25 @@ export default api({
       return { resurrected: false, previousStatus };
     }
 
-    await ctx.integrations.db.execute(
-      `UPDATE module_runs
-       SET status = 'running'::module_status, completed_at = NULL, triggered_at = now()
-       WHERE id = $1`,
-      [runId],
-      { label: `Resurrect run ${runId} (was ${previousStatus})` }
-    );
+    // Clear is_cancelled flag (if it exists) + reset to running
+    try {
+      await ctx.integrations.db.execute(
+        `UPDATE module_runs
+         SET status = 'running'::module_status, is_cancelled = FALSE, completed_at = NULL, triggered_at = now()
+         WHERE id = $1`,
+        [runId],
+        { label: `Resurrect run ${runId} (was ${previousStatus}, clear is_cancelled)` }
+      );
+    } catch {
+      // Pre-migration fallback: is_cancelled column doesn't exist yet
+      await ctx.integrations.db.execute(
+        `UPDATE module_runs
+         SET status = 'running'::module_status, completed_at = NULL, triggered_at = now()
+         WHERE id = $1`,
+        [runId],
+        { label: `Resurrect run ${runId} (was ${previousStatus})` }
+      );
+    }
 
     return { resurrected: true, previousStatus };
   },

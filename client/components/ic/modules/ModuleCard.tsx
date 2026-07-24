@@ -164,9 +164,12 @@ export default function ModuleCard({
           </div>
         )}
 
-        {/* Idle state — no run yet */}
+        {/* Idle state — no run yet, or cancelled/failed */}
         {!isComplete && !isRunning && (
           <div>
+            {status?.latestRun?.isCancelled && (
+              <p className="text-[10px] text-ic-coral/80 font-light mb-1.5">Last run was cancelled</p>
+            )}
             <ICButton size="sm" onClick={onRun} disabled={disabled}>
               <Play className="w-3.5 h-3.5" />
               Run Analysis

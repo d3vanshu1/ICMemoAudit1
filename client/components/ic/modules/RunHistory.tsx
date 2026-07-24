@@ -38,8 +38,8 @@ export default function RunHistory({
                 </div>
               </div>
               <div className="flex items-center gap-2">
-                <ICBadge variant={run.status === "completed" ? "success" : run.status === "cancelled" ? "warning" : "default"}>
-                  {run.status === "cancelled" ? "Cancelled" : run.status}
+                <ICBadge variant={run.status === "completed" ? "success" : run.isCancelled ? "warning" : "default"}>
+                  {run.isCancelled ? "Cancelled" : run.status}
                 </ICBadge>
                 {run.findings_count != null && (
                   <span className="text-xs text-ic-muted">

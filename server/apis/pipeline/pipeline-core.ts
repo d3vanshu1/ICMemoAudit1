@@ -533,16 +533,22 @@ function escapeMarkdownBreakers(text: string): string {
 
 /** Lightweight single-row check — returns true if the run has been cancelled. */
 async function checkCancelled(ctx: PipelineContext, runId: string, gate: string): Promise<boolean> {
-  const rows = await ctx.integrations.db.query(
-    `SELECT status FROM module_runs WHERE id = $1 LIMIT 1`,
-    z.object({ status: z.string() }),
-    [runId],
-    { label: `Cancel gate: ${gate}` }
-  );
-  const status = rows[0]?.status;
-  if (status === "cancelled") {
-    console.log(`[pipeline:cancel-gate] Run ${runId} cancelled at gate: ${gate}`);
-    return true;
+  // Check is_cancelled boolean (post-migration-009) with fallback to status check
+  try {
+    const rows = await ctx.integrations.db.query(
+      `SELECT COALESCE(is_cancelled, FALSE) AS is_cancelled FROM module_runs WHERE id = $1 LIMIT 1`,
+      z.object({ is_cancelled: z.boolean() }),
+      [runId],
+      { label: `Cancel gate: ${gate}` }
+    );
+    if (rows[0]?.is_cancelled) {
+      console.log(`[pipeline:cancel-gate] Run ${runId} cancelled at gate: ${gate}`);
+      return true;
+    }
+  } catch {
+    // Pre-migration fallback: column doesn't exist, check status='failed' + cancelled semantics
+    // In pre-migration state, cancellation sets status='failed' — indistinguishable server-side.
+    // Client-side killedModulesRef is the real guard. This gate is a belt-and-suspenders check.
   }
   return false;
 }
@@ -661,8 +667,8 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     // Completed or failed runs must NOT be resurrected — that causes the
     // "zombie run" bug where terminated runs get re-opened.
     const currentStatus = await ctx.integrations.db.query(
-      `SELECT status FROM module_runs WHERE id = $1 LIMIT 1`,
-      z.object({ status: z.string() }),
+      `SELECT status, COALESCE(is_cancelled, FALSE) AS is_cancelled FROM module_runs WHERE id = $1 LIMIT 1`,
+      z.object({ status: z.string(), is_cancelled: z.boolean() }),
       [runId],
       { label: "Check run status before resume" }
     );
@@ -672,6 +678,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     }
 
     const status = currentStatus[0].status;
+    const isCancelled = currentStatus[0].is_cancelled;
     if (status === "completed") {
       // Already done — return immediately with a synthetic completed result
       // so the caller knows not to keep polling.
@@ -688,10 +695,10 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
       };
     }
 
-    if (status === "failed" || status === "cancelled") {
+    if (status === "failed" || isCancelled) {
       // Terminated — don't resurrect. Return the terminal state.
       return {
-        status: status === "cancelled" ? "cancelled" : "failed",
+        status: isCancelled ? "cancelled" : "failed",
         runId,
         phase: "terminated",
         progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },

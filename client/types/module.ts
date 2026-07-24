@@ -2,7 +2,8 @@ export interface ModuleRun {
   id: string;
   deal_id: string;
   module_id: string;
-  status: "pending" | "running" | "completed" | "failed" | "cancelled";
+  status: "pending" | "running" | "completed" | "failed";
+  isCancelled?: boolean;
   triggered_at: string;
   completed_at: string | null;
   documents_included: string[];

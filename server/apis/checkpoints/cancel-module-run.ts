@@ -5,12 +5,14 @@
  *   1. Primary: dealId + moduleId — cancels ALL running/pending rows for that module
  *   2. Alternate: runId alone — cancels a specific run (backward compat)
  *
- * Sets status = 'cancelled'::module_status with completed_at = now().
+ * Sets status = 'failed' + is_cancelled = TRUE + completed_at = now().
  * Returns the list of affected run IDs.
  *
- * Post-migration-008: uses the real 'cancelled' enum value. If the enum ALTER
- * hasn't been run yet, the cast will fail and we fall back to 'failed' + a
- * first_error marker (legacy behavior preserved).
+ * Boolean approach: uses `is_cancelled` column (Migration 009) to distinguish
+ * user-initiated cancellation from pipeline failure. No enum dependency.
+ * If the column doesn't exist yet (pre-migration), falls back to just
+ * setting status = 'failed' (legacy behavior preserved, functionally safe
+ * because client-side killedModulesRef prevents auto-resume regardless).
  */
 import { api, z, postgres } from "@superblocksteam/sdk-api";
 
@@ -37,13 +39,13 @@ export default api({
   output: z.object({
     cancelled: z.boolean(),
     affectedRunIds: z.array(z.string()),
-    usedEnum: z.boolean().describe("True if 'cancelled' enum value was used; false if fell back to 'failed'"),
+    usedBoolean: z.boolean().describe("True if is_cancelled column was set; false if pre-migration fallback"),
   }),
 
   async run(ctx, { dealId, moduleId, runId }) {
     // Validate input: must provide either (dealId + moduleId) or runId
     if (!runId && (!dealId || !moduleId)) {
-      return { cancelled: false, affectedRunIds: [], usedEnum: false };
+      return { cancelled: false, affectedRunIds: [], usedBoolean: false };
     }
 
     // Build the WHERE clause based on input mode
@@ -60,24 +62,24 @@ export default api({
       params = [runId!];
     }
 
-    // Attempt with real 'cancelled' enum
+    // Attempt with is_cancelled boolean (post-migration-009)
     try {
       const affected = await ctx.integrations.db.query(
         `UPDATE module_runs
-         SET status = 'cancelled'::module_status, completed_at = now()
+         SET status = 'failed'::module_status, is_cancelled = TRUE, completed_at = now()
          WHERE ${whereClause}
          RETURNING id`,
         AffectedRowSchema,
         params,
-        { label: `Cancel runs: ${dealId ? `${moduleId}@${dealId.slice(0, 8)}` : runId?.slice(0, 8)}` }
+        { label: `Cancel runs (boolean): ${dealId ? `${moduleId}@${dealId.slice(0, 8)}` : runId?.slice(0, 8)}` }
       );
 
       const ids = affected.map(r => r.id);
-      console.log(`[CancelModuleRun] Cancelled ${ids.length} run(s) with 'cancelled' enum: ${ids.join(", ")}`);
-      return { cancelled: ids.length > 0, affectedRunIds: ids, usedEnum: true };
-    } catch (enumErr: unknown) {
-      // Enum value doesn't exist yet — fall back to 'failed' with marker
-      console.warn(`[CancelModuleRun] 'cancelled' enum cast failed, using 'failed' fallback`);
+      console.log(`[CancelModuleRun] Cancelled ${ids.length} run(s) with is_cancelled=TRUE: ${ids.join(", ")}`);
+      return { cancelled: ids.length > 0, affectedRunIds: ids, usedBoolean: true };
+    } catch (colErr: unknown) {
+      // Column doesn't exist yet (pre-migration-009) — fall back to status='failed' only
+      console.warn(`[CancelModuleRun] is_cancelled column not found, using status-only fallback`);
 
       const affected = await ctx.integrations.db.query(
         `UPDATE module_runs
@@ -86,11 +88,11 @@ export default api({
          RETURNING id`,
         AffectedRowSchema,
         params,
-        { label: `Cancel (fallback to failed): ${dealId ? `${moduleId}@${dealId.slice(0, 8)}` : runId?.slice(0, 8)}` }
+        { label: `Cancel (pre-migration fallback): ${dealId ? `${moduleId}@${dealId.slice(0, 8)}` : runId?.slice(0, 8)}` }
       );
 
       const ids = affected.map(r => r.id);
-      return { cancelled: ids.length > 0, affectedRunIds: ids, usedEnum: false };
+      return { cancelled: ids.length > 0, affectedRunIds: ids, usedBoolean: false };
     }
   },
 });
