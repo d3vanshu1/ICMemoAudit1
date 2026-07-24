@@ -31,7 +31,7 @@ const ChunkSchema = z.object({
 // ---------------------------------------------------------------------------
 // Sub-Agent Prompts — one per module
 // ---------------------------------------------------------------------------
-const DENSE_SUFFIX = `
+export const DENSE_SUFFIX = `
 
 ## Output Rules
 

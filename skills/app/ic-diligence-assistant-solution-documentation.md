@@ -158,6 +158,24 @@ Chunks → UniversalExtract → WebResearch API (iterative search loop)
   → FormatReport → SaveModuleResult
 ```
 
+### 3.2.1 Cancel Gates & Latency Deviation
+
+The server-side pipeline checks for cancellation at 6 discrete gates:
+
+| Gate | Location (pipeline-core.ts) | Max latency before detection |
+|------|----------------------------|------------------------------|
+| `post_extraction` | Line 1094 | One extraction invocation (~up to 600s worst case, typically <120s) |
+| `between_analysis_batches` | Line 1477 | One analysis batch (~30-60s) |
+| `post_analysis` | Line 1517 | Instantaneous (no work between prev gate) |
+| `merge_round` | Line 1741 | One merge round (~30-60s per group) |
+| `pre_absence_verification` | Line 2001 | Instantaneous |
+| `pre_formatting` | Line 2100 | One absence verification pass (~120s) |
+
+**Extraction-latency deviation (accepted):** The `post_extraction` gate is the first cancel check. If a cancel is issued while extraction is running, the pipeline will not detect it until extraction either completes or returns `in_progress` (budget exhausted). Worst-case latency: **one full invocation** (~600s cap, but typically much shorter because extraction is internally time-budgeted and returns `in_progress` when budget runs low). This is accepted because:
+1. Extraction is purely additive (cached) — no harm in completing an extraction pass
+2. The client-side `killedModulesRef` prevents the next invocation from being triggered
+3. Adding an intra-extraction gate would complicate the extraction phase for marginal benefit
+
 ### 3.3 Client-Side Processing
 
 **File:** `client/lib/pdfProcessor.ts`
