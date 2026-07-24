@@ -20,6 +20,20 @@ Integration "ba09e2b9-2715-4460-8131-896f50b0c414" failed during "execute"
 #### Fix 1 — Coverage-Map Snippet Anchoring
 `checklist-scan-phase.ts` → `formatCoverageMapForPrompt` now includes top-3 verbatim source snippets (300-char `snippet` field already captured) for each "covered" category. The merge layer receives actual quoted text, not just filename/count metadata.
 
+**Code (verbatim, lines 214–226 of `checklist-scan-phase.ts`):**
+```typescript
+  // Fix 1: Include verbatim source snippets so the merge layer can anchor findings
+  // against actual extracted text rather than just category counts.
+  ...
+      // Include top 3 verbatim snippets as anchoring evidence
+      const topHits = cat.hits.slice(0, 3);
+      for (const hit of topHits) {
+        if (hit.snippet) {
+          lines.push(`  > [${hit.fileName}, chunk ${hit.chunkIndex}]: "${hit.snippet}"`);
+        }
+      }
+```
+
 #### Fix 2 — Retrieval Verification Gate (Six-Point Rubric)
 Added to `MERGE_OUTPUT_STRUCTURE` in `merge-findings.ts`. Every finding must pass all six checks:
 1. Quote-anchored
@@ -81,6 +95,7 @@ Findings failing any check → demoted to `human_review_flag` (severity info) or
 | Tax-documentation finding appearing 3× verbatim (#211/212/213) | No semantic dedup at merge | **Fix 6** — Same-issue consolidation clusters by identity; known dedup target documented |
 | Five-way dealer-buyout cluster (same contractual feature, 5 findings) | Title-string-only dedup misses semantic equivalence | **Fix 6** — Semantic clustering instruction + size guideline (>15 = unresolved dupes) |
 | Immaterial process-stage items in principal findings (standard DD tracking) | No materiality threshold | **Fix 4** — IC-chair test demotes to housekeeping appendix; below-threshold items carry `category: "housekeeping"` |
+| "Customer cube never reported" (claim of omission — analysis actually exists in deal documents) | Absence claim not cross-verified against all extracted source text | **Fix 2** — Retrieval verification gate: Call A generates alternate search terms (conclusions/findings/completed/validated); retrieval scans `document_chunks` with expanded queries, hits 3rd memo pp.19–21 containing the customer analysis; Call B issues verdict REVISED → finding removed from principal set |
 
 ---
 
@@ -110,3 +125,35 @@ All `flags`/`data_points`/`key_claims` = 0 in `universal_extractions`. The extra
 - `server/apis/modules/analyze-chunk.ts` — Fix 7: `open_item_acknowledged` in ABSENCE_VERIFICATION_PROTOCOL
 - `server/apis/pipeline/pipeline-core.ts` — Fix 5: deal-process context extraction + injection
 - `server/apis/pipeline/reset-module-merge.ts` — Cross-cutting: refusal message update
+
+---
+
+## Addendum — 2026-07-24
+
+### Changes
+
+1. **BLOCKING: Demote-delete hole closed end-to-end**
+   - `MergeNode` interface gains `housekeepingFindings?: MergedFinding[]`
+   - `housekeeping_appendix` XML tag parsed in pipeline-core's merge parser (alongside `findings_json`)
+   - Housekeeping findings persisted in checkpoint `merged_json`
+   - Accumulated across merge rounds (like principal findings)
+   - `formatReportInline` renderer adds two sections after principal findings:
+     - **"Housekeeping Appendix"** — sub-materiality items with demotion rationale
+     - **"Human Review Flags"** — emphasis-judgment findings
+   - Disclosure header updated: "N principal, M housekeeping, K human-review flags"
+
+2. **Prompt self-contradiction resolved**
+   - Line ~109 `gap_type`: consolidated from two conflicting entries to single three-value instruction (`diligence_gap | memo_omission | open_item_acknowledged`)
+
+3. **Code backstop on absence gate**
+   - Both parsers (pipeline-core + merge-findings.ts): `memo_omission`/`open_item_acknowledged` findings arriving WITHOUT `absence_confidence` → automatically set to `"unverified"` and severity capped at `"info"`
+   - The verification gate cannot be bypassed by field omission
+
+4. **Fail-open visibility**
+   - `verificationPhaseErrored` flag set in Step 5.5 catch block
+   - Passed to renderer → disclosure line injected: "⚠️ Absence claims in this report were not adversarially verified (phase error)."
+   - A failed verification is visually distinct from a passed one in the artifact itself
+
+5. **Paper trace row 10 + Fix-1 code quote**
+   - "Customer cube never reported" → Fix 2 mechanism documented (Call A alternate terms → retrieval hit → Call B REVISED)
+   - Fix-1 snippet-injection code quoted verbatim from `checklist-scan-phase.ts`

@@ -1,5 +1,5 @@
 import { api, z, anthropic } from "@superblocksteam/sdk-api";
-import { buildMergedText } from "./build-merged-text.js";
+import { buildMergedText, type MergedFinding } from "./build-merged-text.js";
 import { NUMERIC_MODULES } from "./constants.js";
 import { getModuleModel } from "../pipeline/model-config.js";
 import { LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY } from "./analyze-chunk.js";
@@ -106,14 +106,13 @@ A JSON array of PRINCIPAL findings only (category = "principal_finding"). Each o
 - "source_docs": array of filename strings
 - "claim_ids": array of claim ID strings (e.g. ["c0-3", "c2-7"]) — these are the stable IDs from the extraction step. Preserve them exactly. Every finding must trace back to at least one source claim.
 - "absence_confidence": (REQUIRED for omission/gap findings) "verified_absent" | "likely_absent" | "unverified" — classification of whether the claimed absence has been cross-checked against all available extractions. Omit only for findings that do not assert something is missing.
-- "gap_type": (REQUIRED for omission/gap findings) "diligence_gap" | "memo_omission". Use "memo_omission" when the information IS present in evidence/reference documents but absent from the subject memo. Use "diligence_gap" when the information is absent from BOTH the subject memo AND all evidence documents. Omit for non-omission findings.
+- "gap_type": (REQUIRED for omission/gap findings) "diligence_gap" | "memo_omission" | "open_item_acknowledged". Use "memo_omission" when the information IS present in evidence/reference documents but absent from the subject memo. Use "diligence_gap" when the information is absent from BOTH the subject memo AND all evidence documents. Use "open_item_acknowledged" when the deal record itself discloses the item as open/pending (e.g., results TBD, workstream staged post-IC) — this is distinct from omission. Omit for non-omission findings.
 - "evidence_docs": (REQUIRED when gap_type = "memo_omission") array of filenames of the evidence documents where the information WAS found. Omit when gap_type = "diligence_gap".
 - "independent": (REQUIRED when gap_type = "memo_omission") boolean. Set to false when ALL evidence_docs are prior IC memos (document_tag = ic_memo) — meaning the corroboration comes only from the team's own prior work, not from independent third-party sources. Set to true when at least one evidence_doc is NOT an ic_memo (e.g. financial model, CIM, customer data, contract). This flag helps the IC distinguish findings backed by outside evidence from those merely restating prior internal positions.
 - "evidence": array of evidence trace objects. REQUIRED for any finding that cites a specific number or quantitative claim. Each object: {"figure": "the number cited", "source_doc": "filename", "verbatim_snippet": "exact text from source containing this figure", "verified": true/false}. A figure with verified=false means it could not be traced to source text and is labeled numeric_unverified.
 - "materiality_rationale": (REQUIRED for all findings) One sentence explaining why this finding would plausibly change an IC member's assessment of a £655m transaction. Sub-threshold items are demoted to housekeeping.
 - "category": "principal_finding" | "housekeeping" | "human_review_flag". Default is "principal_finding". Use "housekeeping" for sub-materiality items (standard DD workstreams, post-close admin, process-stage items). Use "human_review_flag" for emphasis-judgment findings that failed the six-point rubric.
 - "numeric_unverified": boolean. Set to true when the finding's core quantitative claim could NOT be traced to verbatim source text (e.g., chart-derived or vision-inferred figures). Such findings MUST be severity "info" maximum.
-- "gap_type": (REQUIRED for omission/gap findings) "diligence_gap" | "memo_omission" | "open_item_acknowledged". Use "open_item_acknowledged" when the deal record itself discloses the item as open/pending (e.g., results TBD, workstream staged post-IC). This is distinct from omission — the record acknowledges the gap.
 </findings_json>
 
 <housekeeping_appendix>
@@ -621,12 +620,23 @@ No deterministic numeric verification was performed for this analysis. All figur
                 : {}),
               // Fix 4/cross-cutting: category classification
               ...(f.category === "principal_finding" || f.category === "housekeeping" || f.category === "human_review_flag"
-                ? { category: f.category as string }
+                ? { category: f.category as "principal_finding" | "housekeeping" | "human_review_flag" }
                 : {}),
               // Fix 3: numeric_unverified flag
               ...(isNumericUnverified ? { numeric_unverified: true } : {}),
             };
           });
+
+          // CODE BACKSTOP: memo_omission/open_item_acknowledged findings missing
+          // absence_confidence are treated as "unverified" and capped at severity "info".
+          for (const f of findings) {
+            if ((f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged") && !f.absence_confidence) {
+              (f as any).absence_confidence = "unverified";
+              if (f.severity === "critical" || f.severity === "warning") {
+                (f as any).severity = "info";
+              }
+            }
+          }
         }
       } catch {
         findings = [
@@ -670,7 +680,7 @@ No deterministic numeric verification was performed for this analysis. All figur
     // Build a merged text representation for the next round of tree-reduce.
     // Uses the shared buildMergedText() so checkpoint-resumed merges produce
     // byte-identical output.
-    const mergedText = buildMergedText(executiveHeader, findings);
+    const mergedText = buildMergedText(executiveHeader, findings as MergedFinding[]);
 
     return JSON.parse(JSON.stringify({ executiveHeader, findings, housekeepingFindings: housekeepingFindings.length > 0 ? housekeepingFindings : undefined, mergedText }));
   },

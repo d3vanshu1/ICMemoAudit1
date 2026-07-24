@@ -352,7 +352,9 @@ async function formatReportInline(
   executiveHeader: string,
   findings: MergedFinding[],
   _timeRemainingMs: number,
-  _pipelineStartTime: number
+  _pipelineStartTime: number,
+  housekeepingFindings: MergedFinding[] = [],
+  verificationPhaseErrored: boolean = false,
 ): Promise<string | null> {
   // ---------------------------------------------------------------------------
   // PURE MECHANICAL RENDERER — zero Anthropic calls.
@@ -385,12 +387,22 @@ async function formatReportInline(
   // =========================================================================
   lines.push(`# Diligence Report`);
   lines.push(``);
-  lines.push(`> **${totalCount} findings, mechanically rendered, no LLM synthesis.**`);
+  // Partition housekeeping by sub-category
+  const housekeepingItems = housekeepingFindings.filter(f => f.category !== "human_review_flag");
+  const humanReviewItems = housekeepingFindings.filter(f => f.category === "human_review_flag");
+  const housekeepingCount = housekeepingItems.length;
+  const humanReviewCount = humanReviewItems.length;
+
+  lines.push(`> **${totalCount} principal findings, ${housekeepingCount} housekeeping, ${humanReviewCount} human-review flags — mechanically rendered, no LLM synthesis.**`);
   lines.push(`>`);
   lines.push(`> Severity: ${criticalCount} critical, ${warningCount} warning, ${infoCount} info.`);
   lines.push(`> Category: ${memoOmissions} memo\_omission, ${diligenceGaps} diligence\_gap${otherType > 0 ? `, ${otherType} other` : ""}.`);
   lines.push(`>`);
   lines.push(`> All detail text reproduced verbatim from pipeline output. Zero paraphrase, zero trimming.`);
+  if (verificationPhaseErrored) {
+    lines.push(`>`);
+    lines.push(`> ⚠️ **Absence claims in this report were not adversarially verified (phase error).**`);
+  }
   lines.push(``);
 
   // Executive header (deal context from pipeline)
@@ -504,6 +516,56 @@ async function formatReportInline(
       }
 
       // Separator between findings
+      lines.push(`---`);
+      lines.push(``);
+    }
+  }
+
+  // =========================================================================
+  // (d) HOUSEKEEPING APPENDIX — sub-materiality items demoted per Fix 4
+  // =========================================================================
+  if (housekeepingItems.length > 0) {
+    lines.push(`## Housekeeping Appendix`);
+    lines.push(``);
+    lines.push(`> ${housekeepingItems.length} sub-materiality item(s) demoted from principal findings. Standard DD workstreams, post-close admin, or process-stage items.`);
+    lines.push(``);
+
+    for (const f of housekeepingItems) {
+      lines.push(`#### ${f.title}`);
+      lines.push(``);
+      lines.push(`**Severity:** ${f.severity.toUpperCase()} | **Demotion rationale:** ${f.materiality_rationale ?? "Sub-materiality threshold"}`);
+      lines.push(``);
+      lines.push(escapeMarkdownBreakers(f.detail));
+      lines.push(``);
+      if (f.source_docs && f.source_docs.length > 0) {
+        lines.push(`**Source Documents:** ${f.source_docs.join(", ")}`);
+        lines.push(``);
+      }
+      lines.push(`---`);
+      lines.push(``);
+    }
+  }
+
+  // =========================================================================
+  // (e) HUMAN REVIEW FLAGS — emphasis-judgment findings per rubric criterion 2
+  // =========================================================================
+  if (humanReviewItems.length > 0) {
+    lines.push(`## Human Review Flags`);
+    lines.push(``);
+    lines.push(`> ${humanReviewItems.length} finding(s) flagged for human review. These assert emphasis-judgment claims ("underweighted", "de-emphasised") that failed the six-point verification rubric.`);
+    lines.push(``);
+
+    for (const f of humanReviewItems) {
+      lines.push(`#### ${f.title}`);
+      lines.push(``);
+      lines.push(`**Severity:** ${f.severity.toUpperCase()} | **Flag reason:** Emphasis-judgment — requires human assessment`);
+      lines.push(``);
+      lines.push(escapeMarkdownBreakers(f.detail));
+      lines.push(``);
+      if (f.source_docs && f.source_docs.length > 0) {
+        lines.push(`**Source Documents:** ${f.source_docs.join(", ")}`);
+        lines.push(``);
+      }
       lines.push(`---`);
       lines.push(``);
     }
@@ -817,6 +879,20 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
             // Reconstruct findings from the lightweight query (text is rebuilt from findings)
             const findings = JSON.parse(topCheckpoint.findings_json) as MergedFinding[];
+            // Reconstruct housekeeping findings from checkpoint merged_json if available
+            let fastPathHousekeeping: MergedFinding[] = [];
+            try {
+              const [cpRow] = await ctx.integrations.db.query(
+                `SELECT merged_json->'housekeepingFindings' AS hk FROM merge_checkpoints WHERE module_run_id = $1 AND tree_level = $2 AND node_index = 0 LIMIT 1`,
+                z.object({ hk: z.any().nullable() }),
+                [runId, topCheckpoint.tree_level],
+                { label: "Fast-path: load housekeeping from checkpoint" }
+              );
+              if (cpRow?.hk && Array.isArray(cpRow.hk)) {
+                fastPathHousekeeping = cpRow.hk as MergedFinding[];
+              }
+            } catch { /* non-fatal — proceed without housekeeping */ }
+
             const finalNode = {
               text: buildMergedText(topCheckpoint.executive_header, findings),
               executiveHeader: topCheckpoint.executive_header,
@@ -871,7 +947,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
             // Sanity telemetry: shows the clamp arithmetic in the wild
             const perCallTimeoutPreview = Math.min(formatBudget - 10_000, 230_000);
             console.log(`[pipeline:fast-path] Formatting report — elapsed=${Math.round(elapsedMs / 1000)}s, formatBudget=${Math.round(formatBudget / 1000)}s, perCallTimeout=${Math.round(perCallTimeoutPreview / 1000)}s, findings=${finalFindings.length}`);
-            const fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget, startTime);
+            const fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget, startTime, fastPathHousekeeping, false);
 
             if (!fullReport) {
               console.warn(`[pipeline:fast-path] formatReportInline returned null — will retry on next invocation`);
@@ -1607,6 +1683,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     text: string;
     executiveHeader: string;
     findings: MergedFinding[];
+    housekeepingFindings?: MergedFinding[];
     truncated?: boolean; // true when stop_reason was "max_tokens" — findings may be thin
   }
 
@@ -1675,6 +1752,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // This is the safety net: even if higher rounds fail to re-extract findings,
   // we have the full set from intermediate rounds to fall back on.
   let accumulatedFindings: MergedFinding[] = [];
+  let accumulatedHousekeeping: MergedFinding[] = [];
 
   // Build numeric block for merge
   const hasNumericData = !!(numericReport && NUMERIC_MODULES.has(moduleId) &&
@@ -1894,8 +1972,8 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
                     f.absence_confidence === "unverified"
                     ? { absence_confidence: f.absence_confidence as string }
                     : {}),
-                  ...(f.gap_type === "diligence_gap" || f.gap_type === "memo_omission"
-                    ? { gap_type: f.gap_type as "diligence_gap" | "memo_omission" }
+                  ...(f.gap_type === "diligence_gap" || f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged"
+                    ? { gap_type: f.gap_type as "diligence_gap" | "memo_omission" | "open_item_acknowledged" }
                     : {}),
                   ...(Array.isArray(f.evidence_docs) && f.evidence_docs.length > 0
                     ? { evidence_docs: f.evidence_docs.map(String) }
@@ -1908,6 +1986,40 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
             } catch { /* parse failure — use empty findings */ }
           }
 
+          // CODE BACKSTOP: memo_omission findings missing absence_confidence are
+          // treated as "unverified" and capped at severity "info" — prevents bypassing
+          // the verification gate by field omission.
+          for (const f of findings) {
+            if ((f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged") && !f.absence_confidence) {
+              (f as any).absence_confidence = "unverified";
+              if (f.severity === "critical" || f.severity === "warning") {
+                (f as any).severity = "info";
+              }
+            }
+          }
+
+          // Parse housekeeping appendix (demoted findings — Fix 4/6)
+          const housekeepingRaw = extractTag(mergeText, "housekeeping_appendix");
+          let housekeepingFindings: MergedFinding[] = [];
+          if (housekeepingRaw) {
+            try {
+              const parsed = JSON.parse(housekeepingRaw);
+              if (Array.isArray(parsed)) {
+                housekeepingFindings = parsed.map((f: Record<string, unknown>) => ({
+                  severity: (f.severity === "critical" || f.severity === "warning" || f.severity === "info") ? f.severity : "info" as const,
+                  title: String(f.title ?? "Untitled"),
+                  detail: String(f.detail ?? ""),
+                  full_analysis: String(f.full_analysis ?? f.detail ?? ""),
+                  source_docs: Array.isArray(f.source_docs) ? f.source_docs.map(String) : [],
+                  ...(typeof f.materiality_rationale === "string" ? { materiality_rationale: f.materiality_rationale } : {}),
+                  ...(f.category === "housekeeping" || f.category === "human_review_flag"
+                    ? { category: f.category as string }
+                    : { category: "housekeeping" }),
+                })) as MergedFinding[];
+              }
+            } catch { /* non-fatal */ }
+          }
+
           // Fallback: if findings are empty (model failed to extract), union input
           // members' findings — degrades to unconsolidated duplicates rather than
           // erasing everything below this node in the tree
@@ -1917,9 +2029,10 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
 
           // Accumulate findings across all rounds so we never lose data
           accumulatedFindings.push(...findings);
+          if (housekeepingFindings.length > 0) accumulatedHousekeeping.push(...housekeepingFindings);
 
           const mergedTextForNode = buildMergedText(executiveHeader, findings);
-          const node: MergeNode = { text: mergedTextForNode, executiveHeader, findings, truncated };
+          const node: MergeNode = { text: mergedTextForNode, executiveHeader, findings, housekeepingFindings: housekeepingFindings.length > 0 ? housekeepingFindings : undefined, truncated };
 
           return { group, node };
         })
@@ -1947,7 +2060,7 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
             `INSERT INTO merge_checkpoints (module_run_id, tree_level, node_index, merged_json, model_used, prompt_version)
              VALUES ($1, $2, $3, $4::jsonb, $5, $6)
              ON CONFLICT (module_run_id, tree_level, node_index) DO UPDATE SET merged_json = $4::jsonb, model_used = $5, prompt_version = $6`,
-            [runId, currentRound, group.idx, JSON.stringify({ text: cpText, executiveHeader: node.executiveHeader, findings: node.findings, truncated: node.truncated ?? false }), getModuleModel(moduleId, useOpus), currentVersion],
+            [runId, currentRound, group.idx, JSON.stringify({ text: cpText, executiveHeader: node.executiveHeader, findings: node.findings, housekeepingFindings: node.housekeepingFindings, truncated: node.truncated ?? false }), getModuleModel(moduleId, useOpus), currentVersion],
             { label: `Save merge checkpoint R${currentRound}:G${group.idx}` }
           );
         } else {
@@ -2022,6 +2135,9 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
     finalFindings = deduped;
   }
 
+  // Housekeeping findings: from final node or accumulated across rounds
+  const finalHousekeepingFindings: MergedFinding[] = finalNode.housekeepingFindings ?? accumulatedHousekeeping;
+
   // --- Post-processing: suppress fabricated arithmetic/reconciliation findings ---
   // Only findings grounded in NumericVerify's deterministic output are trustworthy.
   const { FABRICATED_ARITHMETIC_PATTERNS } = await import("./fabricated-arithmetic-patterns.js");
@@ -2045,6 +2161,7 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
   //   Call A: generate alternate search queries
   //   Call B: retrieve evidence and issue REVISED/UPHELD verdict
   // Findings without absence_confidence pass through untouched.
+  let verificationPhaseErrored = false;
   if (CHECKLIST_MODULES.has(moduleId)) {
     const verifyBudget = timeRemaining();
     if (verifyBudget >= ABSENCE_VERIFICATION_MIN_BUDGET_MS) {
@@ -2088,6 +2205,7 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
       } catch (verifyErr) {
         const msg = verifyErr instanceof Error ? verifyErr.message : String(verifyErr);
         console.error(`[pipeline] Absence verification phase failed (non-fatal, findings unchanged): ${msg}`);
+        verificationPhaseErrored = true;
       }
     } else {
       console.warn(`[pipeline] Insufficient time for absence verification (${Math.round(verifyBudget / 1000)}s < ${ABSENCE_VERIFICATION_MIN_BUDGET_MS / 1000}s needed) — deferring to next invocation`);
@@ -2147,7 +2265,7 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
 
   if (formatBudget >= FORMAT_REPORT_MIN_BUDGET_MS) {
     console.log(`[pipeline] Formatting report inline (${Math.round(formatBudget / 1000)}s budget)`);
-    fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget, startTime);
+    fullReport = await formatReportInline(ctx, moduleId, finalNode.executiveHeader, finalFindings, formatBudget, startTime, finalHousekeepingFindings, verificationPhaseErrored);
   } else {
     console.warn(`[pipeline] Insufficient time for inline formatting (${Math.round(formatBudget / 1000)}s < ${FORMAT_REPORT_MIN_BUDGET_MS / 1000}s needed) — deferring to next invocation`);
     // Return in_progress so the client re-invokes with a fresh time budget

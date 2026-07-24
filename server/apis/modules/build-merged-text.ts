@@ -25,6 +25,14 @@ export interface MergedFinding {
   /** false when evidence comes solely from prior IC memos (team-authored, not independent third-party).
    *  true when corroborated by at least one non-ic_memo source. Omit when not applicable. */
   independent?: boolean;
+  /** Evidence trace array for numeric claims (Fix 3) */
+  evidence?: Array<{ figure: string; source_doc: string; verbatim_snippet: string; verified: boolean }>;
+  /** Whether the finding's core quantitative claim could not be traced to source text (Fix 3) */
+  numeric_unverified?: boolean;
+  /** One-line rationale for why this finding meets the IC-chair materiality threshold (Fix 4) */
+  materiality_rationale?: string;
+  /** Finding classification: principal_finding (default), housekeeping (sub-materiality), human_review_flag (emphasis-judgment) */
+  category?: "principal_finding" | "housekeeping" | "human_review_flag";
   verification?: {
     status: "revised" | "upheld";
     evidenceQuoted?: string;
