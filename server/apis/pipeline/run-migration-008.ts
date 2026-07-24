@@ -75,7 +75,7 @@ export default api({
       const msg = err instanceof Error ? err.message : String(err);
       return {
         success: false,
-        message: `ALTER TYPE failed: ${msg}. If this is a transaction constraint, run directly via psql: ALTER TYPE module_status ADD VALUE IF NOT EXISTS 'cancelled';`,
+        message: `ALTER TYPE failed. Paste this exact error to Devanshu: ${msg}`,
         existingValues,
       };
     }

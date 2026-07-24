@@ -1,0 +1,83 @@
+# Status-Mutator Inventory — `module_runs.status`
+
+All mechanisms that can **write** to `module_runs.status` or **re-invoke** a pipeline run. Each row documents the trigger, guard conditions, cancelled-handling, exact file:line, the by-construction safety argument relied upon, and pre- vs post-migration-008 behavior.
+
+---
+
+## 1. Mutators That Set `status = 'running'` (Run Initiation)
+
+| # | Mechanism | Trigger | Guard Condition | Cancelled-Handling | File:Line | Safety Argument | Pre-008 | Post-008 |
+|---|-----------|---------|----------------|-------------------|-----------|----------------|---------|----------|
+| 1a | `runPipelineCore` — guarded INSERT (with numeric) | Client calls `RunModulePipeline` | CTE: `NOT EXISTS (SELECT 1 FROM module_runs WHERE deal_id=$1 AND module_id=$2 AND status='running')` | No cancelled check — INSERT only fires when no running row exists; a cancelled row has status≠running so it won't block | `server/apis/pipeline/pipeline-core.ts:597–608` | The partial unique constraint prevents concurrent runs; the INSERT can only succeed when no row is `'running'`. A cancelled row (or 'failed' pre-008) does NOT block new runs — this is intentional. | Identical (guard on `status='running'`) | Identical |
+| 1b | `runPipelineCore` — guarded INSERT (fallback, no numeric column) | Same as 1a, triggered when `numeric_report_json` column doesn't exist yet | Same CTE guard | Same | `server/apis/pipeline/pipeline-core.ts:614–625` | Same as 1a | Identical | Identical |
+| 1c | `runPipelineCore` — unguarded INSERT (fallback when CTE returns 0 rows) | Same as 1a, second fallback when INSERT returns no rows and existing running row found | Verifies running row already exists via SELECT, reuses existing runId | Same | `server/apis/pipeline/pipeline-core.ts:630–650` | Not a real new INSERT — discovers existing running row and adopts it | Identical | Identical |
+| 1d | `runPipelineCore` — fresh run (version mismatch) | Stale prompt_version detected in checkpoints | Marks old run failed first, then INSERTs new `'running'` row (no CTE guard — old one is already failed) | No cancelled check needed — old run was already failed, new run is fresh | `server/apis/pipeline/pipeline-core.ts:1312–1324` | Stale data cannot resume; fresh run is the only safe option. Old run is terminated before new one is created. | Identical | Identical |
+| 1e | `ResetModuleMerge` | Manual admin action (button in admin panel) | None — unconditional `SET status='running'` on the target run | **No cancelled check** — merges all checkpoints for this run are deleted so it can re-merge; assumes operator knows what they're doing | `server/apis/pipeline/reset-module-merge.ts:66` | ⚠️ Admin-only escape hatch. Documented purpose: surgical re-merge of a specific run. Does NOT check current status — will flip cancelled→running. Pre-condition: operator must verify the run should be alive. | SET status='running' unconditionally | Same |
+| 1f | `ResurrectModuleRun` | Manual admin action (deliberate override) | Only flips `'failed'` or `'cancelled'` rows; checks no sibling is already running for same deal+module | **Explicitly handles cancelled**: only resurrects if status IS 'failed' or 'cancelled' — this is the deliberate operator escape hatch | `server/apis/checkpoints/resurrect-module-run.ts:37,57` | ⚠️ **DELIBERATE ESCAPE HATCH** — exists solely to undo a cancel or failure when the operator decides the run should resume. Guard: concurrent-sibling check prevents two running rows. | Pre-008: only resurrects 'failed' (cancelled didn't exist as a status) | Post-008: resurrects 'failed' OR 'cancelled' |
+| 1g | `ResumeCompletedRun` | Admin action — rerun formatting on a completed/failed run | Checks current status; **REFUSES `'cancelled'` status** with early return `{ reset: false }` | **Cancelled is permanent here** — will not flip cancelled→running | `server/apis/checkpoints/resume-completed-run.ts:39–41` | Cancellation is server-authoritative; only `ResurrectModuleRun` can override it. This API is for retrying formatter, not overriding cancellation. | Pre-008: 'cancelled' didn't exist, so irrelevant | Post-008: hard-refuses cancelled |
+| 1h | `UpdateRunStatus` (create mode) | Client calls with no runId — creates new run in any status | None beyond input schema enum validation (`pending\|running\|completed\|failed`) | Input schema does NOT include `'cancelled'` — cannot create a cancelled row via this path | `server/apis/checkpoints/update-run-status.ts:47–52` | Client-facing utility for non-pipeline flows (e.g., executive summary). The enum restriction prevents writing arbitrary statuses. | Identical (no 'cancelled' in enum) | Same — input enum unchanged |
+| 1i | `UpdateRunStatus` (update mode) | Client calls with existing runId | No guard on current status — unconditional SET | Input enum is `pending\|running\|completed\|failed` — cannot write 'cancelled'. But CAN flip cancelled→running if called with status='running'. | `server/apis/checkpoints/update-run-status.ts:32–38` | ⚠️ Potential zombie path: if called on a cancelled run with `status='running'`, it will flip it. **Mitigated by**: client code only calls this for executive_summary module, which doesn't participate in the pipeline cancel flow. | Same | Same — but post-008 a cancelled row could theoretically be flipped |
+
+## 2. Mutators That Set `status = 'completed'`
+
+| # | Mechanism | Trigger | Guard Condition | Cancelled-Handling | File:Line | Safety Argument | Pre-008 | Post-008 |
+|---|-----------|---------|----------------|-------------------|-----------|----------------|---------|----------|
+| 2a | `runPipelineCore` — fast-path completion | Single-chunk module finishes in-invocation (no merge rounds needed) | `WHERE id=$1 AND status='running'::module_status` | If status is 'cancelled', the WHERE clause won't match → no-op | `server/apis/pipeline/pipeline-core.ts:915` | Guarded UPDATE: only transitions `running→completed`. A cancelled run is unreachable. | Identical | Identical |
+| 2b | `runPipelineCore` — normal completion | Full merge finishes and report formatted | `WHERE id=$1 AND status='running'::module_status` | Same — cancelled is unreachable | `server/apis/pipeline/pipeline-core.ts:2248` | Same guard | Identical | Identical |
+| 2c | `ReconcileFindings` | Admin manually reconciles from merge checkpoints | `WHERE id=$1 AND status='running'::module_status` | Same — cancelled is unreachable | `server/apis/checkpoints/reconcile-findings.ts:136` | Same guard | Identical | Identical |
+| 2d | `SaveModuleResult` (legacy path) | Client saves result via non-pipeline path | INSERT new row with status='completed' directly (no UPDATE) | N/A — creates fresh row, doesn't mutate existing | `server/apis/modules/save-module-result.ts:61` | Legacy client-only path for executive summary. Creates new completed row — doesn't touch existing runs. | Identical | Identical |
+| 2e | `ResumeStalePipelines` | Background sweeper picks up stale run, runs to completion | Runs the full `runPipelineCore` which uses the same guarded UPDATE at 2b | If the run was cancelled between claim and completion, the final `SET status='completed' WHERE status='running'` won't match → no-op | `server/apis/pipeline/resume-stale-pipelines.ts` (delegates to pipeline-core.ts:2248) | Sweeper only claims runs where `status='running'` at claim time. If cancelled after claim, the terminal UPDATE is a no-op. | Identical | Identical |
+
+## 3. Mutators That Set `status = 'failed'`
+
+| # | Mechanism | Trigger | Guard Condition | Cancelled-Handling | File:Line | Safety Argument | Pre-008 | Post-008 |
+|---|-----------|---------|----------------|-------------------|-----------|----------------|---------|----------|
+| 3a | `runPipelineCore` — no subject documents | Pipeline starts but no subject docs selected | `WHERE id=$1 AND status='running'::module_status` | Cancelled is unreachable (same pattern) | `server/apis/pipeline/pipeline-core.ts:970` | Same guard | Identical | Identical |
+| 3b | `runPipelineCore` — no evidence documents | No chunked evidence found | Same guard | Same | `server/apis/pipeline/pipeline-core.ts:1003` | Same | Identical | Identical |
+| 3c | `runPipelineCore` — no chunks after routing | Relevance router filtered everything out | Same guard | Same | `server/apis/pipeline/pipeline-core.ts:1181` | Same | Identical | Identical |
+| 3d | `runPipelineCore` — no analysis results | All analysis passes returned empty | Same guard | Same | `server/apis/pipeline/pipeline-core.ts:1539` | Same | Identical | Identical |
+| 3e | `runPipelineCore` — version mismatch (mark old run) | Stale checkpoints detected | Same guard | Same | `server/apis/pipeline/pipeline-core.ts:1324` | Old run is failed, new one is started (1d) | Identical | Identical |
+| 3f | `PurgeStaleRuns` | Client calls before starting new run (auto-expire zombies >30 min) | `WHERE deal_id=$1 AND status='running' AND triggered_at < threshold` | **No cancelled check** — but the WHERE requires `status='running'`, so cancelled rows are untouched | `server/apis/checkpoints/purge-stale-runs.ts:45–48` | Only touches `'running'` rows older than threshold. Cancelled rows have status≠running → unreachable. | Identical | Identical |
+| 3g | `PurgeDealHistory` | Admin reset — marks ALL non-failed runs as failed | `WHERE deal_id=$1 AND status != 'failed'` (or scoped by moduleId) | **Will flip cancelled→failed** — intentional for admin reset. The deal is being wiped. | `server/apis/checkpoints/purge-deal-history.ts:35–39` | Admin-only destructive reset. Flipping cancelled→failed is harmless because both are terminal states and the outputs are also being cleared. | Pre-008: no cancelled exists | Post-008: cancelled→failed (benign — both terminal) |
+| 3h | `ResetDealRun` | Admin kills stalled pipeline + purges extractions | `WHERE id=$1 AND status='running'` | Only touches running rows — cancelled is unreachable | `server/apis/pipeline/reset-deal-run.ts:38–39` | Targets a specific runId; only transitions running→failed. Refuses if already terminal. | Identical | Identical |
+| 3i | `CancelModuleRun` — enum fallback | Cancel request when 'cancelled' enum doesn't exist yet | `WHERE (deal_id=$1 AND module_id=$2) AND status IN ('running','pending')` | This IS the cancel path — sets 'failed' as best-effort when enum unavailable | `server/apis/checkpoints/cancel-module-run.ts:84` | Pre-migration fallback. The client's `killedModulesRef` prevents auto-resume regardless of DB value. | Sets 'failed' (only option) | Only triggered if ALTER TYPE failed — should not occur post-008 |
+| 3j | `ResumeStalePipelines` — claim update then failure during processing | Pipeline errors during background resume | Delegates to pipeline-core which uses guarded UPDATE | Same as 3a–3d | Various lines in pipeline-core.ts | Same guarded pattern | Identical | Identical |
+
+## 4. Mutators That Set `status = 'cancelled'` (Post-Migration-008 Only)
+
+| # | Mechanism | Trigger | Guard Condition | Cancelled-Handling | File:Line | Safety Argument | Pre-008 | Post-008 |
+|---|-----------|---------|----------------|-------------------|-----------|----------------|---------|----------|
+| 4a | `CancelModuleRun` — primary path | User clicks Cancel button → client calls API | `WHERE (deal_id=$1 AND module_id=$2) AND status IN ('running','pending')` | This IS the canonical cancel mechanism | `server/apis/checkpoints/cancel-module-run.ts:67` | Only touches running/pending rows. Falls back to 'failed' (3i) if enum cast fails. Client-side `killedModulesRef` provides immediate UI-level protection regardless. | N/A — 'cancelled' enum doesn't exist | Sets 'cancelled' (durable, distinguished from failure) |
+
+## 5. Client-Side Re-Invocation Mechanisms (trigger `RunModulePipeline`)
+
+| # | Mechanism | Trigger | Guard Condition | Cancelled-Handling | File:Line | Safety Argument | Pre-008 | Post-008 |
+|---|-----------|---------|----------------|-------------------|-----------|----------------|---------|----------|
+| 5a | `handleRunModule` — user click | User clicks "Run" or "Run All" button | `killedModulesRef.current.has(moduleId)` check NOT present here (user is explicitly requesting) | If user re-runs a cancelled module, this is deliberate — creates new run (1a's CTE allows it because cancelled≠running) | `client/pages/DealDashboard/index.tsx:~1440` | User-initiated action is always allowed. The pipeline INSERT guard (1a) prevents concurrent runs but not re-runs after terminal. | Identical | Identical |
+| 5b | Auto-resume (`attemptResume` effect) | Fires on mount / statuses change — detects orphaned running rows | THREE guards: `!pipelinePollingActive.has(id)`, `!resumingModulesRef.has(id)`, **`!killedModulesRef.current.has(id)`** | ✅ Explicitly guarded — killed modules are never auto-resumed | `client/pages/DealDashboard/index.tsx:~1917` | killedModulesRef is checked before any re-invocation. Post-zip-1 fix ensures `dbRunningModuleIds` also respects this ref. | Identical | Identical |
+| 5c | `LoadModuleResults` effect — DB running re-addition | On data load, modules with `status='running'` in DB are added to `runningModules` set | ✅ **Post-zip-1**: `.filter((id) => !killedModulesRef.current.has(id))` | ✅ Fixed in zip 1 — killed modules are filtered out before Set addition | `client/pages/DealDashboard/index.tsx:~186` | The zip-1 fix prevents the zombie re-appearance bug. Without this filter, a stale DB refetch could re-add a cancelled module to `runningModules`. | Bug existed (no filter) | ✅ Fixed (filter present) |
+| 5d | Progress polling effect | Periodic poll loop for running modules | `killedModulesRef.current.has(id)` checked — exits poll loop | ✅ Guarded | `client/pages/DealDashboard/index.tsx:~1977` | Poll loop self-terminates for killed modules | Identical | Identical |
+| 5e | `ResumeStalePipelines` (server-side) | Background cron/manual — picks up stale running rows | Claims only rows where `status='running' AND triggered_at < threshold` | Post-008: cancelled rows have status='cancelled' → WHERE clause excludes them. Pre-008: cancelled rows are 'failed' → also excluded. | `server/apis/pipeline/resume-stale-pipelines.ts:74` | The sweeper's WHERE clause is `status='running'` — by construction it cannot touch any terminal row. | Identical | Identical |
+
+---
+
+## By-Construction Safety Summary
+
+| Property | Argument |
+|----------|----------|
+| **Cancelled runs cannot auto-resume (client)** | `killedModulesRef` is checked at: auto-resume (5b), DB re-addition (5c, zip-1 fix), progress polling (5d). All three client paths that could re-trigger a run respect the ref. |
+| **Cancelled runs cannot auto-resume (server)** | Background sweeper (5e) only claims `status='running'` rows. Post-008 a cancelled row has `status='cancelled'` → excluded by WHERE. Pre-008 falls back to 'failed' → also excluded. |
+| **Cancelled runs cannot accidentally complete** | All completion UPDATEs (2a–2e) use `WHERE status='running'::module_status`. A cancelled row won't match → UPDATE is a no-op. |
+| **Only deliberate operator action can revive a cancelled run** | `ResurrectModuleRun` (1f) is the sole API that flips cancelled→running. It requires explicit runId, checks no concurrent sibling, and is labeled as an escape hatch. `ResetModuleMerge` (1e) also has no status guard — but it's admin-only and its purpose assumes operator intent. |
+| **PurgeStaleRuns cannot kill a cancelled run** | WHERE requires `status='running'` — cancelled rows are unreachable. |
+| **UpdateRunStatus (1i) is a theoretical zombie vector** | It performs unconditional `SET status=$1` on any runId. Mitigation: client only calls this for `executive_summary` module, which doesn't participate in pipeline cancel flow. Documented as low-risk but not zero-risk. |
+
+---
+
+## Escape Hatches (Intentional Override Mechanisms)
+
+| Mechanism | Purpose | Warning |
+|-----------|---------|---------|
+| `ResurrectModuleRun` | Operator deliberately un-cancels or un-fails a run | ⚠️ Will bypass all cancellation guarantees. Use only when the operator has verified the run should resume. Creates zombie if used carelessly. |
+| `ResetModuleMerge` | Operator forces a run back to 'running' to redo merge phase | ⚠️ No status guard — will flip ANY status to running, including cancelled. Assumes operator intent. Merge checkpoints are deleted so re-merge starts fresh. |
+| `PurgeDealHistory` | Operator resets entire deal to clean state | Flips cancelled→failed (benign — both terminal). Clears all outputs. |
