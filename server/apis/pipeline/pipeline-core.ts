@@ -545,10 +545,16 @@ async function checkCancelled(ctx: PipelineContext, runId: string, gate: string)
       console.log(`[pipeline:cancel-gate] Run ${runId} cancelled at gate: ${gate}`);
       return true;
     }
-  } catch {
-    // Pre-migration fallback: column doesn't exist, check status='failed' + cancelled semantics
-    // In pre-migration state, cancellation sets status='failed' — indistinguishable server-side.
-    // Client-side killedModulesRef is the real guard. This gate is a belt-and-suspenders check.
+  } catch (err: unknown) {
+    // Discriminate: 42703 = undefined_column (pre-migration) → silent legacy fallback
+    // Any other error → log as console.error but return false (don't silently disable gate)
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const isUndefinedColumn = errMsg.includes("42703") || errMsg.includes("does not exist");
+    if (!isUndefinedColumn) {
+      console.error(`[pipeline:cancel-gate] UNEXPECTED ERROR at gate "${gate}" for run ${runId}: ${errMsg}`);
+    }
+    // Pre-migration: column doesn't exist → cancellation indistinguishable server-side.
+    // Client-side killedModulesRef is the real guard.
   }
   return false;
 }

@@ -19,14 +19,34 @@ export default api({
     moduleId: z.string(),
     status: z.enum(["pending", "running", "completed", "failed"]),
     documentsIncluded: z.array(z.string()).nullable().optional(),
+    override: z.boolean().optional(),
   }),
 
   output: z.object({
     runId: z.string(),
   }),
 
-  async run(ctx, { runId, dealId, moduleId, status, documentsIncluded }) {
+  async run(ctx, { runId, dealId, moduleId, status, documentsIncluded, override }) {
     if (runId) {
+      // GUARD: refuse update on cancelled runs unless override:true
+      let isCancelled = false;
+      try {
+        const check = await ctx.integrations.db.query(
+          `SELECT COALESCE(is_cancelled, FALSE) AS is_cancelled FROM module_runs WHERE id = $1 LIMIT 1`,
+          z.object({ is_cancelled: z.boolean() }),
+          [runId],
+          { label: `Check is_cancelled before status update` }
+        );
+        isCancelled = check[0]?.is_cancelled ?? false;
+      } catch {
+        // Pre-migration: column doesn't exist, can't guard
+      }
+
+      if (isCancelled && !override) {
+        console.warn(`[UpdateRunStatus] Refused: run ${runId} is cancelled. Pass override:true to force.`);
+        return { runId };
+      }
+
       // Update existing run
       const setCompleted = status === "completed" || status === "failed";
 
