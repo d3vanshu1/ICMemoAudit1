@@ -2161,6 +2161,51 @@ export default function DealDashboardPage() {
   }, [dealId, statuses, getRunProgressApi, refetchModules]);
 
   // ---------------------------------------------------------------------------
+  // Watchdog: self-healing invariant for stuck modules
+  // Improvement over the heartbeat: queries DB directly (GetRunProgress) rather
+  // than relying on `statuses` React state, which may be stale between refetches.
+  // Guarantee: recovers within ~60-90s of the tab being open and visible.
+  // Does NOT survive a closed tab or fully backgrounded/throttled one.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!dealId) return;
+
+    const WATCHDOG_INTERVAL_MS = 60_000;
+
+    const watchdog = async () => {
+      if (document.visibilityState !== "visible") return;
+
+      try {
+        const progress = await getRunProgressApi({ dealId });
+        const dbRunning = (progress?.runs ?? []).filter(
+          (r: { status: string }) => r.status === "running"
+        );
+
+        for (const run of dbRunning) {
+          const { moduleId, runId } = run as { moduleId: string; runId: string };
+          if (moduleId === "executive_summary") continue;
+          if (killedModulesRef.current.has(moduleId)) continue;
+
+          const hasActivePolling = pipelinePollingActive.current.has(moduleId);
+          const isResuming = resumingModulesRef.current.has(moduleId);
+
+          if (!hasActivePolling && !isResuming) {
+            console.log(
+              `[watchdog] Module ${moduleId} is DB-running with no client driver — forcing resume (run ${runId})`
+            );
+            handleRunModule(moduleId, runId);
+          }
+        }
+      } catch {
+        // Watchdog failure is non-fatal — next interval will retry
+      }
+    };
+
+    const interval = setInterval(watchdog, WATCHDOG_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [dealId, handleRunModule, getRunProgressApi]);
+
+  // ---------------------------------------------------------------------------
   // Document management
   // ---------------------------------------------------------------------------
 

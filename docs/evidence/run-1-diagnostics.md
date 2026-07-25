@@ -130,3 +130,35 @@ Exit fires at the RIGHT time, before any batch whose worst case could breach the
 | Mitigation-carry rule respected | Findings citing graded DD items include source grade + mitigation |
 | `mergeGroupsFallenBack` = 0 | No timeout-induced fallbacks with the batch-aware exit preventing overruns |
 | Two-sided pass: completeness + no false positives | Existing SCG acceptance criteria from gate review |
+| Watchdog log line fires when expected | `[watchdog] Module {id} is DB-running with no client driver` appears if/when dead-spot occurs; ideally NEVER appears (heartbeat suffices) |
+
+---
+
+## 7. Handoff-Readiness Ledger — §5: Reliability Guarantee Assessment
+
+The watchdog closes the "stuck until refresh" failure mode. A module that becomes orphaned
+(DB says running, no client poll loop driving it) will be detected and re-attached within
+one watchdog interval (~60s) plus the time for the resumed `handleRunModule` to connect
+to the server pipeline (~5-15s). Total recovery window: **~60-90 seconds** from the moment
+the orphaning occurs, provided the tab is open and visible.
+
+**Precise guarantee:**
+- ✅ Recovers within ~60-90s of the tab being **open and visible**
+- ✅ Survives pipeline-call failures, network timeouts, and heartbeat dead-spots
+- ✅ Does not resurrect deliberately killed modules (`killedModulesRef` respected)
+- ✅ Does not conflict with active polling or in-progress resumes (checks both flags)
+- ❌ Does **NOT** survive a closed tab
+- ❌ Does **NOT** survive a fully backgrounded/throttled tab (Chrome suspends timers after ~5 min)
+- ❌ Does **NOT** provide "one-click-walk-away" reliability — that requires server-side orchestration
+
+**What true walk-away reliability requires:**
+A client-resident poll loop is structurally incapable of achieving "start run → close laptop → come
+back to finished report" reliability. That requires one of:
+1. **Superblocks Scheduled Jobs** (pre-GA) — server-side cron that monitors run state and invokes
+   `RunModulePipeline` independently of any browser session
+2. **External cron** (e.g., GitHub Actions, AWS EventBridge) — hitting the Superblocks API on a
+   schedule to resume orphaned modules
+
+The watchdog is the best-achievable client-side fix. It solves "my module is stuck and I have to
+refresh the page" — it does NOT solve "I can close my laptop and walk away." The latter is a
+platform capability gap, not a code bug.

@@ -3,7 +3,16 @@
 ## Pre-Run-#2 Change-Set — 2026-07-25
 
 **Context:** Final deployment before run #2. Addresses the structural graceful-exit gap identified
-in the Freeze Exception #4 investigation, plus two prompt-quality fixes from the gate review.
+in the Freeze Exception #4 investigation, plus two prompt-quality fixes from the gate review,
+plus the dead-spot watchdog that closes the "stuck until refresh" failure mode.
+
+**Classification of changes:**
+| # | Change | Type |
+|---|--------|------|
+| 1 | Batch-aware graceful exit | **Proactive / Architectural** — pre-emptive structural fix for a gap that was arithmetically unreachable at its designed point; prevents a class of failures, not just the one observed |
+| 2 | Watchdog self-healing loop | **Proactive / Architectural** — new invariant closing the client dead-spot class; addresses a design limitation (poll loop blocking heartbeat) rather than a single incident |
+| 3 | Housekeeping demote-not-delete | **Proactive / Quality** — strengthens prompt to eliminate an observed model drift pattern before it causes data loss in run #2 |
+| 4 | Mitigation-carry rule | **Reactive / Quality patch** — directly motivated by F2/F7 exhibit review finding missing grades in run #1 merged output |
 
 ### Part 1: Batch-Aware Graceful Exit (all three pipeline phases)
 
@@ -63,6 +72,34 @@ Created `docs/evidence/run-1-diagnostics.md` containing:
 - Intermediate housekeeping emission status (not queryable, deferred to run-#2)
 - Full telemetry table for Freeze Exceptions 1–4 with timestamps, diagnoses, and fixes
 - Run-#2 acceptance criteria table
+
+### Part 4: Client Watchdog — Self-Healing Invariant for Stuck Modules
+
+**Problem:** During long `callPipelineWithRetry` windows (up to 920s with retries),
+`pipelinePollingActive` blocks the heartbeat's `attemptResume()` from firing. If the pipeline
+call fails at the network layer and the retry chain exhausts, the module becomes orphaned:
+DB says "running" but no client loop is driving it. Pre-FE4 (kill threshold=2), this manifested
+as permanent "stuck" state requiring a full page refresh.
+
+Post-FE4 the kill threshold (5) and backoff partially mitigate, but a structural gap remains:
+the heartbeat itself relies on `statuses` (React state refreshed every 30s) and can miss modules
+that started running between refetches.
+
+**Fix:** New `useEffect` watchdog with fundamentally different invariant:
+- **60s interval** — independent of any other polling cycle
+- **Queries DB directly** via `getRunProgressApi` — bypasses stale `statuses` entirely (key improvement)
+- **Fires `handleRunModule` unconditionally** when DB says running AND both `pipelinePollingActive`
+  and `resumingModulesRef` are clear for that module
+- **Respects `killedModulesRef`** — will NOT resurrect deliberately killed modules
+- **Respects tab visibility** — skips entirely when `document.visibilityState !== "visible"`
+- Emits `[watchdog] Module {id} is DB-running with no client driver — forcing resume (run {runId})`
+  for run-#2 telemetry
+
+**Guarantee:** Recovers within ~60-90s of the tab being open and visible. Does NOT survive a
+closed tab or a fully backgrounded/throttled one. True walk-away-and-close-the-laptop reliability
+requires Scheduled Jobs (pre-GA) or an external cron.
+
+**File:** `client/pages/DealDashboard/index.tsx`
 
 ---
 
