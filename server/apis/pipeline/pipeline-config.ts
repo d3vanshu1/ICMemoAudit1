@@ -66,6 +66,12 @@ export const TIME_BUDGET_MS = Math.max(120_000, EFFECTIVE_CAP_MS - 100_000);
  *  60s gives a realistic shot at success for most chunks. */
 export const MIN_VIABLE_LLM_BUDGET_MS = 60_000;
 
+/** Reserve (ms) for post-batch work before the platform kills the invocation.
+ *  Covers: N checkpoint DB writes (5-8s each under load) + heartbeat + return overhead.
+ *  At MERGE_CONCURRENCY=5: 5 writes × 6s + heartbeat + serialization = ~35s. Rounded up.
+ *  The batch-aware exit guard subtracts this from available time before launching work. */
+export const CHECKPOINT_RESERVE_MS = 40_000;
+
 /** Extraction phase's own budget (ms). At 300s cap this is 130s — leaves
  *  headroom for clean-parsed-text (Step 0.4), doc-tables (0.6), numeric-inline (0.7).
  *  Formula: effective_cap × 0.42 (rounded to nearest 10s). */

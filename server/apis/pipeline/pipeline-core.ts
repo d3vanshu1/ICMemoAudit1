@@ -74,7 +74,7 @@ import { runAbsenceVerificationPhase } from "./absence-verification-phase.js";
 import { getPipelineVersion } from "./pipeline-version.js";
 import { parseDateFromFileName } from "./parse-date-from-filename.js";
 import { callLLMWithHeadroom, HeadroomExhaustedError, type LLMResponse } from "./call-llm.js";
-import { TIME_BUDGET_MS, EFFECTIVE_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS } from "./pipeline-config.js";
+import { TIME_BUDGET_MS, EFFECTIVE_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS, CHECKPOINT_RESERVE_MS } from "./pipeline-config.js";
 import type { NumericVerifyResult } from "./numeric-verify-inline.js";
 
 // ---------------------------------------------------------------------------
@@ -1554,12 +1554,19 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
   // Process pending chunks with dynamic batch sizing
   for (let bStart = 0; bStart < pendingChunks.length; ) {
-    const remaining = timeRemaining();
-    if (remaining < 60_000) {
+    // Batch-aware graceful exit: don't launch if the real platform clock can't
+    // accommodate worst-case batch (2 full attempts + backoff + checkpoint reserve).
+    // Analysis: 120s timeout, 3 attempts → worst case = 120 + 2 + 120 + 2 + 46 + RESERVE ≈ 330.
+    // Simplified: 2× timeout + backoff + reserve (third attempt is headroom-blocked by FE4 fix).
+    const ANALYSIS_CALL_TIMEOUT = 120_000;
+    const analysisBatchWorstCase = ANALYSIS_CALL_TIMEOUT * 2 + 5_000 + CHECKPOINT_RESERVE_MS; // 285s
+    const platformDeadlineAnalysis = EFFECTIVE_CAP_MS - (Date.now() - startTime);
+    if (platformDeadlineAnalysis < analysisBatchWorstCase) {
+      console.log(`[pipeline:graceful-exit] Analysis phase — platformDeadline=${Math.round(platformDeadlineAnalysis / 1000)}s < batchWorstCase=${Math.round(analysisBatchWorstCase / 1000)}s — returning in_progress`);
       return returnInProgress("analysis");
     }
 
-    const batchSize = remaining < 90_000 ? 5 : ANALYSIS_CONCURRENCY;
+    const batchSize = platformDeadlineAnalysis < 90_000 ? 5 : ANALYSIS_CONCURRENCY;
     const batch = pendingChunks.slice(bStart, bStart + batchSize);
     bStart += batchSize;
 
@@ -1637,8 +1644,11 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     // === CANCEL GATE: between analysis batches ===
     if (await checkCancelled(ctx, runId, "analysis_batch")) return cancelledResult(runId, "analysis_batch");
 
-    // Post-batch time check
-    if (timeRemaining() < 60_000) {
+    // Post-batch graceful exit (redundant with top-of-loop, but catches batches
+    // that completed faster than worst-case — allows immediate exit without re-entering loop header)
+    const postBatchDeadlineAnalysis = EFFECTIVE_CAP_MS - (Date.now() - startTime);
+    if (postBatchDeadlineAnalysis < analysisBatchWorstCase) {
+      console.log(`[pipeline:graceful-exit] Analysis post-batch — platformDeadline=${Math.round(postBatchDeadlineAnalysis / 1000)}s — returning in_progress`);
       return returnInProgress("analysis");
     }
   }
@@ -1903,7 +1913,13 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
     // === CANCEL GATE: between merge rounds ===
     if (await checkCancelled(ctx, runId, "merge_round")) return cancelledResult(runId, "merge_round");
 
-    if (timeRemaining() < 60_000) {
+    // Batch-aware graceful exit: use the real platform clock, not TIME_BUDGET.
+    // Merge: timeoutCap varies by round. Worst case = 2× timeoutCap + backoff + reserve.
+    const roundTimeoutCap = currentRound >= 2 ? 180_000 : 165_000;
+    const mergeBatchWorstCase = roundTimeoutCap * 2 + 5_000 + CHECKPOINT_RESERVE_MS;
+    const platformDeadlineMergeRound = EFFECTIVE_CAP_MS - (Date.now() - startTime);
+    if (platformDeadlineMergeRound < mergeBatchWorstCase) {
+      console.log(`[pipeline:graceful-exit] Merge between-rounds — platformDeadline=${Math.round(platformDeadlineMergeRound / 1000)}s < batchWorstCase=${Math.round(mergeBatchWorstCase / 1000)}s (R${currentRound}, cap=${roundTimeoutCap / 1000}s) — returning in_progress`);
       return returnInProgress("merge", currentRound - 1, 0, 0);
     }
 
@@ -1963,11 +1979,14 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
 
     // Process pending groups in batches (parallel within batch, sequential across batches)
     for (let bStart = 0; bStart < pendingGroups.length; ) {
-      if (timeRemaining() < 60_000) {
+      // Batch-aware graceful exit: real platform clock against worst-case batch duration
+      const platformDeadlineMergeBatch = EFFECTIVE_CAP_MS - (Date.now() - startTime);
+      if (platformDeadlineMergeBatch < mergeBatchWorstCase) {
+        console.log(`[pipeline:graceful-exit] Merge between-batches — platformDeadline=${Math.round(platformDeadlineMergeBatch / 1000)}s < batchWorstCase=${Math.round(mergeBatchWorstCase / 1000)}s (R${currentRound}, done=${groupsDone}/${totalGroupsThisRound}) — returning in_progress`);
         return returnInProgress("merge", currentRound - 1, groupsDone, totalGroupsThisRound);
       }
 
-      const batchSize = timeRemaining() < 90_000 ? Math.min(3, MERGE_CONCURRENCY) : MERGE_CONCURRENCY;
+      const batchSize = platformDeadlineMergeBatch < 90_000 ? Math.min(3, MERGE_CONCURRENCY) : MERGE_CONCURRENCY;
       const batch = pendingGroups.slice(bStart, bStart + batchSize);
       bStart += batchSize;
 

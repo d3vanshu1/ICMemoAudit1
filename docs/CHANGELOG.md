@@ -1,5 +1,71 @@
 # CHANGELOG
 
+## Pre-Run-#2 Change-Set — 2026-07-25
+
+**Context:** Final deployment before run #2. Addresses the structural graceful-exit gap identified
+in the Freeze Exception #4 investigation, plus two prompt-quality fixes from the gate review.
+
+### Part 1: Batch-Aware Graceful Exit (all three pipeline phases)
+
+**Root cause addressed:** The fixed `timeRemaining() < 60_000` exit check was structurally
+unreachable at its designed point because it only fired between batches, and any batch with
+retries could run 200+ seconds past the check point. The platform kill (300s) would fire
+during post-batch checkpoint writes when DB latency spiked.
+
+**Fix:** Replace all three exit checks with a dynamic guard that computes worst-case batch
+duration against the REAL platform clock (`EFFECTIVE_CAP_MS - elapsed`), not `TIME_BUDGET_MS`:
+
+- `CHECKPOINT_RESERVE_MS = 40_000` added to `pipeline-config.ts` (named, commented constant)
+- **Merge loop:** Won't launch batch if `platformDeadline < 2×timeoutCap + 5s + CHECKPOINT_RESERVE`
+  - Round 0-1: needs 375s headroom (2×165 + 5 + 40)
+  - Round 2+: needs 405s headroom (2×180 + 5 + 40)
+  - With 300s cap: first batch always fires, second only if first completes in <~0s → effectively 1 batch/invocation when groups timeout
+- **Analysis loop:** Same principle with 2×120s + 5s + 40s = 285s threshold
+- **Extraction phase:** Same principle with 2×130s + 5s + 40s = 305s threshold
+- Each exit emits `console.log("[pipeline:graceful-exit] ...")` with phase, deadline, and worst-case values
+- **Acceptance criterion:** These log lines appearing in run #2 telemetry confirms the fix is active
+
+**Files:** `server/apis/pipeline/pipeline-config.ts`, `server/apis/pipeline/pipeline-core.ts`, `server/apis/pipeline/extraction-phase.ts`
+
+### Part 2a: Housekeeping "Demote-Not-Delete" Made Mandatory
+
+**Problem:** Model sometimes silently dropped sub-materiality findings instead of demoting them
+to housekeeping, making it impossible to verify completeness.
+
+**Fix:** Strengthened the `<housekeeping_appendix>` prompt section in `MERGE_OUTPUT_STRUCTURE`:
+- Added "MANDATORY — DEMOTE, NEVER DROP" heading
+- Tag must always be emitted, even when empty (`[]`)
+- Added worked example: trademark registration finding demoted with rationale
+- Explicit statement: findings failing materiality gate are NEVER silently deleted
+
+**File:** `server/apis/modules/merge-findings.ts`
+
+### Part 2b: Mitigation-Carry Rule
+
+**Problem:** Findings citing graded DD items (e.g., tax adviser's Red/Amber/Green assessment,
+insurance broker's coverage confirmation) omitted the source's own grade and mitigation summary.
+IC chair cannot distinguish genuinely unmitigated risks from those already resolved.
+(Motivated by exhibits F2 tax DD, F7 insurance DD.)
+
+**Fix:** New rule in `MERGE_OUTPUT_STRUCTURE` after evidence/trace-back section:
+- Findings referencing a source-graded DD item MUST state the source's grade/rating
+- MUST carry the source's mitigation summary
+- If source provides no grade: state "Source does not grade or mitigate."
+
+**File:** `server/apis/modules/merge-findings.ts`
+
+### Part 3: Run-#1 Diagnostic Documentation
+
+Created `docs/evidence/run-1-diagnostics.md` containing:
+- DiagMergeFunnel visualization (376 → 94 → 24 → 6 → 2 → 1)
+- Checkpoint progression timeline with timestamps
+- Final counter values (extraction=381, analysis=376, merge=109 last observed)
+- Intermediate housekeeping emission status (not queryable, deferred to run-#2)
+- Full telemetry table for Freeze Exceptions 1–4 with timestamps, diagnoses, and fixes
+- Run-#2 acceptance criteria table
+
+---
+
 ## Freeze Exception #4 — 2026-07-24
 
 **Cause:** Pre-existing architectural gap surfaced by golden run `0e4cc96d`. Two related failure modes:

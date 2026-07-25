@@ -23,7 +23,7 @@ import {
   type TextChunk,
 } from "./extraction-prompt.js";
 import type { PipelineContext } from "./pipeline-core.js";
-import { EFFECTIVE_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS, EXTRACTION_TIME_BUDGET_MS } from "./pipeline-config.js";
+import { EFFECTIVE_CAP_MS, PLATFORM_HEADROOM_MS, MIN_VIABLE_LLM_BUDGET_MS, EXTRACTION_TIME_BUDGET_MS, CHECKPOINT_RESERVE_MS } from "./pipeline-config.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -558,6 +558,16 @@ export async function runExtractionPhase(
     // Time budget check — before starting batch
     const elapsed = Date.now() - startTime;
     if (elapsed >= EXTRACTION_TIME_BUDGET_MS) {
+      return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError, passStats: makePassStats() };
+    }
+
+    // Batch-aware graceful exit: never launch if the real platform clock can't
+    // accommodate worst-case batch (2× extraction timeout + backoff + checkpoint reserve).
+    const EXTRACTION_CALL_TIMEOUT = 130_000; // matches EXTRACTION_TIME_BUDGET_MS at 300s cap
+    const extractionBatchWorstCase = EXTRACTION_CALL_TIMEOUT * 2 + 5_000 + CHECKPOINT_RESERVE_MS;
+    const platformDeadlineExtraction = EFFECTIVE_CAP_MS - elapsed;
+    if (platformDeadlineExtraction < extractionBatchWorstCase) {
+      console.log(`[pipeline:graceful-exit] Extraction phase — platformDeadline=${Math.round(platformDeadlineExtraction / 1000)}s < batchWorstCase=${Math.round(extractionBatchWorstCase / 1000)}s — returning partial`);
       return { needed: true, completed: false, extractedSoFar, totalChunks, failedChunks, firstError, passStats: makePassStats() };
     }
 

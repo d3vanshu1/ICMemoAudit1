@@ -115,10 +115,32 @@ A JSON array of PRINCIPAL findings only (category = "principal_finding"). Each o
 - "numeric_unverified": boolean. Set to true when the finding's core quantitative claim could NOT be traced to verbatim source text (e.g., chart-derived or vision-inferred figures). Such findings MUST be severity "info" maximum.
 </findings_json>
 
+## MITIGATION-CARRY RULE — Graded DD Item Attribution
+<!-- Motivated by exhibits F2 (tax DD) and F7 (insurance DD) where source documents themselves
+     grade or mitigate the item but the finding omitted that context, creating false alarm. -->
+
+When a finding references a due diligence item that the source document ITSELF grades, mitigates, or
+risk-rates, you MUST state in the finding's "full_analysis":
+1. The source document's own grade/rating (e.g., "Red Book rates this as 'low risk'", "Adviser flags as 'Amber'")
+2. The source's mitigation summary (e.g., "Indemnity agreed at £2m cap", "Insurance novation confirmed pre-close")
+
+A finding that cites a graded DD item WITHOUT carrying forward the source's own assessment is
+incomplete — the IC chair cannot distinguish a genuinely unmitigated risk from one the adviser
+already resolved. If the source provides no grade or mitigation, state: "Source does not grade or mitigate."
+
 <housekeeping_appendix>
 A JSON array of sub-materiality findings (category = "housekeeping"). Same schema as findings_json.
 These are factually correct observations that do NOT meet the IC-chair materiality threshold.
-Include them here rather than deleting — they serve as a completeness record.
+
+MANDATORY — DEMOTE, NEVER DROP: You MUST always emit this tag, even when the array is empty ("[]").
+Every finding that fails the materiality gate is DEMOTED here — it is NEVER silently deleted.
+The housekeeping appendix is a completeness record: its presence guarantees no finding was lost.
+
+Worked example: A finding "Post-close admin: trademark registrations pending in 3 jurisdictions" is
+factually correct but sub-threshold for a £655m transaction. It is DEMOTED to housekeeping with
+category "housekeeping" and materiality_rationale "Standard post-close admin, no impact on IC decision."
+It is NOT deleted.
+
 Also include any "human_review_flag" items here (emphasis-judgment findings demoted by the rubric).
 </housekeeping_appendix>
 
