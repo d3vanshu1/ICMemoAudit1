@@ -25,12 +25,19 @@ during post-batch checkpoint writes when DB latency spiked.
 duration against the REAL platform clock (`EFFECTIVE_CAP_MS - elapsed`), not `TIME_BUDGET_MS`:
 
 - `CHECKPOINT_RESERVE_MS = 40_000` added to `pipeline-config.ts` (named, commented constant)
-- **Merge loop:** Won't launch batch if `platformDeadline < 2×timeoutCap + 5s + CHECKPOINT_RESERVE`
-  - Round 0-1: needs 375s headroom (2×165 + 5 + 40)
-  - Round 2+: needs 405s headroom (2×180 + 5 + 40)
-  - With 300s cap: first batch always fires, second only if first completes in <~0s → effectively 1 batch/invocation when groups timeout
-- **Analysis loop:** Same principle with 2×120s + 5s + 40s = 285s threshold
-- **Extraction phase:** Same principle with 2×130s + 5s + 40s = 305s threshold
+- Formula: `worstCase = timeoutCap + CHECKPOINT_RESERVE_MS` (single attempt + checkpoint I/O)
+- FE4's `HeadroomExhaustedError` already gates any second attempt dynamically at retry-time
+  using actual remaining headroom at that moment — this pre-batch check only needs to guarantee
+  room for ONE attempt plus checkpoint I/O. Provisioning for two full attempts before even
+  starting double-counts a safety margin FE4 already owns, and is mathematically unsatisfiable
+  within a 300s cap once any timeoutCap exceeds 150s (165×2=330>300; 180×2=360>300).
+- **Merge loop:** Won't launch batch if `platformDeadline < timeoutCap + 40s`
+  - Round 0-1: needs 205s headroom (165 + 40) → at t=20s: 280s available ✓ (75s margin)
+  - Round 2+: needs 220s headroom (180 + 40) → at t=20s: 280s available ✓ (60s margin)
+- **Analysis loop:** Same principle with 120s + 40s = 160s threshold
+  - At t=15s: 285s available → 125s margin; allows ≥2 batches per invocation
+- **Extraction phase:** Same principle with 130s + 40s = 170s threshold
+  - At t=10s: 290s available → 120s margin; allows ≥1 full batch per invocation
 - Each exit emits `console.log("[pipeline:graceful-exit] ...")` with phase, deadline, and worst-case values
 - **Acceptance criterion:** These log lines appearing in run #2 telemetry confirms the fix is active
 

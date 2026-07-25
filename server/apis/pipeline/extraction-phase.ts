@@ -562,9 +562,10 @@ export async function runExtractionPhase(
     }
 
     // Batch-aware graceful exit: never launch if the real platform clock can't
-    // accommodate worst-case batch (2× extraction timeout + backoff + checkpoint reserve).
-    const EXTRACTION_CALL_TIMEOUT = 130_000; // matches EXTRACTION_TIME_BUDGET_MS at 300s cap
-    const extractionBatchWorstCase = EXTRACTION_CALL_TIMEOUT * 2 + 5_000 + CHECKPOINT_RESERVE_MS;
+    // accommodate worst-case batch (1× extraction timeout + checkpoint reserve).
+    // FE4's HeadroomExhaustedError gates retries dynamically — no need to pre-provision 2×.
+    const EXTRACTION_CALL_TIMEOUT = 130_000;
+    const extractionBatchWorstCase = EXTRACTION_CALL_TIMEOUT + CHECKPOINT_RESERVE_MS;
     const platformDeadlineExtraction = EFFECTIVE_CAP_MS - elapsed;
     if (platformDeadlineExtraction < extractionBatchWorstCase) {
       console.log(`[pipeline:graceful-exit] Extraction phase — platformDeadline=${Math.round(platformDeadlineExtraction / 1000)}s < batchWorstCase=${Math.round(extractionBatchWorstCase / 1000)}s — returning partial`);

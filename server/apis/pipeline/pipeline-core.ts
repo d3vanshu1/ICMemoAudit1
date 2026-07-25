@@ -1555,11 +1555,11 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // Process pending chunks with dynamic batch sizing
   for (let bStart = 0; bStart < pendingChunks.length; ) {
     // Batch-aware graceful exit: don't launch if the real platform clock can't
-    // accommodate worst-case batch (2 full attempts + backoff + checkpoint reserve).
-    // Analysis: 120s timeout, 3 attempts → worst case = 120 + 2 + 120 + 2 + 46 + RESERVE ≈ 330.
-    // Simplified: 2× timeout + backoff + reserve (third attempt is headroom-blocked by FE4 fix).
+    // accommodate worst-case batch (1 full attempt + checkpoint I/O reserve).
+    // FE4's HeadroomExhaustedError already gates any second attempt dynamically
+    // at retry-time — this pre-batch check only guarantees room for ONE attempt.
     const ANALYSIS_CALL_TIMEOUT = 120_000;
-    const analysisBatchWorstCase = ANALYSIS_CALL_TIMEOUT * 2 + 5_000 + CHECKPOINT_RESERVE_MS; // 285s
+    const analysisBatchWorstCase = ANALYSIS_CALL_TIMEOUT + CHECKPOINT_RESERVE_MS; // 160s
     const platformDeadlineAnalysis = EFFECTIVE_CAP_MS - (Date.now() - startTime);
     if (platformDeadlineAnalysis < analysisBatchWorstCase) {
       console.log(`[pipeline:graceful-exit] Analysis phase — platformDeadline=${Math.round(platformDeadlineAnalysis / 1000)}s < batchWorstCase=${Math.round(analysisBatchWorstCase / 1000)}s — returning in_progress`);
@@ -1914,9 +1914,10 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
     if (await checkCancelled(ctx, runId, "merge_round")) return cancelledResult(runId, "merge_round");
 
     // Batch-aware graceful exit: use the real platform clock, not TIME_BUDGET.
-    // Merge: timeoutCap varies by round. Worst case = 2× timeoutCap + backoff + reserve.
+    // Merge: timeoutCap varies by round. Worst case = 1× timeoutCap + checkpoint reserve.
+    // FE4's HeadroomExhaustedError gates retries dynamically — no need to pre-provision 2×.
     const roundTimeoutCap = currentRound >= 2 ? 180_000 : 165_000;
-    const mergeBatchWorstCase = roundTimeoutCap * 2 + 5_000 + CHECKPOINT_RESERVE_MS;
+    const mergeBatchWorstCase = roundTimeoutCap + CHECKPOINT_RESERVE_MS;
     const platformDeadlineMergeRound = EFFECTIVE_CAP_MS - (Date.now() - startTime);
     if (platformDeadlineMergeRound < mergeBatchWorstCase) {
       console.log(`[pipeline:graceful-exit] Merge between-rounds — platformDeadline=${Math.round(platformDeadlineMergeRound / 1000)}s < batchWorstCase=${Math.round(mergeBatchWorstCase / 1000)}s (R${currentRound}, cap=${roundTimeoutCap / 1000}s) — returning in_progress`);
