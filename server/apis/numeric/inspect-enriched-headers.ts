@@ -70,7 +70,7 @@ export default api({
     const discrepancyDetails = result.discrepancies.map(d => ({
       period: d.period,
       metricCount: d.metrics.length,
-      metrics: d.metrics.slice(0, 25),
+      metrics: d.metrics, // Full list, no slice
     }));
 
     return {

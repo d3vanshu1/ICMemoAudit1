@@ -87,6 +87,7 @@ import GetNumericReport from './numeric/get-numeric-report.js';
 import InspectColHeaders from './numeric/inspect-col-headers.js';
 import InspectEnrichedHeaders from './numeric/inspect-enriched-headers.js';
 import InspectRowLabels from './numeric/inspect-row-labels.js';
+import InspectCellValues from './numeric/inspect-cell-values.js';
 import SearchNumericFindings from './numeric/search-numeric-findings.js';
 import DiagSharedFormulas from './numeric/diag-shared-formulas.js';
 import DiagFormulaExtraction from './numeric/diag-formula-extraction.js';
@@ -135,7 +136,7 @@ const apis = {
   ListDocuments, SaveDocument, UpdateDocument, DeleteDocument, GetDocumentTexts,
   SaveDocTables, GetDocTables, BackfillDocTablesFromText, GetDocTablesSummary, UpdateParsedText, ClearParsedText,
   // Numeric verification
-  NumericVerify, GetNumericReport, SearchNumericFindings, DiagSharedFormulas, DiagFormulaExtraction, InspectColHeaders, InspectEnrichedHeaders, InspectRowLabels,
+  NumericVerify, GetNumericReport, SearchNumericFindings, DiagSharedFormulas, DiagFormulaExtraction, InspectColHeaders, InspectEnrichedHeaders, InspectRowLabels, InspectCellValues,
   // Q&A
   IndexDocumentChunks, SearchChunks, AskDataRoom,
   // Checkpoints

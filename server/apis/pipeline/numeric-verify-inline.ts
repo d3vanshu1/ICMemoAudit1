@@ -181,7 +181,9 @@ const SCG_CROSS_AGREEMENT: CrossAgreementConfig = {
   matchingRule: "exact",
   absThreshold: 1_000, // £1k absolute minimum
   relThreshold: 0.0001, // 0.01% relative
-  maxRatio: 5, // Exclude partial-year vs full-year mismatches (ratio >5×)
+  // maxRatio removed: doc-pinning + base-year matching now eliminate the YTD-vs-full-year
+  // column mismatches that maxRatio was originally designed to catch. Legitimate large
+  // proportional changes (e.g. Total adjustments −210k→−2.7M) should not be filtered.
 };
 
 // Period column detection: matches FY year columns and standard period labels
