@@ -87,7 +87,7 @@ export default api({
     const ratio = rowCount > 0 ? meaningfulCount / rowCount : 0;
     const derivationTriggered = rowCount > 0 && ratio < 0.3;
 
-    // Reproduce the label-column-selection heuristic
+    // Reproduce the multi-column label derivation (matches engine exactly)
     const colStringFreq = new Map<number, number>();
     for (const cell of cells) {
       if (cell.r < rowCount && cell.type === "string" && cell.value != null && String(cell.value).trim() !== "" && cell.c < 6) {
@@ -95,22 +95,31 @@ export default api({
       }
     }
 
-    let chosenLabelCol = 0;
-    let maxFreq = 0;
-    for (const [col, freq] of colStringFreq) {
-      if (col < 4 && freq > maxFreq) { // Original limit is c < 4
-        maxFreq = freq;
-        chosenLabelCol = col;
+    // Sort columns by frequency (descending) — matches engine
+    const labelCols = [...colStringFreq.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([col]) => col);
+    const chosenLabelCol = labelCols[0] ?? 0;
+
+    // Build lookup: row,col → value
+    const cellsByRowCol = new Map<string, string>();
+    for (const cell of cells) {
+      if (cell.r < rowCount && cell.type === "string" && cell.value != null && cell.c < 6) {
+        const val = String(cell.value).trim();
+        if (val && val !== "x") {
+          cellsByRowCol.set(`${cell.r},${cell.c}`, val);
+        }
       }
     }
 
-    // Derive labels (same logic as engine)
+    // Derive labels: iterate columns in frequency order (matches engine)
     const derived: string[] = new Array(rowCount).fill("");
-    for (const cell of cells) {
-      if (cell.c === chosenLabelCol && cell.r < rowCount && cell.type === "string" && cell.value != null) {
-        const label = String(cell.value).trim();
-        if (label && label !== "x") {
-          derived[cell.r] = label;
+    for (const col of labelCols) {
+      for (let ri = 0; ri < rowCount; ri++) {
+        if (derived[ri]) continue;
+        const val = cellsByRowCol.get(`${ri},${col}`);
+        if (val) {
+          derived[ri] = val;
         }
       }
     }

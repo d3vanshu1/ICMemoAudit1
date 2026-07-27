@@ -161,8 +161,6 @@ const DocTableDataSchema = z.object({
  * SCG metric config: which row labels constitute "metrics" for figure reading.
  * Covers the standard P&L/BS/CF hierarchy. If a row label matches any pattern,
  * its values across all period columns are emitted as verified figures.
- * Also used as cross-agreement filter to restrict divergence comparisons to
- * these material metrics (prevents detail-level noise in clean periods).
  */
 const SCG_METRIC_CONFIG: MetricConfig = {
   isRegex: true,
@@ -184,7 +182,6 @@ const SCG_CROSS_AGREEMENT: CrossAgreementConfig = {
   absThreshold: 1_000, // £1k absolute minimum
   relThreshold: 0.0001, // 0.01% relative
   maxRatio: 5, // Exclude partial-year vs full-year mismatches (ratio >5×)
-  metricFilter: SCG_METRIC_CONFIG, // Only compare configured metric labels
 };
 
 // Period column detection: matches FY year columns and standard period labels
