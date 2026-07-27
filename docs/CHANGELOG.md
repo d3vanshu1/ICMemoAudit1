@@ -1,5 +1,65 @@
 # CHANGELOG
 
+## Numeric Verification Engine Rewrite — 2026-07-27
+
+**Context:** Replace the within-sheet subtotal reconciliation engine (which produced 84 phantom
+"critical" discrepancies on the SCG model) with a two-layer architecture: metric figures + cross-agreement only.
+
+**Root cause of the 84 false positives:**
+1. Path A (formula re-sum) was tautologically zero for all formula cells → could ONLY false-positive
+2. Path B (positional heuristic) swept across section boundaries, picking up revenue lines when
+   scanning for "Total direct costs" components. The same workbook flips layout — totals sit above
+   detail in the live FS Summary and below on the hardcoded tab.
+3. Duplicate row labels in adjustment/notes sections caused cross-agreement map overwrites,
+   generating divergences from non-primary structural rows.
+
+**Changes:**
+
+### 1. Engine rewrite (`server/apis/pipeline/numeric-verify-inline.ts`)
+
+- **Deleted:** subtotal reconciliation (Path A + Path B), sign consistency, monotonicity checks
+- **Layer 1 — Metric Figures:** Reads cell values at {label, period} addresses identified by
+  deal-layer config (regex-based `MetricConfig`). No column/keyword assumptions in engine core.
+- **Layer 2 — Cross-Agreement:** The ONLY discrepancy emitter. Matches {label, period} across
+  two configured source sheets. Threshold: max(£1k absolute, 0.01% relative). Rolled up by period.
+  Framed as "confirm intentional vs stale/contradiction," not asserted errors.
+- **First-occurrence-wins deduplication:** When duplicate row labels exist for the same period,
+  the first (primary structural) occurrence is kept. Prevents downstream adjustment rows from
+  shadowing the main metric row in cross-agreement maps.
+- **Design invariant:** Within-sheet subtotal discrepancies = 0 (by design — nothing emits them).
+
+### 2. Standalone API delegation (`server/apis/numeric/numeric-verify.ts`)
+
+- Replaced 1,257-line standalone copy with a thin wrapper that delegates to `runNumericVerifyInline()`.
+- Resolves `deal_id` from provided `documentIds` via documents table.
+- Output schema updated: figures now include `period` and `source_sheet`; discrepancies
+  restricted to `check_type: "cross_doc_agreement"` with `period` and `metrics[]` cluster.
+
+### 3. Pipeline numericBlock framing (`pipeline-core.ts`, `format-report.ts`)
+
+- `numericBlock` = verified-figures list, framed "trustworthy values — flag where the NARRATIVE
+  disagrees with these." Removed "AUTHORITATIVE GROUND TRUTH" language and discrepancy injection.
+- Merge prompt instructions updated: figures-only context, no forced contradiction assertions.
+- FormatReport appendix: "Verified Figures" + any cross-agreement divergences (clean rendering).
+
+### Acceptance test results (SCG deal, 2 documents, 39 tables):
+
+| Criterion | Result |
+|-----------|--------|
+| Within-sheet subtotal discrepancies on FS Summary | **0** ✅ |
+| Total direct costs (r207) flagged | **No** ✅ |
+| Total overheads (r223) flagged | **No** ✅ |
+| Figures emitted | 101 |
+| Discrepancies emitted | 0 |
+
+**Files modified:**
+- `server/apis/pipeline/numeric-verify-inline.ts` (full rewrite, 724 lines)
+- `server/apis/numeric/numeric-verify.ts` (delegation wrapper, 160 lines)
+- `server/apis/pipeline/pipeline-core.ts` (numericBlock builder + merge prompt)
+- `server/apis/modules/format-report.ts` (numericBlock builder + appendix rendering)
+
+---
+
 ## Pre-Run-#2 Change-Set — 2026-07-25
 
 **Context:** Final deployment before run #2. Addresses the structural graceful-exit gap identified

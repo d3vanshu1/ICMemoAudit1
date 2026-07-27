@@ -1811,32 +1811,37 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   let accumulatedHousekeeping: MergedFinding[] = [];
 
   // Build numeric block for merge
+  // Architecture: figures = trustworthy cell values (flag where narrative disagrees);
+  //               discrepancies = cross-agreement only (live vs frozen reference sheet).
   const hasNumericData = !!(numericReport && NUMERIC_MODULES.has(moduleId) &&
     (numericReport.figures.length > 0 || numericReport.discrepancies.length > 0));
 
   let numericBlock = "";
   if (hasNumericData && numericReport) {
-    const critDisc = numericReport.discrepancies.filter((d: Record<string, unknown>) => d.severity === "critical");
-    const otherDisc = numericReport.discrepancies.filter((d: Record<string, unknown>) => d.severity !== "critical");
-    numericBlock = `\n\n## Numeric Verification Report\n*Source: deterministic arithmetic engine*\n\n`;
+    numericBlock = `\n\n## Numeric Verification Report\n*Source: deterministic cell-value reads from the financial model*\n\n`;
+
+    // Cross-agreement discrepancies (the ONLY discrepancy source)
     if (numericReport.discrepancies.length > 0) {
-      numericBlock += `### Discrepancies (${numericReport.discrepancies.length} total, ${critDisc.length} critical)\n`;
-      for (const d of [...critDisc, ...otherDisc]) {
+      numericBlock += `### Cross-Version Divergences\n`;
+      numericBlock += `*These are differences between the live model and a frozen reference. Confirm whether each reflects an intentional update or a stale/contradictory reference.*\n\n`;
+      for (const d of numericReport.discrepancies) {
         const disc = d as Record<string, unknown>;
-        numericBlock += `- **[${String(disc.severity).toUpperCase()}]** ${String(disc.description)}`;
-        if (disc.expected != null && disc.actual != null) numericBlock += ` (expected: ${disc.expected}, reported: ${disc.actual})`;
-        numericBlock += `\n`;
+        numericBlock += `- **[${String(disc.severity).toUpperCase()}]** ${String(disc.description)}\n`;
       }
+      numericBlock += `\n`;
     }
+
+    // Verified figures — trustworthy values for narrative comparison
     if (numericReport.figures.length > 0) {
-      numericBlock += `### Verified Figures\n`;
-      const MAX_FIGURES = 200;
-      if (numericReport.figures.length > MAX_FIGURES) {
-        console.warn(`[pipeline-core] numeric figures capped at ${MAX_FIGURES} (had ${numericReport.figures.length})`);
+      numericBlock += `### Verified Figures (Trustworthy Cell Values)\n`;
+      numericBlock += `*Flag where narrative claims disagree with these code-read values.*\n\n`;
+      const MAX_FIG_DISPLAY = 200;
+      const figuresArr = numericReport.figures as Array<Record<string, unknown>>;
+      if (figuresArr.length > MAX_FIG_DISPLAY) {
+        console.warn(`[pipeline-core] numeric figures capped at ${MAX_FIG_DISPLAY} (had ${figuresArr.length})`);
       }
-      for (const f of numericReport.figures.slice(0, MAX_FIGURES)) {
-        const fig = f as Record<string, unknown>;
-        numericBlock += `- **${String(fig.name)}**: ${fig.recomputed_value} @ ${String(fig.source_cell)}\n`;
+      for (const fig of figuresArr.slice(0, MAX_FIG_DISPLAY)) {
+        numericBlock += `- **${String(fig.name)}** (${String(fig.period ?? "")}): ${fig.value ?? fig.recomputed_value} @ ${String(fig.source_cell)}\n`;
       }
     }
   }
@@ -1844,18 +1849,19 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // Prepare base merge prompt (numeric blocks are static, findings rule varies per round)
   let baseMergePrompt = rawMergePrompt;
   if (hasNumericData) {
-    const numericVerifInst = `## NUMERIC VERIFICATION — AUTHORITATIVE GROUND TRUTH
+    const numericVerifInst = `## NUMERIC VERIFICATION — TRUSTWORTHY VALUES
 
-A "## Numeric Verification Report" section appears in the input below. It contains deterministic arithmetic results produced by code — NOT by AI inference. You MUST:
-- Treat every figure and discrepancy in that section as factual ground truth
-- Any narrative claim that contradicts a code-verified figure is a CONFIRMED contradiction
-- Cross-doc agreement discrepancies are pre-verified contradictions — report them directly as findings
-- Never re-derive or contradict a code-verified figure based on text reading${numericPartial ? `
+A "## Numeric Verification Report" section appears in the input below. It contains cell values read directly from the financial model by code — NOT by AI inference. You MUST:
+- Treat every "Verified Figure" as a trustworthy cell value from the model
+- Flag where NARRATIVE claims (from CIM, IC memo, management presentations) disagree with these values — that is a potential contradiction
+- "Cross-Version Divergences" compare the live model to a frozen reference; frame these as "confirm intentional revision vs stale reference," not as asserted errors
+- Never invent or re-derive figures — only cite values that appear in the Verified Figures list
+- Do NOT treat absence from the list as evidence of a problem — the list covers configured metrics only${numericPartial ? `
 
-⚠️ PARTIAL COVERAGE WARNING: The numeric verification engine ran out of time and could NOT process all documents/tables in this deal. The figures and discrepancies below are correct for the tables that WERE analyzed, but ABSENCE of a discrepancy does NOT prove correctness — unverified tables may contain additional arithmetic errors. Do NOT claim "code-verified" status for any figure that does not explicitly appear in the Numeric Verification Report below.` : ""}`;
+⚠️ PARTIAL COVERAGE: The engine ran out of time before processing all tables. Verified Figures are correct for what was analyzed, but coverage is incomplete.` : ""}`;
     baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_VERIFICATION_BLOCK}}", numericVerifInst);
     baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_TASK_STEP_1}}",
-      "**Numeric Contradictions First**: Convert every discrepancy from the Numeric Verification Report into a finding.\n");
+      "**Cross-Version Divergences First**: If the Numeric Verification Report contains cross-version divergences, assess each cluster and report as findings where they indicate stale references or contradictions (not merely intentional updates).\n");
   } else {
     baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_VERIFICATION_BLOCK}}", "");
     baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_TASK_STEP_1}}", "");

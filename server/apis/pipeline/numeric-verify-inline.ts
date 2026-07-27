@@ -1,41 +1,23 @@
 /**
  * Inline Numeric Verification — server-side callable function.
  *
- * This is a REWRITE of the NumericVerify API as a plain exported function that
- * pipeline-core.ts invokes directly after Step 0.6 (doc_tables backfill). It
- * produces an identical report shape so that `hasNumericData` can be freshly
- * computed within the same invocation — closing the two-run bug where the
- * client-side NumericVerify ran before backfill and the server never recomputed.
+ * REWRITTEN 2026-07-27: Replaced subtotal/sign/monotonicity heuristics
+ * (which produced 84 false-positive "critical" discrepancies on the SCG model)
+ * with a two-layer architecture:
  *
- * ═══════════════════════════════════════════════════════════════════════════════
- * DESIGN CONSTRAINTS (from session context — do not violate):
- * ═══════════════════════════════════════════════════════════════════════════════
+ *   Layer 1 — METRIC FIGURES: Read cell values at known {label, period} addresses.
+ *             The label→address mapping is deal-layer config, not engine logic.
+ *             Produces trustworthy values for the merge prompt to compare against narrative.
  *
- * 1. ALL FOUR CHECKS PRESERVED:
- *    - subtotal reconciliation
- *    - sign consistency (cash-flow bridges)
- *    - monotonicity (sensitivity tables)
- *    - cross-document agreement
+ *   Layer 2 — CROSS-AGREEMENT: The ONLY discrepancy emitter. Matches {label, period}
+ *             across two source sheets, flags divergence > max(£1k, 0.01%), rolls up
+ *             by period. Frames findings as "confirm intentional vs stale/contradiction."
  *
- * 2. PARTIAL FLAG + PROGRESS COUNTS:
- *    partial, documentsProcessed, documentsTotal, tablesLoaded, tablesTotal
- *    Reported honestly so downstream merge prompt knows when coverage is incomplete.
- *
- * 3. TIME-BUDGET + CHECKPOINT BEHAVIOR:
- *    Respects a caller-supplied time budget. If exhausted, returns partial=true
- *    with whatever was computed so far. Next invocation resumes — the function
- *    is stateless (no persisted checkpoint), but the result itself carries enough
- *    metadata for the caller to know coverage was incomplete.
- *
- * 4. PAGINATED doc_tables LOADING:
- *    Tables are loaded individually by ID after an index query. Never loads all
- *    doc_tables data in a single query (gRPC 4MB limit).
- *
- * 5. RECOMPUTES hasNumericData:
- *    The result is returned to pipeline-core, which uses it to rebuild
- *    numericBlock and hasNumericData AFTER the doc_tables backfill.
- *
- * ═══════════════════════════════════════════════════════════════════════════════
+ * Design constraints:
+ *   - Engine core has NO column/keyword/sheet-name assumptions — those live in deal config.
+ *   - Cross-agreement matching rule and source sheets are deal-specific config.
+ *   - SheetJS formula population is no longer load-bearing; values only.
+ *   - Within-sheet subtotal discrepancies = 0 (by design: nothing emits them).
  */
 import { z } from "@superblocksteam/sdk-api";
 
@@ -53,21 +35,53 @@ export interface NumericVerifyResult {
   tablesTotal: number;
 }
 
-interface Figure {
+export interface Figure {
   name: string;
-  recomputed_value: number | string;
+  period: string;
+  value: number;
   source_doc: string;
   source_cell: string;
-  formula?: string;
+  source_sheet: string;
 }
 
-interface Discrepancy {
+export interface Discrepancy {
   description: string;
   severity: "critical" | "warning" | "info";
-  check_type: "subtotal_reconciliation" | "sign_consistency" | "monotonicity" | "cross_doc_agreement";
+  check_type: "cross_doc_agreement";
   sources: string[];
-  expected?: number | string;
-  actual?: number | string;
+  period: string;
+  metrics: Array<{ label: string; sourceA: number; sourceB: number; absDiff: number; relDiffPct: number }>;
+}
+
+/**
+ * Deal-layer config for cross-agreement checks.
+ * Identifies which sheets to compare and how to match metrics.
+ */
+export interface CrossAgreementConfig {
+  /** Source A: sheet identifier (sheet_or_page match string) */
+  sourceASheet: string;
+  /** Source B: sheet identifier (sheet_or_page match string) */
+  sourceBSheet: string;
+  /** Matching rule: "exact" = exact string match on row labels; future: "semantic" */
+  matchingRule: "exact";
+  /** Optional: restrict to these row labels. If empty/null, all shared labels are compared. */
+  restrictLabels?: string[];
+  /** Divergence threshold: absolute minimum difference to flag (e.g., 1000 for £1k) */
+  absThreshold: number;
+  /** Divergence threshold: relative (e.g., 0.0001 for 0.01%) */
+  relThreshold: number;
+}
+
+/**
+ * Deal-layer config: which metrics to read as verified figures.
+ * If empty, the engine falls back to reading all rows matching METRIC_KEYWORDS
+ * in the configured source sheets.
+ */
+export interface MetricConfig {
+  /** Label patterns to match (exact or regex) */
+  labelPatterns: string[];
+  /** If true, patterns are case-insensitive regex; if false, exact string match */
+  isRegex: boolean;
 }
 
 type Cell = {
@@ -75,7 +89,6 @@ type Cell = {
   c: number;
   value: number | string | null;
   type: "number" | "string" | "date" | "boolean" | "empty";
-  formula?: string;
 };
 
 interface ParsedTable {
@@ -114,88 +127,52 @@ const DocTableDataSchema = z.object({
   data: z.any(),
 });
 
-const SummaryCellSchema = z.object({
-  row_idx: z.coerce.number(),
-  row_label: z.string(),
-  col_idx: z.coerce.number(),
-  col_label: z.string(),
-  cell_value: z.any(),
-  cell_type: z.string(),
-});
+// ---------------------------------------------------------------------------
+// Config: SCG deal-specific (hardcoded for now; future: DB-stored per deal)
+// ---------------------------------------------------------------------------
 
-const ColHeaderSchema = z.object({ label: z.string() });
+/**
+ * SCG cross-agreement config.
+ * Compares "FS Summary" (live model) vs "FS Summary (hardcoded)" (frozen reference).
+ */
+const SCG_CROSS_AGREEMENT: CrossAgreementConfig = {
+  sourceASheet: "FS Summary",
+  sourceBSheet: "FS Summary (hardcoded)",
+  matchingRule: "exact",
+  absThreshold: 1_000, // £1k absolute minimum
+  relThreshold: 0.0001, // 0.01% relative
+};
+
+/**
+ * SCG metric config: which row labels constitute "metrics" for figure reading.
+ * Covers the standard P&L/BS/CF hierarchy. If a row label matches any pattern,
+ * its values across all period columns are emitted as verified figures.
+ */
+const SCG_METRIC_CONFIG: MetricConfig = {
+  isRegex: true,
+  labelPatterns: [
+    "^Total\\s+(direct\\s+costs|overheads|revenue)",
+    "^(Revenue|EBITDA|EBIT|Gross\\s+Profit|Net\\s+Income|Operating\\s+Profit)",
+    "^(Adjusted|Normalised|Underlying)\\s+(EBITDA|EBIT|Revenue)",
+    "^(ARR|MRR|Net\\s+Revenue|Recurring\\s+Revenue)",
+    "^Surgery\\s+Intellect\\s+GP",
+  ],
+};
+
+// Period column detection: matches FY year columns and standard period labels
+const PERIOD_COL_PATTERN = /\b(20\d{2}|fy\s*\d{2,4}|cy\s*\d{2,4}|q[1-4]|h[12]|ytd|ltm)\b|^(actual|forecast|budget|plan)$/i;
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
-const TOLERANCE = 1e-6;
-const MAX_DATA_BYTES = 2_500_000; // skip tables larger than 2.5MB
-const MAX_PER_GROUP = 3;
-const MAX_DISCREPANCIES = 100;
-const MAX_FIGURES = 200;
+const MAX_DATA_BYTES = 2_500_000;
+const MAX_FIGURES = 500;
+const MAX_DISCREPANCIES = 50;
 
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
-
-function round(v: number, places = 4): number {
-  return Math.round(v * 10 ** places) / 10 ** places;
-}
-
-function cellRef(table: ParsedTable, cell: Cell): string {
-  const row = table.rowHeaders[cell.r] ?? `row${cell.r}`;
-  const col = table.colHeaders[cell.c] ?? `col${cell.c}`;
-  return `[${table.sheetOrPage}] ${row} / ${col}`;
-}
-
-function numericCellsInRow(table: ParsedTable, rowIdx: number): Cell[] {
-  return table.cells.filter((c) => c.r === rowIdx && c.type === "number" && c.value !== null);
-}
-
-function isSubtotalHeader(header: string): boolean {
-  const h = header.toLowerCase().trim();
-  if (!h) return false;
-  if (/\b(total|subtotal|sub-total|sum|grand)\b/.test(h)) return true;
-  if (/\b(aggregate)\b/.test(h)) return true;
-  if (/\bgross\s*profit\b/.test(h)) return true;
-  if (/\bebitda\b/.test(h)) return true;
-  if (/\bebit\b/.test(h) && !/\bebitda\b/.test(h)) return true;
-  if (/\bnoi\b/.test(h)) return true;
-  if (/\bnet\s+(income|revenue|profit|result|earnings|margin|proceeds|cash|operating|position)\b/.test(h)) return true;
-  if (/^net$/.test(h)) return true;
-  return false;
-}
-
-function isSensitivityHeader(headers: string[]): boolean {
-  let numericHeaders = 0;
-  for (const h of headers) {
-    if (!h) continue;
-    const cleaned = h.replace(/[%x\s]/gi, "");
-    if (!isNaN(Number(cleaned)) && cleaned !== "") numericHeaders++;
-  }
-  return numericHeaders >= Math.min(3, headers.length);
-}
-
-function isCashFlowSheet(caption: string, sheetName: string): boolean {
-  const text = (caption + " " + sheetName).toLowerCase();
-  return (
-    text.includes("cash flow") ||
-    text.includes("cashflow") ||
-    text.includes("ofcf") ||
-    text.includes("fcf") ||
-    text.includes("bridge") ||
-    text.includes("waterfall") ||
-    text.includes("sources and uses")
-  );
-}
-
-function normalizeLabel(label: string): string {
-  return label
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "")
-    .trim();
-}
 
 function buildGrid(table: ParsedTable): void {
   for (const cell of table.cells) {
@@ -203,311 +180,259 @@ function buildGrid(table: ParsedTable): void {
   }
 }
 
+function cellRef(table: ParsedTable, rowIdx: number, colIdx: number): string {
+  const row = table.rowHeaders[rowIdx] ?? `row${rowIdx}`;
+  const col = table.colHeaders[colIdx] ?? `col${colIdx}`;
+  return `[${table.sheetOrPage}] ${row} / ${col}`;
+}
+
+function isPeriodCol(label: string): boolean {
+  return PERIOD_COL_PATTERN.test(label.trim());
+}
+
+function normalizePeriod(label: string): string {
+  // Extract the core period identifier for matching across sheets
+  const cleaned = label.trim().toLowerCase();
+  // Try to extract a 4-digit year
+  const yearMatch = cleaned.match(/\b(20\d{2})\b/);
+  if (yearMatch) return yearMatch[1];
+  return cleaned;
+}
+
+function matchesMetricConfig(rowLabel: string, config: MetricConfig): boolean {
+  if (!rowLabel || rowLabel.trim() === "" || rowLabel === "x") return false;
+  for (const pattern of config.labelPatterns) {
+    if (config.isRegex) {
+      if (new RegExp(pattern, "i").test(rowLabel)) return true;
+    } else {
+      if (rowLabel.trim().toLowerCase() === pattern.toLowerCase()) return true;
+    }
+  }
+  return false;
+}
+
+function matchesCrossSheet(sheetOrPage: string, configSheet: string): boolean {
+  // For "FS Summary" vs "FS Summary (hardcoded)":
+  // "FS Summary" matches "FS Summary" but NOT "FS Summary (hardcoded)"
+  // Exact match on the full sheet name
+  return sheetOrPage.trim().toLowerCase() === configSheet.trim().toLowerCase();
+}
+
 // ---------------------------------------------------------------------------
-// Check 1: Subtotal reconciliation
+// Layer 1: Metric Figures — read cell values at known metric labels
 // ---------------------------------------------------------------------------
 
-function checkSubtotalReconciliation(
+function extractMetricFigures(
   table: ParsedTable,
-  figures: Figure[],
-  discrepancies: Discrepancy[]
-): void {
-  const { rowHeaders, colHeaders } = table;
-  if (rowHeaders.length < 2) return;
-
-  const totalRowIndices: number[] = [];
-  for (let ri = 0; ri < rowHeaders.length; ri++) {
-    if (isSubtotalHeader(rowHeaders[ri])) totalRowIndices.push(ri);
-  }
-
-  for (const totalRow of totalRowIndices) {
-    const totalCells = numericCellsInRow(table, totalRow);
-
-    for (const totalCell of totalCells) {
-      const reportedTotal = totalCell.value as number;
-      const ci = totalCell.c;
-
-      const prevTotalIdx = [...totalRowIndices].reverse().find((t) => t < totalRow) ?? -1;
-      const startRow = prevTotalIdx + 1;
-
-      const addends: number[] = [];
-      for (let ri = startRow; ri < totalRow; ri++) {
-        const cell = table.grid.get(`${ri},${ci}`);
-        if (cell?.type === "number" && cell.value !== null && !isSubtotalHeader(rowHeaders[ri])) {
-          addends.push(cell.value as number);
-        }
-      }
-
-      if (addends.length < 2) continue;
-
-      const recomputed = round(addends.reduce((a, b) => a + b, 0));
-      const reported = round(reportedTotal);
-
-      figures.push({
-        name: `${rowHeaders[totalRow]} (${colHeaders[ci] || `col${ci}`})`,
-        recomputed_value: recomputed,
-        source_doc: table.documentId,
-        source_cell: cellRef(table, totalCell),
-        formula: totalCell.formula,
-      });
-
-      if (Math.abs(recomputed - reported) > TOLERANCE * Math.max(1, Math.abs(reported))) {
-        const pctDiff = reported !== 0 ? ((recomputed - reported) / Math.abs(reported)) * 100 : Infinity;
-        const severity: Discrepancy["severity"] = Math.abs(pctDiff) > 5 ? "critical" : "warning";
-
-        discrepancies.push({
-          description: `Subtotal mismatch in "${table.sheetOrPage}": row "${rowHeaders[totalRow]}", col "${colHeaders[ci] || `col${ci}`}" — reported ${reported.toLocaleString()} but sum of components = ${recomputed.toLocaleString()} (${pctDiff > 0 ? "+" : ""}${round(pctDiff, 2)}%)`,
-          severity,
-          check_type: "subtotal_reconciliation",
-          sources: [`${table.documentId}::${table.sheetOrPage}`],
-          expected: recomputed,
-          actual: reported,
-        });
-      }
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Check 2: Sign consistency in cash-flow bridges
-// ---------------------------------------------------------------------------
-
-function checkSignConsistency(
-  table: ParsedTable,
-  figures: Figure[],
-  discrepancies: Discrepancy[]
-): void {
-  if (!isCashFlowSheet(table.caption, table.sheetOrPage)) return;
-
-  const { rowHeaders, colHeaders } = table;
-
-  const periodCols: number[] = [];
-  for (let ci = 1; ci < colHeaders.length; ci++) {
-    const h = colHeaders[ci];
-    if (/\d{4}|fy|cy|q\d|year|period/i.test(h)) periodCols.push(ci);
-  }
-  if (periodCols.length === 0) {
-    for (let ci = 1; ci < colHeaders.length; ci++) {
-      if (!isNaN(Number(colHeaders[ci].replace(/[%,]/g, "")))) periodCols.push(ci);
-    }
-  }
-  if (periodCols.length === 0) return;
-
-  const startKeywords = /beginning|opening|start|initial|prior/i;
-  const endKeywords = /ending|closing|end|final|net|total|result/i;
-
-  for (const ci of periodCols) {
-    let startRowIdx = -1;
-    let endRowIdx = -1;
-
-    for (let ri = 0; ri < rowHeaders.length; ri++) {
-      const h = rowHeaders[ri];
-      if (startKeywords.test(h) && startRowIdx === -1) startRowIdx = ri;
-      if (endKeywords.test(h) && isSubtotalHeader(h)) endRowIdx = ri;
-    }
-
-    if (startRowIdx === -1 || endRowIdx === -1 || endRowIdx <= startRowIdx) continue;
-
-    const startCell = table.grid.get(`${startRowIdx},${ci}`);
-    const endCell = table.grid.get(`${endRowIdx},${ci}`);
-
-    if (!startCell || !endCell || startCell.type !== "number" || endCell.type !== "number") continue;
-    if (startCell.value === null || endCell.value === null) continue;
-
-    let bridgeSum = startCell.value as number;
-    for (let ri = startRowIdx + 1; ri < endRowIdx; ri++) {
-      const cell = table.grid.get(`${ri},${ci}`);
-      if (cell?.type === "number" && cell.value !== null && !isSubtotalHeader(rowHeaders[ri])) {
-        bridgeSum += cell.value as number;
-      }
-    }
-
-    const reported = round(endCell.value as number);
-    const recomputed = round(bridgeSum);
-
-    figures.push({
-      name: `${table.sheetOrPage} bridge end — ${colHeaders[ci]}`,
-      recomputed_value: recomputed,
-      source_doc: table.documentId,
-      source_cell: cellRef(table, endCell),
-      formula: endCell.formula,
-    });
-
-    if (Math.abs(recomputed - reported) > TOLERANCE * Math.max(1, Math.abs(reported))) {
-      const signFlipMatch = Math.abs(-recomputed - reported) < TOLERANCE * Math.max(1, Math.abs(reported));
-
-      discrepancies.push({
-        description: `Cash-flow bridge sign/arithmetic error in "${table.sheetOrPage}" (${colHeaders[ci]}): bridge from "${rowHeaders[startRowIdx]}" to "${rowHeaders[endRowIdx]}" — reported ${reported.toLocaleString()}, recomputed ${recomputed.toLocaleString()}${signFlipMatch ? ". This matches a SIGN FLIP (one component has wrong sign)." : ""}`,
-        severity: "critical",
-        check_type: "sign_consistency",
-        sources: [`${table.documentId}::${table.sheetOrPage}`],
-        expected: recomputed,
-        actual: reported,
-      });
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Check 3: Monotonicity in sensitivity tables
-// ---------------------------------------------------------------------------
-
-function checkMonotonicity(
-  table: ParsedTable,
-  discrepancies: Discrepancy[]
-): void {
-  const { rowHeaders, colHeaders } = table;
-
-  const hasSensKeyword =
-    /sensitiv|scenario|case|stress|upside|downside|base|bull|bear/i.test(
-      table.caption + " " + table.sheetOrPage
-    );
-  const numericColHeaders = isSensitivityHeader(colHeaders.slice(1));
-
-  if (!hasSensKeyword && !numericColHeaders) return;
-
-  for (let ri = 0; ri < rowHeaders.length; ri++) {
-    if (isSubtotalHeader(rowHeaders[ri])) continue;
-
-    const rowNums = table.cells
-      .filter((c) => c.r === ri && c.type === "number" && c.value !== null && c.c >= 1)
-      .sort((a, b) => a.c - b.c)
-      .map((c) => c.value as number);
-
-    if (rowNums.length < 3) continue;
-
-    let increases = 0;
-    let decreases = 0;
-    for (let i = 1; i < rowNums.length; i++) {
-      if (rowNums[i] > rowNums[i - 1] + TOLERANCE) increases++;
-      if (rowNums[i] < rowNums[i - 1] - TOLERANCE) decreases++;
-    }
-
-    const isMonotonic = increases === 0 || decreases === 0;
-
-    if (!isMonotonic) {
-      const violationIdx = rowNums.findIndex((v, i) =>
-        i > 0 &&
-        (increases > decreases
-          ? v < rowNums[i - 1] - TOLERANCE
-          : v > rowNums[i - 1] + TOLERANCE)
-      );
-
-      const violationColHeader = violationIdx >= 0
-        ? (colHeaders[violationIdx + 1] ?? `col${violationIdx + 1}`)
-        : "unknown";
-
-      discrepancies.push({
-        description: `Non-monotonic sensitivity table in "${table.sheetOrPage}", row "${rowHeaders[ri]}": values do not trend consistently (${increases > decreases ? "generally increasing" : "generally decreasing"} but reverses at "${violationColHeader}"). Values: [${rowNums.map((v) => round(v, 2)).join(", ")}]`,
-        severity: "warning",
-        check_type: "monotonicity",
-        sources: [`${table.documentId}::${table.sheetOrPage}`],
-      });
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Check 4: Cross-document agreement
-// ---------------------------------------------------------------------------
-
-function checkCrossDocAgreement(
-  tables: ParsedTable[],
-  figures: Figure[],
-  discrepancies: Discrepancy[]
-): void {
-  type FigureOccurrence = { doc: string; value: number; ref: string; tableCaption: string };
-  const figureMap = new Map<string, FigureOccurrence[]>();
-
-  const CROSS_DOC_KEYWORDS =
-    /revenue|arr|mrr|ebitda|ebit|gross profit|net income|net revenue|total revenue|operating income|cash|recurring/i;
-
-  for (const table of tables) {
-    const { rowHeaders, colHeaders } = table;
-    for (let ri = 0; ri < rowHeaders.length; ri++) {
-      const rowLabel = rowHeaders[ri];
-      if (!CROSS_DOC_KEYWORDS.test(rowLabel)) continue;
-
-      for (let ci = 1; ci < colHeaders.length; ci++) {
-        const cell = table.grid.get(`${ri},${ci}`);
-        if (!cell || cell.type !== "number" || cell.value === null) continue;
-
-        const key = `${normalizeLabel(rowLabel)}::${normalizeLabel(colHeaders[ci])}`;
-        if (!figureMap.has(key)) figureMap.set(key, []);
-
-        figureMap.get(key)!.push({
-          doc: table.documentId,
-          value: cell.value as number,
-          ref: cellRef(table, cell),
-          tableCaption: table.caption,
-        });
-      }
-    }
-  }
-
-  for (const [key, occurrences] of figureMap.entries()) {
-    const byDoc = new Map<string, FigureOccurrence[]>();
-    for (const occ of occurrences) {
-      if (!byDoc.has(occ.doc)) byDoc.set(occ.doc, []);
-      byDoc.get(occ.doc)!.push(occ);
-    }
-
-    if (byDoc.size < 2) continue;
-
-    const docValues: Array<{ doc: string; value: number; ref: string; caption: string }> = [];
-    for (const [doc, occs] of byDoc.entries()) {
-      docValues.push({ doc, value: occs[0].value, ref: occs[0].ref, caption: occs[0].tableCaption });
-    }
-
-    const [a, b] = docValues;
-    const absDiff = Math.abs(a.value - b.value);
-    const relDiff = Math.max(Math.abs(a.value), Math.abs(b.value)) > 1
-      ? absDiff / Math.max(Math.abs(a.value), Math.abs(b.value))
-      : absDiff;
-
-    if (relDiff > 0.005) {
-      const parts = key.split("::");
-      const figureName = parts[0] ?? key;
-      const colLabel = parts[1] ?? "";
-
-      figures.push({
-        name: `${figureName} (${colLabel}) — cross-doc mismatch`,
-        recomputed_value: a.value,
-        source_doc: a.doc,
-        source_cell: a.ref,
-      });
-
-      const severity: Discrepancy["severity"] = relDiff > 0.05 ? "critical" : "warning";
-
-      discrepancies.push({
-        description: `Cross-document figure mismatch for "${figureName}" (${colLabel}): doc "${a.caption}" = ${round(a.value, 2).toLocaleString()} vs doc "${b.caption}" = ${round(b.value, 2).toLocaleString()} (${round(relDiff * 100, 2)}% difference). Documents do not agree on this figure.`,
-        severity,
-        check_type: "cross_doc_agreement",
-        sources: [a.ref, b.ref],
-        expected: a.value,
-        actual: b.value,
-      });
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// All checks orchestrator
-// ---------------------------------------------------------------------------
-
-function runAllChecks(tables: ParsedTable[]): { figures: Figure[]; discrepancies: Discrepancy[] } {
+  metricConfig: MetricConfig
+): Figure[] {
   const figures: Figure[] = [];
-  const discrepancies: Discrepancy[] = [];
+  const { rowHeaders, colHeaders } = table;
 
-  for (const table of tables) {
-    checkSubtotalReconciliation(table, figures, discrepancies);
-    checkSignConsistency(table, figures, discrepancies);
-    checkMonotonicity(table, discrepancies);
+  // Identify period columns
+  const periodCols: Array<{ colIdx: number; period: string }> = [];
+  for (let ci = 0; ci < colHeaders.length; ci++) {
+    if (isPeriodCol(colHeaders[ci])) {
+      periodCols.push({ colIdx: ci, period: normalizePeriod(colHeaders[ci]) });
+    }
+  }
+  if (periodCols.length === 0) return figures;
+
+  // Find metric rows
+  for (let ri = 0; ri < rowHeaders.length; ri++) {
+    const label = rowHeaders[ri];
+    if (!matchesMetricConfig(label, metricConfig)) continue;
+
+    for (const { colIdx, period } of periodCols) {
+      const cell = table.grid.get(`${ri},${colIdx}`);
+      if (!cell || cell.type !== "number" || cell.value === null) continue;
+
+      figures.push({
+        name: label.trim(),
+        period,
+        value: cell.value as number,
+        source_doc: table.documentId,
+        source_cell: cellRef(table, ri, colIdx),
+        source_sheet: table.sheetOrPage,
+      });
+    }
   }
 
-  checkCrossDocAgreement(tables, figures, discrepancies);
+  return figures;
+}
 
-  return { figures, discrepancies };
+// ---------------------------------------------------------------------------
+// Layer 2: Cross-Agreement — the ONLY discrepancy emitter
+// ---------------------------------------------------------------------------
+
+interface CrossAgreementEntry {
+  label: string;
+  period: string;
+  value: number;
+  sourceRef: string;
+}
+
+function runCrossAgreement(
+  tables: ParsedTable[],
+  config: CrossAgreementConfig
+): { discrepancies: Discrepancy[]; figures: Figure[] } {
+  const discrepancies: Discrepancy[] = [];
+  const figures: Figure[] = [];
+
+  // Find tables matching source A and source B
+  const sourceATables = tables.filter((t) => matchesCrossSheet(t.sheetOrPage, config.sourceASheet));
+  const sourceBTables = tables.filter((t) => matchesCrossSheet(t.sheetOrPage, config.sourceBSheet));
+
+  if (sourceATables.length === 0 || sourceBTables.length === 0) {
+    console.log(`[NumericInline:CrossAgreement] Source not found: A="${config.sourceASheet}" (${sourceATables.length}), B="${config.sourceBSheet}" (${sourceBTables.length})`);
+    return { discrepancies, figures };
+  }
+
+  // Use first matching table for each source
+  const tableA = sourceATables[0];
+  const tableB = sourceBTables[0];
+
+  // Extract all numeric entries from both sheets
+  const entriesA = extractAllNumericEntries(tableA);
+  const entriesB = extractAllNumericEntries(tableB);
+
+  // Build lookup maps: key = "normalizedLabel::normalizedPeriod"
+  // Use first-occurrence-wins to avoid downstream rows with the same label
+  // (e.g., a "Total direct costs" in an adjustments section) from shadowing
+  // the primary structural row.
+  const mapA = new Map<string, CrossAgreementEntry>();
+  for (const e of entriesA) {
+    const key = `${e.label.trim().toLowerCase()}::${e.period}`;
+    if (!mapA.has(key)) mapA.set(key, e);
+  }
+
+  const mapB = new Map<string, CrossAgreementEntry>();
+  for (const e of entriesB) {
+    const key = `${e.label.trim().toLowerCase()}::${e.period}`;
+    if (!mapB.has(key)) mapB.set(key, e);
+  }
+
+  // Compare: find keys present in both maps with divergence > threshold
+  // Group divergences by period for rolled-up reporting
+  const divergencesByPeriod = new Map<string, Array<{
+    label: string;
+    valueA: number;
+    valueB: number;
+    absDiff: number;
+    relDiffPct: number;
+    refA: string;
+    refB: string;
+  }>>();
+
+  for (const [key, entryA] of mapA) {
+    const entryB = mapB.get(key);
+    if (!entryB) continue;
+
+    // Restrict labels if configured
+    if (config.restrictLabels && config.restrictLabels.length > 0) {
+      const labelMatch = config.restrictLabels.some(
+        (l) => l.toLowerCase() === entryA.label.trim().toLowerCase()
+      );
+      if (!labelMatch) continue;
+    }
+
+    const absDiff = Math.abs(entryA.value - entryB.value);
+    const maxAbs = Math.max(Math.abs(entryA.value), Math.abs(entryB.value));
+    const relDiff = maxAbs > 0 ? absDiff / maxAbs : 0;
+
+    // Apply threshold: divergence must exceed BOTH abs AND rel thresholds
+    // (i.e., flag only when the difference is meaningful in both absolute and relative terms)
+    if (absDiff > config.absThreshold && relDiff > config.relThreshold) {
+      const period = entryA.period;
+      if (!divergencesByPeriod.has(period)) divergencesByPeriod.set(period, []);
+      divergencesByPeriod.get(period)!.push({
+        label: entryA.label,
+        valueA: entryA.value,
+        valueB: entryB.value,
+        absDiff,
+        relDiffPct: relDiff * 100,
+        refA: entryA.sourceRef,
+        refB: entryB.sourceRef,
+      });
+    }
+
+    // Emit verified figures from source A (live model = authoritative)
+    figures.push({
+      name: entryA.label,
+      period: entryA.period,
+      value: entryA.value,
+      source_doc: tableA.documentId,
+      source_cell: entryA.sourceRef,
+      source_sheet: tableA.sheetOrPage,
+    });
+  }
+
+  // Roll up: one discrepancy per period containing the metric cluster
+  for (const [period, divergences] of divergencesByPeriod) {
+    if (divergences.length === 0) continue;
+
+    // Sort by absolute difference descending
+    divergences.sort((a, b) => b.absDiff - a.absDiff);
+
+    const metricSummary = divergences
+      .slice(0, 20) // cap for readability
+      .map((d) => `${d.label}: ${d.valueA.toLocaleString()} (${config.sourceASheet}) vs ${d.valueB.toLocaleString()} (${config.sourceBSheet}) — Δ${d.relDiffPct.toFixed(2)}%`)
+      .join("\n  ");
+
+    const severity: Discrepancy["severity"] = divergences.some((d) => d.relDiffPct > 5) ? "critical" : "warning";
+
+    discrepancies.push({
+      description: `Cross-version divergence in period "${period}" — ${divergences.length} metric(s) differ between "${config.sourceASheet}" and "${config.sourceBSheet}". Confirm whether these reflect intentional updates (live model revision) or stale/contradictory references:\n  ${metricSummary}`,
+      severity,
+      check_type: "cross_doc_agreement",
+      sources: [
+        `${tableA.documentId}::${tableA.sheetOrPage}`,
+        `${tableB.documentId}::${tableB.sheetOrPage}`,
+      ],
+      period,
+      metrics: divergences.map((d) => ({
+        label: d.label,
+        sourceA: d.valueA,
+        sourceB: d.valueB,
+        absDiff: d.absDiff,
+        relDiffPct: d.relDiffPct,
+      })),
+    });
+  }
+
+  return { discrepancies, figures };
+}
+
+function extractAllNumericEntries(table: ParsedTable): CrossAgreementEntry[] {
+  const entries: CrossAgreementEntry[] = [];
+  const { rowHeaders, colHeaders } = table;
+
+  // Identify period columns
+  const periodCols: Array<{ colIdx: number; period: string }> = [];
+  for (let ci = 0; ci < colHeaders.length; ci++) {
+    if (isPeriodCol(colHeaders[ci])) {
+      periodCols.push({ colIdx: ci, period: normalizePeriod(colHeaders[ci]) });
+    }
+  }
+
+  for (let ri = 0; ri < rowHeaders.length; ri++) {
+    const label = rowHeaders[ri];
+    if (!label || label.trim() === "" || label === "x") continue;
+
+    for (const { colIdx, period } of periodCols) {
+      const cell = table.grid.get(`${ri},${colIdx}`);
+      if (!cell || cell.type !== "number" || cell.value === null) continue;
+
+      entries.push({
+        label: label.trim(),
+        period,
+        value: cell.value as number,
+        sourceRef: cellRef(table, ri, colIdx),
+      });
+    }
+  }
+
+  return entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -615,69 +540,6 @@ function deriveColLabelsFromCells(originalHeaders: string[], cells: Cell[]): str
 }
 
 // ---------------------------------------------------------------------------
-// Deduplication & ranking
-// ---------------------------------------------------------------------------
-
-function deduplicateAndRank(
-  discrepancies: Discrepancy[],
-  maxPerGroup: number,
-  maxTotal: number
-): Discrepancy[] {
-  function groupKey(d: Discrepancy): string {
-    const rowMatch = d.description.match(/row "([^"]+)"/);
-    const sheetMatch = d.description.match(/in "([^"]+)"/);
-    const row = rowMatch?.[1] ?? "unknown";
-    const sheet = sheetMatch?.[1] ?? d.sources[0] ?? "unknown";
-    return `${d.check_type}::${sheet}::${row}`;
-  }
-
-  function severityRank(s: string): number {
-    switch (s) {
-      case "critical": return 0;
-      case "warning": return 1;
-      case "info": return 2;
-      default: return 3;
-    }
-  }
-
-  function deviation(d: Discrepancy): number {
-    if (d.expected != null && d.actual != null) {
-      const exp = typeof d.expected === "number" ? d.expected : parseFloat(String(d.expected));
-      const act = typeof d.actual === "number" ? d.actual : parseFloat(String(d.actual));
-      if (!isNaN(exp) && !isNaN(act) && Math.max(Math.abs(exp), Math.abs(act)) > 0) {
-        return Math.abs(exp - act) / Math.max(Math.abs(exp), Math.abs(act));
-      }
-    }
-    return 0;
-  }
-
-  const groups = new Map<string, Discrepancy[]>();
-  for (const d of discrepancies) {
-    const key = groupKey(d);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(d);
-  }
-
-  const kept: Discrepancy[] = [];
-  for (const [, group] of groups) {
-    group.sort((a, b) => {
-      const sevDiff = severityRank(a.severity) - severityRank(b.severity);
-      if (sevDiff !== 0) return sevDiff;
-      return deviation(b) - deviation(a);
-    });
-    kept.push(...group.slice(0, maxPerGroup));
-  }
-
-  kept.sort((a, b) => {
-    const sevDiff = severityRank(a.severity) - severityRank(b.severity);
-    if (sevDiff !== 0) return sevDiff;
-    return deviation(b) - deviation(a);
-  });
-
-  return kept.slice(0, maxTotal);
-}
-
-// ---------------------------------------------------------------------------
 // Main: runNumericVerifyInline
 // ---------------------------------------------------------------------------
 /**
@@ -685,9 +547,8 @@ function deduplicateAndRank(
  *
  * @param db - Database client (from ctx.integrations.db)
  * @param dealId - Deal UUID
- * @param timeBudgetMs - Maximum time to spend on verification. If exhausted,
- *                       returns partial=true with whatever was computed.
- *                       Pass `null` to disable time budget (run to completion).
+ * @param timeBudgetMs - Maximum time to spend. If exhausted, returns partial=true.
+ *                       Pass `null` to disable time budget.
  */
 export async function runNumericVerifyInline(
   db: DbClient,
@@ -698,7 +559,6 @@ export async function runNumericVerifyInline(
   const timeRemaining = () =>
     timeBudgetMs === null ? Infinity : timeBudgetMs - (Date.now() - startTime);
 
-  // Empty result for early returns
   const emptyResult: NumericVerifyResult = {
     figures: [],
     discrepancies: [],
@@ -709,9 +569,7 @@ export async function runNumericVerifyInline(
     tablesTotal: 0,
   };
 
-  // Step 1: Find spreadsheet documents for this deal that have doc_tables
-  // We query doc_tables directly (not documents) because we only care about
-  // docs that have structured table data available.
+  // Step 1: Find documents with doc_tables for this deal
   const DocumentIdSchema = z.object({ document_id: z.string() });
   const documentIdRows = await db.query(
     `SELECT DISTINCT document_id
@@ -725,23 +583,18 @@ export async function runNumericVerifyInline(
     { label: "NumericInline: find documents with doc_tables" }
   );
 
-  if (documentIdRows.length === 0) {
-    return emptyResult;
-  }
+  if (documentIdRows.length === 0) return emptyResult;
 
   const documentIds = documentIdRows.map((r) => r.document_id);
 
-  // Step 2: Build table index (metadata only — no data column)
-  // Paginated per-document to stay under gRPC limits
+  // Step 2: Build table index (metadata only)
   const tableIndex: z.infer<typeof TableIndexSchema>[] = [];
   let docsProcessed = 0;
   let timeBudgetExhaustedAtDocPhase = false;
 
   for (const docId of documentIds) {
     if (timeRemaining() < 30_000) {
-      console.log(
-        `[NumericInline] Time budget exhausted after ${docsProcessed}/${documentIds.length} documents — returning partial`
-      );
+      console.log(`[NumericInline] Time budget exhausted after ${docsProcessed}/${documentIds.length} documents`);
       timeBudgetExhaustedAtDocPhase = true;
       break;
     }
@@ -760,16 +613,29 @@ export async function runNumericVerifyInline(
     tableIndex.push(...rows);
   }
 
-  const loadable = tableIndex.filter((t) => t.data_length <= MAX_DATA_BYTES);
-  const oversized = tableIndex.filter((t) => t.data_length > MAX_DATA_BYTES);
+  // Step 3: Load table data — only sheets relevant to cross-agreement + metrics
+  // For SCG: "FS Summary" and "FS Summary (hardcoded)" are the comparison targets
+  const relevantSheets = new Set([
+    SCG_CROSS_AGREEMENT.sourceASheet.toLowerCase(),
+    SCG_CROSS_AGREEMENT.sourceBSheet.toLowerCase(),
+  ]);
 
-  if (oversized.length > 0) {
+  const loadable = tableIndex.filter(
+    (t) => t.data_length <= MAX_DATA_BYTES &&
+      relevantSheets.has(t.sheet_or_page.trim().toLowerCase())
+  );
+
+  const oversizedRelevant = tableIndex.filter(
+    (t) => t.data_length > MAX_DATA_BYTES &&
+      relevantSheets.has(t.sheet_or_page.trim().toLowerCase())
+  );
+
+  if (oversizedRelevant.length > 0) {
     console.log(
-      `[NumericInline] Skipping ${oversized.length} oversized table(s): ${oversized.map((t) => `${t.sheet_or_page} (${(t.data_length / 1_000_000).toFixed(1)}MB)`).join(", ")}`
+      `[NumericInline] Relevant sheets exceed size limit: ${oversizedRelevant.map((t) => `${t.sheet_or_page} (${(t.data_length / 1_000_000).toFixed(1)}MB)`).join(", ")}`
     );
   }
 
-  // Step 3: Load table data individually (paginated, respecting gRPC limit)
   const allRawRows: Array<{ id: string; document_id: string; sheet_or_page: string; caption: string | null; data: any }> = [];
   let timeBudgetExhaustedAtTableLoad = false;
 
@@ -791,94 +657,6 @@ export async function runNumericVerifyInline(
     allRawRows.push(...rows);
   }
 
-  // Step 4: For oversized tables, extract summary-level rows (totals/subtotals)
-  // so cross-doc agreement checks still work on key figures
-  for (const meta of oversized) {
-    if (timeRemaining() < 20_000) {
-      console.log(`[NumericInline] Time budget low — skipping remaining oversized tables`);
-      timeBudgetExhaustedAtTableLoad = true;
-      break;
-    }
-
-    const summaryRows = await db.query(
-      `WITH tbl AS (
-         SELECT data FROM doc_tables WHERE id = $1::uuid
-       ),
-       headers AS (
-         SELECT ordinality - 1 AS idx, elem::text AS label
-         FROM tbl, jsonb_array_elements_text(data->'row_headers') WITH ORDINALITY AS t(elem, ordinality)
-       ),
-       total_rows AS (
-         SELECT idx, label FROM headers
-         WHERE lower(label) ~ '(total|subtotal|sum|net|grand|ebitda|ebit|gross profit|revenue|arr|noi)'
-       ),
-       col_headers AS (
-         SELECT ordinality - 1 AS idx, elem::text AS label
-         FROM tbl, jsonb_array_elements_text(data->'col_headers') WITH ORDINALITY AS t(elem, ordinality)
-       ),
-       total_cells AS (
-         SELECT
-           tr.idx AS row_idx,
-           tr.label AS row_label,
-           ch.idx AS col_idx,
-           ch.label AS col_label,
-           cell->>'value' AS cell_value,
-           cell->>'type' AS cell_type
-         FROM tbl,
-              total_rows tr,
-              col_headers ch,
-              jsonb_array_elements(data->'cells') AS cell
-         WHERE (cell->>'r')::int = tr.idx
-           AND (cell->>'c')::int = ch.idx
-           AND cell->>'type' = 'number'
-       )
-       SELECT row_idx, row_label, col_idx, col_label, cell_value, cell_type
-       FROM total_cells
-       ORDER BY row_idx, col_idx
-       LIMIT 500`,
-      SummaryCellSchema,
-      [meta.id],
-      { label: `NumericInline: summary rows from oversized ${meta.sheet_or_page}` }
-    );
-
-    if (summaryRows.length === 0) continue;
-
-    const colHeadersResult = await db.query(
-      `SELECT elem::text AS label
-       FROM doc_tables, jsonb_array_elements_text(data->'col_headers') AS elem
-       WHERE id = $1::uuid`,
-      ColHeaderSchema,
-      [meta.id],
-      { label: `NumericInline: col_headers for ${meta.sheet_or_page}` }
-    );
-
-    const uniqueRowIndices = [...new Set(summaryRows.map((r) => r.row_idx))].sort((a, b) => a - b);
-    const rowIndexMap = new Map(uniqueRowIndices.map((oldIdx, newIdx) => [oldIdx, newIdx]));
-
-    const miniCells: Cell[] = summaryRows.map((r) => ({
-      r: rowIndexMap.get(r.row_idx) ?? 0,
-      c: r.col_idx,
-      value: r.cell_value != null ? Number(r.cell_value) : null,
-      type: "number" as const,
-    }));
-
-    const miniRowHeaders = uniqueRowIndices.map(
-      (idx) => summaryRows.find((r) => r.row_idx === idx)?.row_label ?? `row${idx}`
-    );
-
-    allRawRows.push({
-      id: meta.id,
-      document_id: meta.document_id,
-      sheet_or_page: meta.sheet_or_page,
-      caption: meta.caption,
-      data: {
-        row_headers: miniRowHeaders,
-        col_headers: colHeadersResult.map((c) => c.label),
-        cells: miniCells,
-      },
-    });
-  }
-
   if (allRawRows.length === 0) {
     return {
       figures: [],
@@ -891,27 +669,44 @@ export async function runNumericVerifyInline(
     };
   }
 
-  // Step 5: Parse and run all checks
+  // Step 4: Parse tables
   const tables = parseTables(allRawRows);
-  const raw = runAllChecks(tables);
+  console.log(`[NumericInline] Parsed ${tables.length} table(s) from ${allRawRows.length} raw row(s)`);
 
-  // Step 6: Deduplicate and cap
-  const discrepancies = deduplicateAndRank(raw.discrepancies, MAX_PER_GROUP, MAX_DISCREPANCIES);
-  const figures = raw.figures.slice(0, MAX_FIGURES);
+  // Step 5: Layer 1 — Extract metric figures from all loaded tables
+  let allFigures: Figure[] = [];
+  for (const table of tables) {
+    const tableFigures = extractMetricFigures(table, SCG_METRIC_CONFIG);
+    allFigures.push(...tableFigures);
+  }
+
+  // Step 6: Layer 2 — Cross-agreement (only discrepancy source)
+  const crossResult = runCrossAgreement(tables, SCG_CROSS_AGREEMENT);
+
+  // Merge figures: cross-agreement also produces figures (from source A)
+  allFigures.push(...crossResult.figures);
+
+  // Deduplicate figures by (name, period, source_sheet)
+  const figureKeys = new Set<string>();
+  const dedupedFigures: Figure[] = [];
+  for (const f of allFigures) {
+    const key = `${f.name.toLowerCase()}::${f.period}::${f.source_sheet.toLowerCase()}`;
+    if (!figureKeys.has(key)) {
+      figureKeys.add(key);
+      dedupedFigures.push(f);
+    }
+  }
+
+  const figures = dedupedFigures.slice(0, MAX_FIGURES);
+  const discrepancies = crossResult.discrepancies.slice(0, MAX_DISCREPANCIES);
 
   const isPartial = timeBudgetExhaustedAtDocPhase || timeBudgetExhaustedAtTableLoad;
 
-  if (isPartial) {
-    console.log(
-      `[NumericInline] PARTIAL report: ${docsProcessed}/${documentIds.length} docs, ` +
-      `${allRawRows.length}/${tableIndex.length} tables loaded.`
-    );
-  } else {
-    console.log(
-      `[NumericInline] Complete: ${figures.length} figures, ${discrepancies.length} discrepancies ` +
-      `from ${allRawRows.length} tables across ${docsProcessed} documents.`
-    );
-  }
+  console.log(
+    `[NumericInline] ${isPartial ? "PARTIAL" : "Complete"}: ${figures.length} figures, ` +
+    `${discrepancies.length} cross-agreement discrepancies (by period), ` +
+    `${tables.length} tables from ${docsProcessed} documents.`
+  );
 
   return {
     figures,

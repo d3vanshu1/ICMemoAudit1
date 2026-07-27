@@ -734,16 +734,15 @@ export default api({
 
     // Fix #3: Conditionally strip or inject numeric verification instructions in the report prompt.
     if (hasNumericData) {
-      const numericVerificationInstructions = `## NUMERIC VERIFICATION REQUIREMENT
-A "## Numeric Verification Report" section in your input contains code-verified arithmetic results. You MUST:
-- Present all numeric discrepancies and cross-doc figure mismatches as **Confirmed Contradictions** with the highest priority
-- Cite the recomputed_value as the authoritative figure
-- State "[Code-Verified: X]" next to any figure **ONLY** when the exact figure X appears in the "## Numeric Verification Report" section below as an expected, actual, or recomputed_value
-- **NEVER** apply [Code-Verified] or [Code-Verified: X] to a figure that appears only in the Findings JSON — those figures come from AI text interpretation, NOT from the arithmetic engine
-- **NEVER** use bare [Code-Verified] tags without a specific numeric value inside
-- Never paraphrase or re-derive a code-verified figure from text
-- Label findings as **SOURCE: Deterministic Arithmetic Verification** ONLY when they directly reference a discrepancy from the Numeric Verification Report section — NOT for findings whose figures come solely from the AI-generated Findings JSON
-- If a finding discusses a dollar amount (e.g. "$72,000") that does NOT appear in the Numeric Verification Report, treat it as a text-derived claim: attribute it to its source document, use hedged language ("as reported in", "per the model"), and do NOT imply arithmetic verification`;
+      const numericVerificationInstructions = `## NUMERIC VERIFICATION — TRUSTWORTHY VALUES
+A "## Numeric Verification Report" section in your input contains cell values read directly from the financial model by code — NOT by AI inference. You MUST:
+- Treat "Verified Figures" as trustworthy cell values — flag where narrative claims disagree
+- "Cross-Version Divergences" compare a live model to a frozen reference; frame as "confirm intentional revision vs stale reference," not as asserted errors
+- Cite specific values only when they appear in the Verified Figures list
+- **NEVER** apply [Code-Verified] or [Code-Verified: X] tags — the concept is removed
+- **NEVER** invent or re-derive figures; only cite values from the Verified Figures list
+- When discussing cross-version divergences, use hedged framing: "the live model shows X while the frozen reference shows Y — assess whether this reflects an intentional update"
+- If a finding discusses a dollar amount that does NOT appear in the Verified Figures list, treat it as a text-derived claim with hedged language`;
       reportPrompt = reportPrompt.replace("{{FORMAT_NUMERIC_VERIFICATION_BLOCK}}", numericVerificationInstructions);
     } else {
       // Fix #1: Belt-and-suspenders guard language for report formatting
@@ -760,39 +759,27 @@ No deterministic numeric verification was performed for this analysis. All figur
     let numericBlock = "";
     if (numericReport && NUMERIC_MODULES.has(moduleId) &&
         (numericReport.figures.length > 0 || numericReport.discrepancies.length > 0)) {
-      const criticalDisc = numericReport.discrepancies.filter(
-        (d: Record<string, unknown>) => d.severity === "critical"
-      );
-      const otherDisc = numericReport.discrepancies.filter(
-        (d: Record<string, unknown>) => d.severity !== "critical"
-      );
-
-      numericBlock = `\n\n## Numeric Verification Report\n*Source: deterministic arithmetic engine — treat all values here as ground truth*\n\n`;
+      numericBlock = `\n\n## Numeric Verification Report\n*Source: deterministic cell-value reads from the financial model*\n\n`;
 
       if (numericReport.discrepancies.length > 0) {
-        numericBlock += `### Flagged Discrepancies (${numericReport.discrepancies.length} total, ${criticalDisc.length} critical)\n`;
-        for (const d of [...criticalDisc, ...otherDisc]) {
+        numericBlock += `### Cross-Version Divergences\n`;
+        numericBlock += `*Differences between the live model and a frozen reference.*\n\n`;
+        for (const d of numericReport.discrepancies) {
           const disc = d as Record<string, unknown>;
-          numericBlock += `- **[${String(disc.severity).toUpperCase()}]** [check: ${String(disc.check_type)}] ${String(disc.description)}`;
-          if (disc.expected != null && disc.actual != null) {
-            numericBlock += ` (code-verified value: ${disc.expected}, reported: ${disc.actual})`;
-          }
-          numericBlock += `\n`;
+          numericBlock += `- **[${String(disc.severity).toUpperCase()}]** ${String(disc.description)}\n`;
         }
         numericBlock += `\n`;
       }
 
       if (numericReport.figures.length > 0) {
-        numericBlock += `### Verified Figures (code-recomputed)\n`;
-        const MAX_FIGURES = 200;
-        if (numericReport.figures.length > MAX_FIGURES) {
-          console.warn(`[format-report] numeric figures capped at ${MAX_FIGURES} (had ${numericReport.figures.length})`);
+        numericBlock += `### Verified Figures (Trustworthy Cell Values)\n`;
+        const MAX_FIG_DISPLAY = 200;
+        const figuresArr = numericReport.figures as Array<Record<string, unknown>>;
+        if (figuresArr.length > MAX_FIG_DISPLAY) {
+          console.warn(`[format-report] numeric figures capped at ${MAX_FIG_DISPLAY} (had ${figuresArr.length})`);
         }
-        for (const f of numericReport.figures.slice(0, MAX_FIGURES)) {
-          const fig = f as Record<string, unknown>;
-          numericBlock += `- **${String(fig.name)}**: ${fig.recomputed_value} @ ${String(fig.source_cell)}`;
-          if (fig.formula) numericBlock += ` [=${String(fig.formula)}]`;
-          numericBlock += `\n`;
+        for (const fig of figuresArr.slice(0, MAX_FIG_DISPLAY)) {
+          numericBlock += `- **${String(fig.name)}** (${String(fig.period ?? "")}): ${fig.value ?? fig.recomputed_value} @ ${String(fig.source_cell)}\n`;
         }
       }
     }
