@@ -468,6 +468,12 @@ function parseTables(rows: Array<{ id: string; document_id: string; sheet_or_pag
       effectiveColHeaders = deriveColLabelsFromCells(data.col_headers, data.cells);
     }
 
+    // Year enrichment: always merge numeric year values from row 0 into col headers.
+    // This handles the common SheetJS pattern where period years live in row 0 as
+    // numeric cell values (e.g., 2023, 2024, 2025, 2026) while col_headers only
+    // contain generic qualifiers ("Actual"/"Forecast") or "Col%d" labels.
+    effectiveColHeaders = enrichColHeadersWithYears(effectiveColHeaders, data.cells);
+
     const table: ParsedTable = {
       id: row.id,
       documentId: row.document_id,
@@ -537,6 +543,69 @@ function deriveColLabelsFromCells(originalHeaders: string[], cells: Cell[]): str
   }
 
   return derived;
+}
+
+/**
+ * Enrich column headers with year info from row 0 numeric cells.
+ *
+ * SheetJS often extracts multi-row headers as: col_headers = ["Actual", "Forecast", ...]
+ * with the year sitting in row 0 as a numeric value (2023, 2024, etc.). Without this
+ * enrichment, all "Actual" columns normalize to the same period and first-occurrence-wins
+ * collapses them into one — making cross-agreement impossible for year-specific comparisons.
+ *
+ * Logic:
+ * - For each column, if the current header doesn't already contain a 4-digit year
+ *   AND row 0 at that column has a numeric value that looks like a year (2000–2099),
+ *   prepend the year: "Actual" → "2026 Actual", "Forecast" → "2026 Forecast".
+ * - If the header already contains a year (e.g., "FY2025"), leave it alone.
+ * - Row 0 numeric years propagate rightward to fill columns that share the same year
+ *   band (spreadsheets typically have one year header spanning multiple monthly columns).
+ */
+function enrichColHeadersWithYears(headers: string[], cells: Cell[]): string[] {
+  const enriched = [...headers];
+  const maxCol = headers.length;
+
+  // Build a map of col → numeric year from row 0
+  const row0Cells = cells.filter((c) => c.r === 0 && c.c < maxCol).sort((a, b) => a.c - b.c);
+
+  // Track the "current year" as we scan left to right (forward-fill)
+  // Spreadsheets typically have a year label in the first column of a year band.
+  let currentYear: string | null = null;
+  const colYears: (string | null)[] = new Array(maxCol).fill(null);
+
+  // First pass: assign explicit years from row 0 numeric cells
+  for (const cell of row0Cells) {
+    if (
+      cell.type === "number" &&
+      typeof cell.value === "number" &&
+      cell.value >= 2000 &&
+      cell.value <= 2099 &&
+      Number.isInteger(cell.value)
+    ) {
+      colYears[cell.c] = String(cell.value);
+    }
+  }
+
+  // Second pass: forward-fill (a year in col 10 applies to cols 10–16 until the next year)
+  for (let ci = 0; ci < maxCol; ci++) {
+    if (colYears[ci] !== null) {
+      currentYear = colYears[ci];
+    }
+    colYears[ci] = currentYear;
+  }
+
+  // Third pass: enrich headers that don't already have a year
+  const hasYearPattern = /\b20\d{2}\b/;
+  for (let ci = 0; ci < maxCol; ci++) {
+    const year = colYears[ci];
+    if (!year) continue;
+    const header = enriched[ci];
+    if (hasYearPattern.test(header)) continue; // already has year
+    // Prepend year to make period extraction work
+    enriched[ci] = `${year} ${header}`;
+  }
+
+  return enriched;
 }
 
 // ---------------------------------------------------------------------------
