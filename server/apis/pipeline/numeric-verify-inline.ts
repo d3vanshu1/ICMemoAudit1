@@ -50,7 +50,23 @@ export interface Discrepancy {
   check_type: "cross_doc_agreement";
   sources: string[];
   period: string;
-  metrics: Array<{ label: string; sourceA: number; sourceB: number; absDiff: number; relDiffPct: number }>;
+  /** Headline finding: one plain-language summary sentence for the period */
+  headline: string;
+  /** Materiality floor used for tiering (stated in headline for transparency) */
+  materialityFloor: { abs: number; rel: number };
+  metrics: Array<{
+    label: string;
+    sourceA: number;
+    sourceB: number;
+    absDiff: number;
+    relDiffPct: number;
+    /** Tier: "material" = above materiality floor + aggregate label; "detail" = everything else */
+    tier: "material" | "detail";
+    /** True if the label is an aggregate/section-level line (Total*, EBITDA, GP, etc.) */
+    isAggregate: boolean;
+    /** True if the label appears more than once in the source sheet (lower-confidence match) */
+    isDuplicateLabel: boolean;
+  }>;
 }
 
 /**
@@ -87,6 +103,13 @@ export interface CrossAgreementConfig {
    * If not set, no ratio guard is applied.
    */
   maxRatio?: number;
+  /**
+   * Materiality floor for tiering. Lines above BOTH thresholds AND matching aggregate patterns
+   * are classified as "material" (tier 2); all others as "detail" (tier 3).
+   * Headline (tier 1) is a synthesized narrative from the material tier.
+   */
+  materialityAbsFloor: number;
+  materialityRelFloor: number;
 }
 
 /**
@@ -179,15 +202,92 @@ const SCG_CROSS_AGREEMENT: CrossAgreementConfig = {
   sourceADocId: "a0172256-4ab0-412b-a247-f70b16136b28",
   sourceBDocId: "a0172256-4ab0-412b-a247-f70b16136b28",
   matchingRule: "exact",
-  absThreshold: 1_000, // £1k absolute minimum
+  absThreshold: 1_000, // £1k absolute minimum — floor for ANY divergence to be recorded
   relThreshold: 0.0001, // 0.01% relative
-  // maxRatio removed: doc-pinning + base-year matching now eliminate the YTD-vs-full-year
-  // column mismatches that maxRatio was originally designed to catch. Legitimate large
-  // proportional changes (e.g. Total adjustments −210k→−2.7M) should not be filtered.
+  // Materiality floor: determines tier 2 ("material movements") vs tier 3 ("detail")
+  materialityAbsFloor: 500_000, // £500k
+  materialityRelFloor: 0.05, // 5%
 };
 
 // Period column detection: matches FY year columns and standard period labels
 const PERIOD_COL_PATTERN = /\b(20\d{2}|fy\s*\d{2,4}|cy\s*\d{2,4}|q[1-4]|h[12]|ytd|ltm)\b|^(actual|forecast|budget|plan)$/i;
+
+// ---------------------------------------------------------------------------
+// Aggregate label detection — identifies section/summary-level lines
+// ---------------------------------------------------------------------------
+
+/** Patterns that indicate a row is an aggregate/section-level line rather than a detail line */
+const AGGREGATE_LABEL_PATTERNS = [
+  /^Total\b/i,
+  /\bEBITDA\b/i,
+  /\bGross\s*Profit\b/i,
+  /\bGP\b/,
+  /\b(direct\s+costs|overheads)\b/i,
+  /\badjustments\b/i,
+  /\bcontribution\b/i,
+  /\bNet\s+(income|profit|loss)\b/i,
+  /^(Group\s+)?Revenue\b/i,
+  /^Total\s+Group\b/i,
+];
+
+function isAggregateLabel(label: string): boolean {
+  return AGGREGATE_LABEL_PATTERNS.some((p) => p.test(label));
+}
+
+/**
+ * Detect duplicate labels within a set of entries.
+ * Returns a Set of labels that appear more than once (lower-confidence matches).
+ */
+function findDuplicateLabels(entries: CrossAgreementEntry[]): Set<string> {
+  const labelCounts = new Map<string, number>();
+  for (const e of entries) {
+    const key = e.label.trim().toLowerCase();
+    labelCounts.set(key, (labelCounts.get(key) ?? 0) + 1);
+  }
+  const duplicates = new Set<string>();
+  for (const [key, count] of labelCounts) {
+    if (count > 1) duplicates.add(key);
+  }
+  return duplicates;
+}
+
+/**
+ * Generate a headline finding for a period's material divergences.
+ * Leads with EBITDA/revenue impact.
+ */
+function generateHeadline(
+  materialMetrics: Array<{ label: string; sourceA: number; sourceB: number; absDiff: number; relDiffPct: number }>,
+  period: string,
+  materialityFloor: { abs: number; rel: number },
+  sourceASheet: string,
+  sourceBSheet: string,
+): string {
+  if (materialMetrics.length === 0) {
+    return `No material divergences (>\u00a3${(materialityFloor.abs / 1000).toFixed(0)}k abs or >${(materialityFloor.rel * 100).toFixed(0)}% rel) found in period "${period}" between "${sourceASheet}" and "${sourceBSheet}".`;
+  }
+
+  // Find key headline metrics: EBITDA (reported or adj) and revenue
+  const ebitdaLine = materialMetrics.find((m) => /EBITDA/i.test(m.label));
+  const revenueLine = materialMetrics.find((m) => /revenue/i.test(m.label) && /Total.*Group/i.test(m.label))
+    ?? materialMetrics.find((m) => /revenue/i.test(m.label));
+
+  const formatDelta = (m: { sourceA: number; sourceB: number; absDiff: number }) => {
+    const sign = m.sourceA > m.sourceB ? "+" : "\u2212";
+    const mag = m.absDiff >= 1_000_000
+      ? `\u00a3${(m.absDiff / 1_000_000).toFixed(1)}m`
+      : `\u00a3${(m.absDiff / 1_000).toFixed(0)}k`;
+    return `${sign}${mag}`;
+  };
+
+  const parts: string[] = [];
+  parts.push(`Live model revised vs frozen snapshot in FY${period}`);
+  if (ebitdaLine) parts.push(`${ebitdaLine.label} ${formatDelta(ebitdaLine)}`);
+  if (revenueLine) parts.push(`revenue ${formatDelta(revenueLine)}`);
+  parts.push(`(${materialMetrics.length} material movement${materialMetrics.length === 1 ? "" : "s"} above \u00a3${(materialityFloor.abs / 1000).toFixed(0)}k/\u200B${(materialityFloor.rel * 100).toFixed(0)}%)`);
+  parts.push("— confirm memo cites current model.");
+
+  return parts.join("; ");
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -313,6 +413,8 @@ interface CrossAgreementEntry {
   period: string;
   value: number;
   sourceRef: string;
+  /** True if this entry comes from an annual summary column (not monthly/sub-annual) */
+  isAnnual: boolean;
 }
 
 function runCrossAgreement(
@@ -362,20 +464,31 @@ function runCrossAgreement(
   const entriesA = extractAllNumericEntries(tableA);
   const entriesB = extractAllNumericEntries(tableB);
 
+  // Detect duplicate labels in source A (lower-confidence matches when label appears >1 time)
+  const duplicateLabelsA = findDuplicateLabels(entriesA);
+
   // Build lookup maps: key = "normalizedLabel::baseYear"
   // Cross-agreement uses BASE YEAR (no qualifier) so that live-model "actual" columns
   // match hardcoded-model "forecast" columns for the same fiscal year.
   // First-occurrence-wins per base-year avoids both:
   //   (a) downstream rows with same label shadowing structural rows
   //   (b) forecast columns shadowing actual columns within one sheet (actual comes first)
+  //
+  // CRITICAL: Only use annual entries for cross-agreement. Monthly/sub-annual columns
+  // (detected by extractAllNumericEntries) have per-month values that are not comparable
+  // to annual summaries. When a row's annual cell is blank but monthly cells exist,
+  // the monthly value would be incorrectly compared against the hardcoded annual — the
+  // exact false-positive pattern (D&A −4.8M monthly vs −59.9M annual).
   const mapA = new Map<string, CrossAgreementEntry>();
   for (const e of entriesA) {
+    if (!e.isAnnual) continue; // Skip sub-annual entries
     const key = `${e.label.trim().toLowerCase()}::${periodBaseYear(e.period)}`;
     if (!mapA.has(key)) mapA.set(key, e);
   }
 
   const mapB = new Map<string, CrossAgreementEntry>();
   for (const e of entriesB) {
+    if (!e.isAnnual) continue; // Skip sub-annual entries
     const key = `${e.label.trim().toLowerCase()}::${periodBaseYear(e.period)}`;
     if (!mapB.has(key)) mapB.set(key, e);
   }
@@ -460,22 +573,48 @@ function runCrossAgreement(
     });
   }
 
-  // Roll up: one discrepancy per period containing the metric cluster
+  // Roll up: one discrepancy per period containing ALL metrics, tiered
+  const materialityFloor = { abs: config.materialityAbsFloor, rel: config.materialityRelFloor };
+
   for (const [period, divergences] of divergencesByPeriod) {
     if (divergences.length === 0) continue;
 
     // Sort by absolute difference descending
     divergences.sort((a, b) => b.absDiff - a.absDiff);
 
-    const metricSummary = divergences
-      .slice(0, 20) // cap for readability
-      .map((d) => `${d.label}: ${d.valueA.toLocaleString()} (${config.sourceASheet}) vs ${d.valueB.toLocaleString()} (${config.sourceBSheet}) — Δ${d.relDiffPct.toFixed(2)}%`)
+    // Classify each metric with tier + flags
+    const taggedMetrics = divergences.map((d) => {
+      const aggregate = isAggregateLabel(d.label);
+      const aboveMateriality =
+        d.absDiff >= materialityFloor.abs || (d.relDiffPct / 100) >= materialityFloor.rel;
+      const tier: "material" | "detail" = (aggregate && aboveMateriality) ? "material" : "detail";
+      return {
+        label: d.label,
+        sourceA: d.valueA,
+        sourceB: d.valueB,
+        absDiff: d.absDiff,
+        relDiffPct: d.relDiffPct,
+        tier,
+        isAggregate: aggregate,
+        isDuplicateLabel: duplicateLabelsA.has(d.label.trim().toLowerCase()),
+      };
+    });
+
+    // Generate headline from material-tier metrics
+    const materialMetrics = taggedMetrics.filter((m) => m.tier === "material");
+    const headline = generateHeadline(materialMetrics, period, materialityFloor, config.sourceASheet, config.sourceBSheet);
+
+    // Description: summary for backward compat / log consumption
+    const metricSummary = taggedMetrics
+      .filter((m) => m.tier === "material")
+      .slice(0, 20)
+      .map((d) => `${d.label}: ${d.sourceA.toLocaleString()} (${config.sourceASheet}) vs ${d.sourceB.toLocaleString()} (${config.sourceBSheet}) — Δ${d.relDiffPct.toFixed(2)}%`)
       .join("\n  ");
 
-    const severity: Discrepancy["severity"] = divergences.some((d) => d.relDiffPct > 5) ? "critical" : "warning";
+    const severity: Discrepancy["severity"] = taggedMetrics.some((d) => d.relDiffPct > 5) ? "critical" : "warning";
 
     discrepancies.push({
-      description: `Cross-version divergence in period "${period}" — ${divergences.length} metric(s) differ between "${config.sourceASheet}" and "${config.sourceBSheet}". Confirm whether these reflect intentional updates (live model revision) or stale/contradictory references:\n  ${metricSummary}`,
+      description: `Cross-version divergence in period "${period}" — ${taggedMetrics.length} metric(s) total (${materialMetrics.length} material, ${taggedMetrics.length - materialMetrics.length} detail) between "${config.sourceASheet}" and "${config.sourceBSheet}":\n  ${metricSummary}`,
       severity,
       check_type: "cross_doc_agreement",
       sources: [
@@ -483,13 +622,9 @@ function runCrossAgreement(
         `${tableB.documentId}::${tableB.sheetOrPage}`,
       ],
       period,
-      metrics: divergences.map((d) => ({
-        label: d.label,
-        sourceA: d.valueA,
-        sourceB: d.valueB,
-        absDiff: d.absDiff,
-        relDiffPct: d.relDiffPct,
-      })),
+      headline,
+      materialityFloor,
+      metrics: taggedMetrics,
     });
   }
 
@@ -508,6 +643,26 @@ function extractAllNumericEntries(table: ParsedTable): CrossAgreementEntry[] {
     }
   }
 
+  // Detect annual vs sub-annual columns:
+  // Group columns by base year. For each year, if there are multiple columns,
+  // the first (lowest col index) is the annual summary; the rest are monthly/sub-annual.
+  // This handles the common financial model structure: cols 7-10 = annual summaries,
+  // cols 18-65 = monthly detail (all sharing the same enriched year).
+  const colsByBaseYear = new Map<string, number[]>();
+  for (const pc of periodCols) {
+    const baseYear = periodBaseYear(pc.period);
+    if (!colsByBaseYear.has(baseYear)) colsByBaseYear.set(baseYear, []);
+    colsByBaseYear.get(baseYear)!.push(pc.colIdx);
+  }
+
+  // Annual columns: for each base year with >1 column, the first is annual.
+  // For years with exactly 1 column, that single column is annual.
+  const annualCols = new Set<number>();
+  for (const [, cols] of colsByBaseYear) {
+    cols.sort((a, b) => a - b);
+    annualCols.add(cols[0]); // First (lowest index) = annual summary
+  }
+
   for (let ri = 0; ri < rowHeaders.length; ri++) {
     const label = rowHeaders[ri];
     if (!label || label.trim() === "" || label === "x") continue;
@@ -521,6 +676,7 @@ function extractAllNumericEntries(table: ParsedTable): CrossAgreementEntry[] {
         period,
         value: cell.value as number,
         sourceRef: cellRef(table, ri, colIdx),
+        isAnnual: annualCols.has(colIdx),
       });
     }
   }
