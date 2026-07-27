@@ -525,7 +525,7 @@ No deterministic numeric verification was performed for this analysis. All figur
           console.warn(`[merge-findings] numeric figures capped at ${MAX_FIG_DISPLAY} (had ${figuresArr.length})`);
         }
         for (const fig of figuresArr.slice(0, MAX_FIG_DISPLAY)) {
-          numericBlock += `- **${String(fig.name)}** (${String(fig.period ?? "")}): ${fig.value ?? fig.recomputed_value} @ ${String(fig.source_cell)}\n`;
+          numericBlock += `- **${String(fig.name)}** (${String(fig.period ?? "")}): ${fig.value} @ ${String(fig.source_cell)}\n`;
         }
       }
     }

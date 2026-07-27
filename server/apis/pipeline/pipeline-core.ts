@@ -1841,7 +1841,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
         console.warn(`[pipeline-core] numeric figures capped at ${MAX_FIG_DISPLAY} (had ${figuresArr.length})`);
       }
       for (const fig of figuresArr.slice(0, MAX_FIG_DISPLAY)) {
-        numericBlock += `- **${String(fig.name)}** (${String(fig.period ?? "")}): ${fig.value ?? fig.recomputed_value} @ ${String(fig.source_cell)}\n`;
+        numericBlock += `- **${String(fig.name)}** (${String(fig.period ?? "")}): ${fig.value} @ ${String(fig.source_cell)}\n`;
       }
     }
   }

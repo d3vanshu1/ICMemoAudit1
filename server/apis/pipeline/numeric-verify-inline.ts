@@ -62,14 +62,31 @@ export interface CrossAgreementConfig {
   sourceASheet: string;
   /** Source B: sheet identifier (sheet_or_page match string) */
   sourceBSheet: string;
+  /** Source A: document_id pin. When set, only tables from this document match source A. */
+  sourceADocId?: string;
+  /** Source B: document_id pin. When set, only tables from this document match source B. */
+  sourceBDocId?: string;
   /** Matching rule: "exact" = exact string match on row labels; future: "semantic" */
   matchingRule: "exact";
   /** Optional: restrict to these row labels. If empty/null, all shared labels are compared. */
   restrictLabels?: string[];
+  /**
+   * Optional: restrict cross-agreement to rows whose labels match the metric config patterns.
+   * When set, only entries with labels matching these regex/exact patterns are compared.
+   * Prevents detail-level line items from producing noise in FY periods that should be "clean."
+   */
+  metricFilter?: MetricConfig;
   /** Divergence threshold: absolute minimum difference to flag (e.g., 1000 for £1k) */
   absThreshold: number;
   /** Divergence threshold: relative (e.g., 0.0001 for 0.01%) */
   relThreshold: number;
+  /**
+   * Max magnitude ratio: exclude comparisons where one value is >N× the other.
+   * Prevents false positives from partial-year (YTD) vs full-year column mismatches.
+   * Example: maxRatio=5 excludes D&A -4.8M vs -59.9M (ratio 12.4×).
+   * If not set, no ratio guard is applied.
+   */
+  maxRatio?: number;
 }
 
 /**
@@ -133,30 +150,41 @@ const DocTableDataSchema = z.object({
 
 /**
  * SCG cross-agreement config.
- * Compares "FS Summary" (live model) vs "FS Summary (hardcoded)" (frozen reference).
+ * Compares "FS Summary" (live updated) vs "FS Summary (hardcoded)" (frozen reference).
+ * Both sheets live in document a0172256 (the updated model with 22 sheets).
+ * Document pinning prevents the original/pre-update model (321b6185) from being
+ * selected — that model's FS Summary is identical to the hardcoded snapshot,
+ * producing 0 divergences (false negative).
  */
-const SCG_CROSS_AGREEMENT: CrossAgreementConfig = {
-  sourceASheet: "FS Summary",
-  sourceBSheet: "FS Summary (hardcoded)",
-  matchingRule: "exact",
-  absThreshold: 1_000, // £1k absolute minimum
-  relThreshold: 0.0001, // 0.01% relative
-};
 
 /**
  * SCG metric config: which row labels constitute "metrics" for figure reading.
  * Covers the standard P&L/BS/CF hierarchy. If a row label matches any pattern,
  * its values across all period columns are emitted as verified figures.
+ * Also used as cross-agreement filter to restrict divergence comparisons to
+ * these material metrics (prevents detail-level noise in clean periods).
  */
 const SCG_METRIC_CONFIG: MetricConfig = {
   isRegex: true,
   labelPatterns: [
     "^Total\\s+(direct\\s+costs|overheads|revenue)",
     "^(Revenue|EBITDA|EBIT|Gross\\s+Profit|Net\\s+Income|Operating\\s+Profit)",
-    "^(Adjusted|Normalised|Underlying)\\s+(EBITDA|EBIT|Revenue)",
+    "^(Adjusted|Adj\\.?|Normalised|Underlying|Reported)\\s+(EBITDA|EBIT|Revenue)",
     "^(ARR|MRR|Net\\s+Revenue|Recurring\\s+Revenue)",
     "^Surgery\\s+Intellect\\s+GP",
   ],
+};
+
+const SCG_CROSS_AGREEMENT: CrossAgreementConfig = {
+  sourceASheet: "FS Summary",
+  sourceBSheet: "FS Summary (hardcoded)",
+  sourceADocId: "a0172256-4ab0-412b-a247-f70b16136b28",
+  sourceBDocId: "a0172256-4ab0-412b-a247-f70b16136b28",
+  matchingRule: "exact",
+  absThreshold: 1_000, // £1k absolute minimum
+  relThreshold: 0.0001, // 0.01% relative
+  maxRatio: 5, // Exclude partial-year vs full-year mismatches (ratio >5×)
+  metricFilter: SCG_METRIC_CONFIG, // Only compare configured metric labels
 };
 
 // Period column detection: matches FY year columns and standard period labels
@@ -191,12 +219,28 @@ function isPeriodCol(label: string): boolean {
 }
 
 function normalizePeriod(label: string): string {
-  // Extract the core period identifier for matching across sheets
+  // Extract period identifier preserving actual/forecast qualifier for display and
+  // intra-sheet dedup (so "2026 Actual" ≠ "2026 Forecast" within one sheet).
   const cleaned = label.trim().toLowerCase();
-  // Try to extract a 4-digit year
   const yearMatch = cleaned.match(/\b(20\d{2})\b/);
-  if (yearMatch) return yearMatch[1];
+  if (yearMatch) {
+    const year = yearMatch[1];
+    const qualifierMatch = cleaned.match(/\b(actual|forecast|budget|plan)\b/);
+    if (qualifierMatch) return `${year} ${qualifierMatch[1]}`;
+    return year;
+  }
   return cleaned;
+}
+
+/**
+ * Strip qualifier from a normalized period to get the base year for cross-sheet matching.
+ * "2026 actual" → "2026", "2026 forecast" → "2026", "2026" → "2026"
+ * This allows comparing live-model "actual" columns against hardcoded-model "forecast"
+ * columns (same business concept, different time-based qualifiers).
+ */
+function periodBaseYear(period: string): string {
+  const yearMatch = period.match(/^(20\d{2})/);
+  return yearMatch ? yearMatch[1] : period;
 }
 
 function matchesMetricConfig(rowLabel: string, config: MetricConfig): boolean {
@@ -279,16 +323,39 @@ function runCrossAgreement(
   const discrepancies: Discrepancy[] = [];
   const figures: Figure[] = [];
 
-  // Find tables matching source A and source B
-  const sourceATables = tables.filter((t) => matchesCrossSheet(t.sheetOrPage, config.sourceASheet));
-  const sourceBTables = tables.filter((t) => matchesCrossSheet(t.sheetOrPage, config.sourceBSheet));
+  // Find tables matching source A and source B (document-pinned when configured)
+  const sourceATables = tables.filter((t) =>
+    matchesCrossSheet(t.sheetOrPage, config.sourceASheet) &&
+    (!config.sourceADocId || t.documentId === config.sourceADocId)
+  );
+  const sourceBTables = tables.filter((t) =>
+    matchesCrossSheet(t.sheetOrPage, config.sourceBSheet) &&
+    (!config.sourceBDocId || t.documentId === config.sourceBDocId)
+  );
 
   if (sourceATables.length === 0 || sourceBTables.length === 0) {
-    console.log(`[NumericInline:CrossAgreement] Source not found: A="${config.sourceASheet}" (${sourceATables.length}), B="${config.sourceBSheet}" (${sourceBTables.length})`);
+    console.log(`[NumericInline:CrossAgreement] Source not found: A="${config.sourceASheet}"${config.sourceADocId ? ` doc=${config.sourceADocId.slice(0,8)}` : ""} (${sourceATables.length}), B="${config.sourceBSheet}"${config.sourceBDocId ? ` doc=${config.sourceBDocId.slice(0,8)}` : ""} (${sourceBTables.length})`);
     return { discrepancies, figures };
   }
 
-  // Use first matching table for each source
+  // Fail loud if multiple tables match a source spec — never silently take [0]
+  if (sourceATables.length > 1) {
+    console.warn(
+      `[NumericInline:CrossAgreement] AMBIGUOUS source A: ${sourceATables.length} tables match "${config.sourceASheet}"` +
+      `${config.sourceADocId ? ` in doc ${config.sourceADocId.slice(0,8)}` : ""}. ` +
+      `Documents: [${sourceATables.map(t => t.documentId.slice(0,8)).join(", ")}]. Skipping cross-agreement.`
+    );
+    return { discrepancies, figures };
+  }
+  if (sourceBTables.length > 1) {
+    console.warn(
+      `[NumericInline:CrossAgreement] AMBIGUOUS source B: ${sourceBTables.length} tables match "${config.sourceBSheet}"` +
+      `${config.sourceBDocId ? ` in doc ${config.sourceBDocId.slice(0,8)}` : ""}. ` +
+      `Documents: [${sourceBTables.map(t => t.documentId.slice(0,8)).join(", ")}]. Skipping cross-agreement.`
+    );
+    return { discrepancies, figures };
+  }
+
   const tableA = sourceATables[0];
   const tableB = sourceBTables[0];
 
@@ -296,19 +363,21 @@ function runCrossAgreement(
   const entriesA = extractAllNumericEntries(tableA);
   const entriesB = extractAllNumericEntries(tableB);
 
-  // Build lookup maps: key = "normalizedLabel::normalizedPeriod"
-  // Use first-occurrence-wins to avoid downstream rows with the same label
-  // (e.g., a "Total direct costs" in an adjustments section) from shadowing
-  // the primary structural row.
+  // Build lookup maps: key = "normalizedLabel::baseYear"
+  // Cross-agreement uses BASE YEAR (no qualifier) so that live-model "actual" columns
+  // match hardcoded-model "forecast" columns for the same fiscal year.
+  // First-occurrence-wins per base-year avoids both:
+  //   (a) downstream rows with same label shadowing structural rows
+  //   (b) forecast columns shadowing actual columns within one sheet (actual comes first)
   const mapA = new Map<string, CrossAgreementEntry>();
   for (const e of entriesA) {
-    const key = `${e.label.trim().toLowerCase()}::${e.period}`;
+    const key = `${e.label.trim().toLowerCase()}::${periodBaseYear(e.period)}`;
     if (!mapA.has(key)) mapA.set(key, e);
   }
 
   const mapB = new Map<string, CrossAgreementEntry>();
   for (const e of entriesB) {
-    const key = `${e.label.trim().toLowerCase()}::${e.period}`;
+    const key = `${e.label.trim().toLowerCase()}::${periodBaseYear(e.period)}`;
     if (!mapB.has(key)) mapB.set(key, e);
   }
 
@@ -336,14 +405,39 @@ function runCrossAgreement(
       if (!labelMatch) continue;
     }
 
+    // Metric filter: only compare labels matching the metric config patterns
+    if (config.metricFilter) {
+      const label = entryA.label.trim();
+      const matches = config.metricFilter.labelPatterns.some((pattern) => {
+        if (config.metricFilter!.isRegex) {
+          return new RegExp(pattern, "i").test(label);
+        }
+        return label.toLowerCase() === pattern.toLowerCase();
+      });
+      if (!matches) continue;
+    }
+
     const absDiff = Math.abs(entryA.value - entryB.value);
     const maxAbs = Math.max(Math.abs(entryA.value), Math.abs(entryB.value));
+    const minAbs = Math.min(Math.abs(entryA.value), Math.abs(entryB.value));
     const relDiff = maxAbs > 0 ? absDiff / maxAbs : 0;
+
+    // Magnitude ratio guard: exclude comparisons where one value is >maxRatio× the other.
+    // This catches partial-year (YTD) vs full-year column mismatches where, e.g.,
+    // D&A "actual" = £4.8M (1 month) vs D&A "forecast" = £59.9M (full year).
+    if (config.maxRatio && minAbs > 0 && maxAbs / minAbs > config.maxRatio) {
+      continue;
+    }
+    // Also skip when one side is 0 and the other exceeds absThreshold × maxRatio
+    // (handles rows where YTD = 0 vs forecast = large number)
+    if (config.maxRatio && minAbs === 0 && maxAbs > config.absThreshold * config.maxRatio) {
+      continue;
+    }
 
     // Apply threshold: divergence must exceed BOTH abs AND rel thresholds
     // (i.e., flag only when the difference is meaningful in both absolute and relative terms)
     if (absDiff > config.absThreshold && relDiff > config.relThreshold) {
-      const period = entryA.period;
+      const period = periodBaseYear(entryA.period);
       if (!divergencesByPeriod.has(period)) divergencesByPeriod.set(period, []);
       divergencesByPeriod.get(period)!.push({
         label: entryA.label,
@@ -495,31 +589,44 @@ function deriveRowLabelsFromCells(originalHeaders: string[], cells: Cell[]): str
   const maxRow = originalHeaders.length;
   const derived: string[] = new Array(maxRow).fill("");
 
+  // Count string frequency per column (first 6 columns) to rank label candidates
   const colStringFreq = new Map<number, number>();
   for (const cell of cells) {
-    if (cell.r < maxRow && cell.type === "string" && cell.value != null && String(cell.value).trim() !== "" && cell.c < 4) {
+    if (cell.r < maxRow && cell.type === "string" && cell.value != null && String(cell.value).trim() !== "" && cell.c < 6) {
       colStringFreq.set(cell.c, (colStringFreq.get(cell.c) ?? 0) + 1);
     }
   }
 
-  let labelCol = 0;
-  let maxFreq = 0;
-  for (const [col, freq] of colStringFreq) {
-    if (freq > maxFreq) {
-      maxFreq = freq;
-      labelCol = col;
-    }
-  }
+  // Sort columns by frequency (descending) — most-populated column is primary label source.
+  // This handles multi-level indent structures (e.g., col 3 = sub-items, col 2 = totals).
+  const labelCols = [...colStringFreq.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([col]) => col);
 
+  // Build a quick lookup: row → cell value per column (first 6 cols)
+  const cellsByRowCol = new Map<string, string>();
   for (const cell of cells) {
-    if (cell.c === labelCol && cell.r < maxRow && cell.type === "string" && cell.value != null) {
-      const label = String(cell.value).trim();
-      if (label && label !== "x") {
-        derived[cell.r] = label;
+    if (cell.r < maxRow && cell.type === "string" && cell.value != null && cell.c < 6) {
+      const val = String(cell.value).trim();
+      if (val && val !== "x") {
+        cellsByRowCol.set(`${cell.r},${cell.c}`, val);
       }
     }
   }
 
+  // Fill derived labels: iterate columns in frequency order.
+  // For each row still unlabeled, take the value from the current column.
+  for (const col of labelCols) {
+    for (let ri = 0; ri < maxRow; ri++) {
+      if (derived[ri]) continue; // already labeled from a higher-frequency column
+      const val = cellsByRowCol.get(`${ri},${col}`);
+      if (val) {
+        derived[ri] = val;
+      }
+    }
+  }
+
+  // Final fallback: original row_headers
   for (let i = 0; i < maxRow; i++) {
     if (!derived[i] && originalHeaders[i] && originalHeaders[i] !== "" && originalHeaders[i] !== "x") {
       derived[i] = originalHeaders[i];
@@ -755,11 +862,13 @@ export async function runNumericVerifyInline(
   // Merge figures: cross-agreement also produces figures (from source A)
   allFigures.push(...crossResult.figures);
 
-  // Deduplicate figures by (name, period, source_sheet)
+  // Deduplicate figures by (name, period, source_sheet, document_id)
+  // document_id is included to prevent the original model's figures from
+  // shadowing the updated model's figures when both have the same sheet name.
   const figureKeys = new Set<string>();
   const dedupedFigures: Figure[] = [];
   for (const f of allFigures) {
-    const key = `${f.name.toLowerCase()}::${f.period}::${f.source_sheet.toLowerCase()}`;
+    const key = `${f.name.toLowerCase()}::${f.period}::${f.source_sheet.toLowerCase()}::${f.source_doc}`;
     if (!figureKeys.has(key)) {
       figureKeys.add(key);
       dedupedFigures.push(f);

@@ -31,6 +31,17 @@ export default api({
     figureCountForPeriod: z.number(),
     totalFigureCount: z.number(),
     discrepancyPeriods: z.array(z.string()),
+    discrepancyDetails: z.array(z.object({
+      period: z.string(),
+      metricCount: z.number(),
+      metrics: z.array(z.object({
+        label: z.string(),
+        sourceA: z.number(),
+        sourceB: z.number(),
+        absDiff: z.number(),
+        relDiffPct: z.number(),
+      })),
+    })),
     allPeriods: z.array(z.string()),
   }),
 
@@ -55,11 +66,19 @@ export default api({
     // Collect discrepancy periods
     const discrepancyPeriods = result.discrepancies.map(d => d.period);
 
+    // Collect discrepancy details (metrics per period)
+    const discrepancyDetails = result.discrepancies.map(d => ({
+      period: d.period,
+      metricCount: d.metrics.length,
+      metrics: d.metrics.slice(0, 25),
+    }));
+
     return {
       figuresForPeriod,
       figureCountForPeriod: result.figures.filter(f => f.period === targetPeriod).length,
       totalFigureCount: result.figures.length,
       discrepancyPeriods,
+      discrepancyDetails,
       allPeriods,
     };
   },
