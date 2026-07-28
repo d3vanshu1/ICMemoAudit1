@@ -295,7 +295,8 @@ function generateHeadline(
 
 const MAX_DATA_BYTES = 2_500_000;
 const MAX_FIGURES = 500;
-const MAX_DISCREPANCIES = 50;
+// MAX_DISCREPANCIES removed: discrepancies are no longer truncated in the stored set.
+// The tiered report shows all divergences; the merge prompt uses only the headline + material summary.
 
 // ---------------------------------------------------------------------------
 // Utility functions
@@ -1031,7 +1032,10 @@ export async function runNumericVerifyInline(
   }
 
   const figures = dedupedFigures.slice(0, MAX_FIGURES);
-  const discrepancies = crossResult.discrepancies.slice(0, MAX_DISCREPANCIES);
+  // Do NOT truncate discrepancies — all divergences feed the tiered report.
+  // The merge-prompt injection (pipeline-core.ts) already uses only the per-period
+  // headline + material-tier lines from the .description field (bounded by design).
+  const discrepancies = crossResult.discrepancies;
 
   const isPartial = timeBudgetExhaustedAtDocPhase || timeBudgetExhaustedAtTableLoad;
 

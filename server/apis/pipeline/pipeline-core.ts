@@ -1820,15 +1820,23 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   if (hasNumericData && numericReport) {
     numericBlock = `\n\n## Numeric Verification Report\n*Source: deterministic cell-value reads from the financial model*\n\n`;
 
-    // Cross-agreement discrepancies (the ONLY discrepancy source)
+    // Cross-agreement discrepancies — inject ONLY the rolled-up per-period summary.
+    // Each discrepancy.description contains the headline + material-tier lines (bounded).
+    // The full detail (all 90+ metrics) is stored in .metrics[] for the tiered report UI
+    // but NOT dumped into the merge prompt (would bloat it and cause line-item contradictions).
     if (numericReport.discrepancies.length > 0) {
       numericBlock += `### Cross-Version Divergences\n`;
       numericBlock += `*These are differences between the live model and a frozen reference. Confirm whether each reflects an intentional update or a stale/contradictory reference.*\n\n`;
       for (const d of numericReport.discrepancies) {
         const disc = d as Record<string, unknown>;
-        numericBlock += `- **[${String(disc.severity).toUpperCase()}]** ${String(disc.description)}\n`;
+        // Prefer the headline (compact one-liner) when available; fall back to description
+        const headline = disc.headline as string | undefined;
+        if (headline) {
+          numericBlock += `**${String(disc.period ?? "Unknown")}:** ${headline}\n\n`;
+        }
+        // Material movements summary (already bounded to tier-2 lines in description)
+        numericBlock += `${String(disc.description)}\n\n`;
       }
-      numericBlock += `\n`;
     }
 
     // Verified figures — trustworthy values for narrative comparison

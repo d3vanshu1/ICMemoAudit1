@@ -1,5 +1,6 @@
 import { api, z, anthropic } from "@superblocksteam/sdk-api";
 import { NUMERIC_MODULES } from "./constants.js";
+import { EFFECTIVE_CAP_MS } from "../pipeline/pipeline-config.js";
 
 // ---------------------------------------------------------------------------
 // Integration
@@ -713,9 +714,11 @@ export default api({
 
   async run(ctx, { moduleId, executiveHeader, findings, useOpus, coverageLine, numericReport }) {
     // Time-budget guard: ensure we return a partial report rather than being
-    // killed mid-stream by the 300s platform hard limit.
+    // killed mid-stream by the platform hard limit.
     const FORMAT_START_TIME = Date.now();
-    const FORMAT_TIME_BUDGET_MS = 220_000; // 220s — leaves 80s margin under 300s platform kill
+    // Derived from effective cap: leaves 100s margin under the platform kill.
+    // At 600s cap → 500s format budget; at 300s cap → 200s budget.
+    const FORMAT_TIME_BUDGET_MS = EFFECTIVE_CAP_MS - 100_000;
 
     let reportPrompt = REPORT_PROMPTS[moduleId];
     if (!reportPrompt) {
@@ -808,7 +811,7 @@ No deterministic numeric verification was performed for this analysis. All figur
       `${findingsJson}${sanitizeBraces(numericBlock)}`;
 
     // --- Report generation with continuation on truncation ---
-    const MAX_CONTINUATIONS = 1;
+    const MAX_CONTINUATIONS = 2;
     // Default to Sonnet (3× faster) — Opus only when explicitly requested via useOpus flag
     const selectedModel = useOpus ? OPUS_MODEL : SONNET_MODEL;
     let accumulated = "";

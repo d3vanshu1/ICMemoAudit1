@@ -31,16 +31,18 @@ export const PLATFORM_CAP_MS = Number(process.env.SB_API_TIMEOUT_MS) || 300_000;
 
 /** Effective cap override.
  *
- *  REVERTED 2026-07-22: DiagTimeoutProbe survived 570s but that used Clark's
- *  testApi path which bypasses the Application API quota. Client-invoked APIs
- *  (executeSdkApiV3) are hard-killed at 5m0s per the platform quota:
- *    "RunModulePipeline API execution exceeded the 5-minute time limit."
- *  Two consecutive 300s kills confirmed empirically (run 32087fa4, omission_audit).
+ *  CONFIRMED 2026-07-28: DiagTimeoutProbe client-path (executeApi / executeSdkApiV3)
+ *  survived >305s — Idris confirmed account-level cap raised to 600s. The prior 300s
+ *  kills (run 32087fa4, 2026-07-22) were under the old platform quota. Client-invoked
+ *  APIs now have 10 minutes effective; we use 600s as a conservative ceiling.
  *
- *  With override=undefined, EFFECTIVE_CAP_MS falls back to PLATFORM_CAP_MS=300s.
- *  Pipeline will checkpoint more frequently (TIME_BUDGET_MS=200s) but always
- *  exit cleanly before the platform kill. Poll loop re-invokes to continue. */
-const PIPELINE_CAP_OVERRIDE_MS: number | undefined = undefined;
+ *  Derived budgets at 600s:
+ *    TIME_BUDGET_MS = 500_000 (graceful exit 500s, 100s headroom)
+ *    EXTRACTION_TIME_BUDGET_MS = 250_000 (42% of 600s)
+ *    RESUME_JOB_TIME_BUDGET_MS = 570_000 (600s - 30s headroom)
+ *    STALENESS_THRESHOLD_MINUTES = 12 (ceil(10min) + 2)
+ */
+const PIPELINE_CAP_OVERRIDE_MS: number | undefined = 600_000;
 
 /** The actual cap used for all derived constants. Override wins if set. */
 export const EFFECTIVE_CAP_MS = PIPELINE_CAP_OVERRIDE_MS ?? PLATFORM_CAP_MS;
