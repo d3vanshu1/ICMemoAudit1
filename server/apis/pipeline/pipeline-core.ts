@@ -1861,10 +1861,11 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
 A "## Numeric Verification Report" section appears in the input below. It contains cell values read directly from the financial model by code — NOT by AI inference. You MUST:
 - Treat every "Verified Figure" as a trustworthy cell value from the model
-- Flag where NARRATIVE claims (from CIM, IC memo, management presentations) disagree with these values — that is a potential contradiction
+- Flag where NARRATIVE claims (from CIM, IC memo, management presentations) disagree with these values — that is a potential contradiction ONLY IF same metric + same scope + same period
 - "Cross-Version Divergences" compare the live model to a frozen reference; frame these as "confirm intentional revision vs stale reference," not as asserted errors
 - Never invent or re-derive figures — only cite values that appear in the Verified Figures list
-- Do NOT treat absence from the list as evidence of a problem — the list covers configured metrics only${numericPartial ? `
+- Do NOT treat absence from the list as evidence of a problem — the list covers configured metrics only
+- SCOPE RULE: A narrative figure (e.g., "Total Revenue (PF) £194m") contradicts a model figure ONLY if the scope qualifiers match exactly. "Total Revenue (PF)" and "Total revenue (excl. future M&A)" are DIFFERENT metrics — flag as a hedged scope-mismatch note, not a contradiction${numericPartial ? `
 
 ⚠️ PARTIAL COVERAGE: The engine ran out of time before processing all tables. Verified Figures are correct for what was analyzed, but coverage is incomplete.` : ""}`;
     baseMergePrompt = baseMergePrompt.replace("{{NUMERIC_VERIFICATION_BLOCK}}", numericVerifInst);
@@ -2063,6 +2064,7 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
                   ...(typeof f.independent === "boolean"
                     ? { independent: f.independent }
                     : {}),
+                  ...(typeof f.severity_anchor === "string" ? { severity_anchor: f.severity_anchor } : {}),
                 }));
               }
             } catch { /* parse failure — use empty findings */ }
@@ -2097,10 +2099,30 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
                   ...(f.category === "housekeeping" || f.category === "human_review_flag"
                     ? { category: f.category as string }
                     : { category: "housekeeping" }),
+                  ...(typeof f.severity_anchor === "string" ? { severity_anchor: f.severity_anchor } : {}),
                 })) as MergedFinding[];
               }
             } catch { /* non-fatal */ }
           }
+
+          // --- Observability: Fix 2 (scope-mismatch) + Fix 3 (severity anchors) ---
+          // (placed after housekeeping parse so allMergeFindings includes both sets)
+          const allMergeFindings = [...findings, ...housekeepingFindings];
+          const scopeMismatches = allMergeFindings.filter(f =>
+            f.full_analysis?.includes("[SCOPE_MISMATCH]")
+          );
+          if (scopeMismatches.length > 0) {
+            console.log(`[Merge][Fix2] Scope-qualifier mismatches downgraded (${scopeMismatches.length}):`);
+            for (const sm of scopeMismatches) {
+              console.log(`  → "${sm.title}" | severity=${sm.severity} | ${sm.detail?.slice(0, 120)}`);
+            }
+          }
+          for (const f of allMergeFindings) {
+            if ((f as any).severity_anchor) {
+              console.log(`[Merge][Fix3] severity_anchor | "${f.title}" [${f.severity}]: ${(f as any).severity_anchor}`);
+            }
+          }
+          // --- End observability ---
 
           // Fallback: if findings are empty (model failed to extract), union input
           // members' findings — degrades to unconsolidated duplicates rather than

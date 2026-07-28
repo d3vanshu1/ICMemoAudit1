@@ -33,6 +33,8 @@ export interface MergedFinding {
   materiality_rationale?: string;
   /** Finding classification: principal_finding (default), housekeeping (sub-materiality), human_review_flag (emphasis-judgment) */
   category?: "principal_finding" | "housekeeping" | "human_review_flag";
+  /** Severity anchor: the £ figure or source statement justifying the assigned severity (Fix 3 observability) */
+  severity_anchor?: string;
   verification?: {
     status: "revised" | "upheld";
     evidenceQuoted?: string;

@@ -45,6 +45,8 @@ const FindingSchema = z.object({
   materiality_rationale: z.string().optional(),
   category: z.enum(["principal_finding", "housekeeping", "human_review_flag"]).optional(),
   numeric_unverified: z.boolean().optional(),
+  /** Severity anchor: the £ figure or source statement justifying the severity assignment */
+  severity_anchor: z.string().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -69,6 +71,47 @@ All numeric verification is performed by a separate deterministic system (Numeri
 are injected when available. Any arithmetic claim not sourced from NumericVerify is fabricated.
 If you see numeric findings in the input extractions that appear to be ad-hoc arithmetic,
 DISCARD them — do not propagate or consolidate them into your output.
+
+## SIGNIFICANCE GROUNDING — Severity Must Be Source-Anchored
+
+Every finding's severity and impact characterization MUST be anchored to verifiable evidence. Apply these rules:
+
+### Fact vs. Characterization Separation
+
+In every finding's "full_analysis", you MUST clearly separate:
+1. **Sourced facts** (what the source documents actually state) — prefix with "[SOURCED]"
+2. **Significance/impact claims** (your assessment of why it matters) — prefix with "[SIGNIFICANCE]"
+
+A significance claim is ONLY valid when it is:
+- **Directly stated in the source** (e.g., "the legal DD states this constitutes a s.19 criminal offence"), OR
+- **Directly computable from sourced figures against a materiality floor** (e.g., "£12m write-down = 1.8% of EV, above the £5m materiality threshold")
+
+### Severity Anchoring Rules
+
+- **critical**: Requires EITHER (a) an explicit source statement of material risk (e.g., "criminal offence", "regulatory breach", "going concern doubt"), OR (b) a quantified £ impact exceeding 1% of transaction value (£6.5m on a £655m deal)
+- **warning**: Requires a quantified £ impact exceeding £1m, or a source-stated risk with identified mitigation
+- **info**: Everything else — including items where significance cannot be source-anchored
+
+### Prohibited Characterizations (Without Source Anchoring)
+
+You MUST NOT attach these characterizations unless the source explicitly states them or you can quantify them against the £655m transaction:
+- "material revenue-generating asset" — unless the source states materiality or revenue > £5m/yr
+- "operational cliff" / "existential threat" — unless the source describes business continuity risk
+- "critical dependency" — unless the source identifies single-point-of-failure
+- "threatens [year] projections" — unless you can cite the specific £ impact and its % of projected figures
+
+Example — WRONG: A £118k/yr office lease described as "a material revenue-generating asset with an operational cliff threatening 2031 projections." £118k = 0.018% of EV. The source says nothing about materiality or operational dependency. This is fabricated significance → demote to housekeeping.
+
+Example — CORRECT: "FCA authorisation under s.19 FSMA — the legal DD states that operating without proper consumer-hire authorisation constitutes a criminal offence (s.19 breach)." The source directly states the severity anchor. This is grounded → critical is justified.
+
+### severity_anchor Field (Required)
+
+Every finding MUST include a "severity_anchor" field — one sentence stating the £ figure or source statement that justifies the assigned severity. If you cannot articulate a severity anchor, the finding MUST be info/housekeeping.
+
+Examples:
+- "severity_anchor": "Legal DD states s.19 breach is a criminal offence (source-stated risk)"
+- "severity_anchor": "£12m contingent liability = 1.8% of EV, exceeds £6.5m critical threshold"
+- "severity_anchor": "£118k/yr rent = 0.018% of EV — below all materiality thresholds"
 
 ## MATERIALITY GATE — IC-Chair Standard
 
@@ -113,6 +156,7 @@ A JSON array of PRINCIPAL findings only (category = "principal_finding"). Each o
 - "materiality_rationale": (REQUIRED for all findings) One sentence explaining why this finding would plausibly change an IC member's assessment of a £655m transaction. Sub-threshold items are demoted to housekeeping.
 - "category": "principal_finding" | "housekeeping" | "human_review_flag". Default is "principal_finding". Use "housekeeping" for sub-materiality items (standard DD workstreams, post-close admin, process-stage items). Use "human_review_flag" for emphasis-judgment findings that failed the six-point rubric.
 - "numeric_unverified": boolean. Set to true when the finding's core quantitative claim could NOT be traced to verbatim source text (e.g., chart-derived or vision-inferred figures). Such findings MUST be severity "info" maximum.
+- "severity_anchor": (REQUIRED for all findings) One sentence stating the £ figure or explicit source statement that justifies the assigned severity. Format: "[£X = Y% of EV, exceeds Z threshold]" for quantified anchors, or "[Source document states: verbatim risk language]" for source-stated anchors. If no anchor can be articulated, severity MUST be "info" and category MUST be "housekeeping".
 </findings_json>
 
 ## MITIGATION-CARRY RULE — Graded DD Item Attribution
@@ -245,10 +289,30 @@ ${MERGE_OUTPUT_STRUCTURE}`,
 
 {{NUMERIC_VERIFICATION_BLOCK}}
 
+## SCOPE-QUALIFIER MATCHING — Narrative vs. Data Comparison Rules
+
+When comparing a narrative figure (from CIM, IC memo, management presentation) against a model figure (Verified Figures list), you MUST enforce scope-qualifier matching:
+
+1. **Exact-qualifier rule**: A numeric contradiction can only be ASSERTED (severity critical/warning) when BOTH the metric name AND its scope qualifier match exactly. Examples of distinct scopes that must NOT be compared as contradictions:
+   - "Total Revenue (PF)" ≠ "Total revenue (excl. future M&A)" — pro-forma includes acquisitions, excl-M&A does not
+   - "Total Group revenue" ≠ "Total revenue (excl. future M&A)" — group-level includes all entities
+   - "Adj. EBITDA (post-IFRS 16)" ≠ "Adj. EBITDA (pre-IFRS 16)" — different accounting treatment
+   - "Revenue (run-rate)" ≠ "Revenue (reported)" — different temporal basis
+
+2. **Scope-mismatch hedge**: When a memo figure and a model figure share a base metric name (e.g., both say "revenue") but have DIFFERENT qualifiers or scopes (PF vs excl-M&A, group vs segment, run-rate vs reported), you MUST:
+   - NOT assert a contradiction, shortfall, or discrepancy
+   - Instead, produce a **hedged info-level note**: "Figures differ — confirm like-for-like basis ([memo qualifier] vs [model qualifier]) and period alignment."
+   - Set severity to "info", category to "housekeeping"
+   - Include in full_analysis: "[SCOPE_MISMATCH] Memo cites [label+qualifier]: [value]. Model shows [label+qualifier]: [value]. These metrics have different scope definitions and are not directly comparable."
+
+3. **Same-scope only**: Only assert a numeric contradiction when you can confirm BOTH figures describe the same metric, same scope, same period, and same accounting basis. When in doubt, hedge — do not fabricate a contradiction from a scope difference.
+
+4. **No synonym tables**: Do NOT infer that two differently-qualified metrics are "the same thing" based on proximity or common usage. Treat each qualifier as defining a distinct metric unless the source explicitly states equivalence.
+
 ## Your Task
 
-1. {{NUMERIC_TASK_STEP_1}}**Cross-Reference Narrative vs. Data**: For each narrative claim, search the data extractions for confirming or contradicting evidence.
-2. **Flag Contradictions**: When a narrative claim conflicts with data, document both sides with exact citations.
+1. {{NUMERIC_TASK_STEP_1}}**Cross-Reference Narrative vs. Data**: For each narrative claim, search the data extractions for confirming or contradicting evidence. Apply scope-qualifier matching before asserting any numeric contradiction.
+2. **Flag Contradictions**: When a narrative claim conflicts with data AT THE SAME SCOPE, document both sides with exact citations.
 3. **Identify Unsupported Claims**: Flag narrative claims that have no data support.
 4. **Assess Materiality**: Rate each contradiction by its potential impact on the investment thesis.
 5. **Note Consistent Claims**: Briefly acknowledge claims that are well-supported by data.
