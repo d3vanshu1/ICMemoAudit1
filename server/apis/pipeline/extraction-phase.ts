@@ -54,13 +54,13 @@ const STAGGER_DELAY_MS = 250;
  *  - Observed extraction response time: 40-120s per call
  *  - Effective batch cadence: ~45-125s per batch (response_time + cooldown)
  *  - Peak RPM (extraction phase alone): ~8 req / 45s = ~10.7 RPM (best case)
- *  - Total requests per invocation: 72 (spread over ~375s of wall-clock at 600s cap)
- *  - At 600s cap the time budget is 250s for extraction — with 8-concurrent batches
- *    and 5s cooldown, 9 batches × (25s avg + 5s cooldown) ≈ 270s fits comfortably.
- *  - Stepping from 48→72 first (not 96); if 429s appear, reduce back before going higher.
- *  - EXTRACTION_CONCURRENCY=8 and INTER_BATCH_COOLDOWN_MS=5000 unchanged (rate-limit-tuned).
- *  - If 429s return at 72 gaps, reduce MAX_GAPS back or increase COOLDOWN. */
-const MAX_GAPS_PER_INVOCATION = 72; // 9 full batches of 8
+ *  - Total requests per invocation: 48 (spread over ~250s of wall-clock)
+ *  - This is 3× the prior 16-gap cap; validated against the same
+ *    EXTRACTION_CONCURRENCY=8 that was reduced from 12 specifically to avoid
+ *    429 storms. At 8 concurrent with 250ms stagger, we stay well under the
+ *    account-level RPM tier (empirically, 429s ceased at concurrency ≤ 8).
+ *  - If 429s return at 48 gaps, reduce MAX_GAPS back or increase COOLDOWN. */
+const MAX_GAPS_PER_INVOCATION = 48; // 6 full batches of 8
 
 /** Cooldown between batches (ms) when processing gap-fills.
  *  Only applied when total gaps exceed MAX_GAPS_PER_INVOCATION — gives the
