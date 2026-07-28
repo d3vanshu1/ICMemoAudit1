@@ -1096,9 +1096,12 @@ export async function runNumericVerifyInline(
   const tables = parseTables(allRawRows);
   console.log(`[NumericInline] Parsed ${tables.length} table(s) from ${allRawRows.length} raw row(s)`);
 
-  // Step 5: Layer 1 — Extract metric figures from all loaded tables
+  // Step 5: Layer 1 — Extract metric figures from the LIVE MODEL only.
+  // Figures are the source-of-truth model values fed to the LLM — they must come
+  // exclusively from the resolved live model, not from the original/frozen version
+  // (which would inject stale values as "trustworthy" alongside the live ones).
   let allFigures: Figure[] = [];
-  for (const table of tables) {
+  for (const table of tables.filter(t => t.documentId === liveModelDocId)) {
     const tableFigures = extractMetricFigures(table, SCG_METRIC_CONFIG);
     allFigures.push(...tableFigures);
   }
