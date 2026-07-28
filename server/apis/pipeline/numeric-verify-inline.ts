@@ -432,6 +432,32 @@ function matchesCrossSheet(sheetOrPage: string, configSheet: string): boolean {
   return sheetOrPage.trim().toLowerCase() === configSheet.trim().toLowerCase();
 }
 
+/**
+ * Detect which period columns are annual summaries vs monthly/sub-annual.
+ *
+ * Heuristic: group columns by base year. For each year, the first (lowest col
+ * index) is the annual summary; the rest are monthly/sub-annual detail.
+ * Years with exactly one column treat that column as annual.
+ *
+ * Shared by extractMetricFigures (Layer 1) and extractAllNumericEntries (Layer 2)
+ * to ensure consistent annual-only filtering across both layers.
+ */
+function detectAnnualColumns(periodCols: Array<{ colIdx: number; period: string }>): Set<number> {
+  const colsByBaseYear = new Map<string, number[]>();
+  for (const pc of periodCols) {
+    const baseYear = periodBaseYear(pc.period);
+    if (!colsByBaseYear.has(baseYear)) colsByBaseYear.set(baseYear, []);
+    colsByBaseYear.get(baseYear)!.push(pc.colIdx);
+  }
+
+  const annualCols = new Set<number>();
+  for (const [, cols] of colsByBaseYear) {
+    cols.sort((a, b) => a - b);
+    annualCols.add(cols[0]); // First (lowest index) = annual summary
+  }
+  return annualCols;
+}
+
 // ---------------------------------------------------------------------------
 // Layer 1: Metric Figures — read cell values at known metric labels
 // ---------------------------------------------------------------------------
@@ -452,12 +478,19 @@ function extractMetricFigures(
   }
   if (periodCols.length === 0) return figures;
 
+  // CRITICAL (Fix 2C): Only emit figures from ANNUAL summary columns.
+  // Monthly/sub-annual columns have per-month values (e.g., £4.6m) that are
+  // incomparable to annual totals (£57m). Feeding both into the Verified Figures
+  // list causes the merge LLM to fabricate "formula error" contradictions.
+  const annualCols = detectAnnualColumns(periodCols);
+
   // Find metric rows
   for (let ri = 0; ri < rowHeaders.length; ri++) {
     const label = rowHeaders[ri];
     if (!matchesMetricConfig(label, metricConfig)) continue;
 
     for (const { colIdx, period } of periodCols) {
+      if (!annualCols.has(colIdx)) continue; // Skip sub-annual columns
       const cell = table.grid.get(`${ri},${colIdx}`);
       if (!cell || cell.type !== "number" || cell.value === null) continue;
 
@@ -714,25 +747,8 @@ function extractAllNumericEntries(table: ParsedTable): CrossAgreementEntry[] {
     }
   }
 
-  // Detect annual vs sub-annual columns:
-  // Group columns by base year. For each year, if there are multiple columns,
-  // the first (lowest col index) is the annual summary; the rest are monthly/sub-annual.
-  // This handles the common financial model structure: cols 7-10 = annual summaries,
-  // cols 18-65 = monthly detail (all sharing the same enriched year).
-  const colsByBaseYear = new Map<string, number[]>();
-  for (const pc of periodCols) {
-    const baseYear = periodBaseYear(pc.period);
-    if (!colsByBaseYear.has(baseYear)) colsByBaseYear.set(baseYear, []);
-    colsByBaseYear.get(baseYear)!.push(pc.colIdx);
-  }
-
-  // Annual columns: for each base year with >1 column, the first is annual.
-  // For years with exactly 1 column, that single column is annual.
-  const annualCols = new Set<number>();
-  for (const [, cols] of colsByBaseYear) {
-    cols.sort((a, b) => a - b);
-    annualCols.add(cols[0]); // First (lowest index) = annual summary
-  }
+  // Use shared annual-column detection (same heuristic as extractMetricFigures)
+  const annualCols = detectAnnualColumns(periodCols);
 
   for (let ri = 0; ri < rowHeaders.length; ri++) {
     const label = rowHeaders[ri];

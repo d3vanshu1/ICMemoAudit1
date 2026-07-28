@@ -309,6 +309,26 @@ When comparing a narrative figure (from CIM, IC memo, management presentation) a
 
 4. **No synonym tables**: Do NOT infer that two differently-qualified metrics are "the same thing" based on proximity or common usage. Treat each qualifier as defining a distinct metric unless the source explicitly states equivalence.
 
+## SOURCE-DOCUMENT INTEGRITY — Citation Provenance Rules
+
+Every finding must cite source documents that ACTUALLY CONTAIN the claim. Fabricated or mis-attributed citations are the worst class of error — they destroy IC trust.
+
+1. **Provenance enforcement**: A finding's "source_docs" MUST be documents that appear in the input analysis sets AND whose extraction text contains the claim or data point cited. Do NOT cite a document unless you can point to a verbatim snippet from its extraction that supports the specific assertion.
+
+2. **Cross-document attribution ban**: If claim X appears in Document A's extraction but NOT in Document B's extraction, you MUST NOT cite Document B as a source for claim X. This applies even if you believe Document B "probably" contains it — you can only cite what is present in the extraction text you received.
+
+3. **Conditionality preservation**: When a source document states a conditional fact (e.g., "terminable ONLY IF material impact in the reasonable opinion of [party]"), the finding MUST preserve the conditional language. You MUST NOT:
+   - Drop qualifiers: "terminable" ≠ "automatically terminates"
+   - Escalate conditions to absolutes: "may be terminated upon material impact" ≠ "will terminate"
+   - Omit thresholds: "liability capped at £2m" ≠ "unlimited liability"
+
+4. **Unverified escalation gate**: If your finding asserts an ABSOLUTE (automatic termination, unlimited liability, guaranteed loss) but the source extraction contains CONDITIONAL language for the same topic, the finding is an "unverified escalation." You MUST:
+   - Flag with "numeric_unverified": true
+   - Cap severity at "info"
+   - State in full_analysis: "[CONDITIONALITY_DROPPED] Source states: '[verbatim conditional text]'. Finding escalates to absolute without sourced justification."
+
+5. **Multi-source cross-check**: When a finding synthesizes information from multiple source documents, each specific factual claim within the finding must be attributed to the correct source. Do not attribute claims from legal DD to the vendor FDD or vice versa, even if both discuss the same topic.
+
 ## Your Task
 
 1. {{NUMERIC_TASK_STEP_1}}**Cross-Reference Narrative vs. Data**: For each narrative claim, search the data extractions for confirming or contradicting evidence. Apply scope-qualifier matching before asserting any numeric contradiction.
@@ -317,6 +337,7 @@ When comparing a narrative figure (from CIM, IC memo, management presentation) a
 4. **Assess Materiality**: Rate each contradiction by its potential impact on the investment thesis.
 5. **Note Consistent Claims**: Briefly acknowledge claims that are well-supported by data.
 6. **Consolidate**: Combine overlapping observations into single, stronger findings.
+7. **Verify Source Attribution**: Before finalizing, confirm every source_doc citation traces to a specific extraction snippet you received. Remove or correct any mis-attributed citations.
 ${MERGE_OUTPUT_STRUCTURE}`,
 
   blind_spot_scanner: `You are a senior investment committee advisor and contrarian thinker. You are synthesizing analyst findings that extracted the investment thesis, explicit assumptions, and implicit assumptions from deal documents. Your job is to identify blind spots.
