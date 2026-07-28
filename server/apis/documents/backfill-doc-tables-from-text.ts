@@ -67,10 +67,26 @@ function classifyValue(text: string): { value: number | string | null; type: Str
   const trimmed = text.trim();
   if (trimmed === "") return { value: null, type: "empty" };
 
-  // Try to parse as number (handle currency, commas, parentheses for negatives, percentages)
-  const cleaned = trimmed.replace(/[$,]/g, "").replace(/^\((.+)\)$/, "-$1");
+  // Strip currency symbols (£, €, $) and thousands separators; handle parenthetical negatives
+  const cleaned = trimmed
+    .replace(/[£€$,]/g, "")
+    .replace(/^\((.+)\)$/, "-$1");
   const isPercent = trimmed.endsWith("%");
   const numStr = isPercent ? cleaned.replace(/%$/, "") : cleaned;
+
+  // Handle magnitude suffixes: k (×1,000), m (×1,000,000), bn (×1,000,000,000)
+  const magMatch = numStr.match(/^(-?[\d.]+)\s*(k|m|bn|b)$/i);
+  if (magMatch) {
+    const base = Number(magMatch[1]);
+    if (!isNaN(base)) {
+      const suffix = magMatch[2].toLowerCase();
+      const multiplier = suffix === "k" ? 1_000
+        : suffix === "m" ? 1_000_000
+        : /* bn/b */ 1_000_000_000;
+      return { value: base * multiplier, type: "number" };
+    }
+  }
+
   const num = Number(numStr);
 
   if (!isNaN(num) && numStr !== "") {
@@ -83,6 +99,11 @@ function classifyValue(text: string): { value: number | string | null; type: Str
   // Date detection (simple ISO-like patterns)
   if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
     return { value: trimmed, type: "date" };
+  }
+
+  // Log cells that look numeric but failed to parse (currency/magnitude residue)
+  if (/[£€$]\s*[\d.]|[\d.]\s*(k|m|bn)\b/i.test(trimmed)) {
+    console.log(`[DocTables] Unparseable numeric candidate: "${trimmed}"`);
   }
 
   return { value: trimmed, type: "string" };

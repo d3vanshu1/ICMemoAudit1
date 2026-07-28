@@ -712,13 +712,24 @@ No deterministic numeric verification was performed for this analysis. All figur
             };
           });
 
-          // CODE BACKSTOP: memo_omission/open_item_acknowledged findings missing
-          // absence_confidence are treated as "unverified" and capped at severity "info".
+          // CODE BACKSTOP: absence-verification gate — gates on claim shape,
+          // not gap_type alone. Any finding asserting absence without verified
+          // confidence is capped at info severity.
+          const ABSENCE_PATTERNS = /\b(does not confirm|does not disclose|absent|not disclosed|missing|no mention|fails to address|not addressed|not confirmed|no evidence of|no reference to|omits?|silent on|does not discuss|not discussed)\b/i;
+
           for (const f of findings) {
-            if ((f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged") && !f.absence_confidence) {
-              (f as any).absence_confidence = "unverified";
+            const hasAbsenceGapType = f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged";
+            const assertsAbsence = !hasAbsenceGapType &&
+              (ABSENCE_PATTERNS.test(f.full_analysis || "") || ABSENCE_PATTERNS.test(f.detail || ""));
+
+            if ((hasAbsenceGapType || assertsAbsence) && f.absence_confidence !== "verified_absent") {
+              if (!f.absence_confidence) {
+                (f as any).absence_confidence = "unverified";
+              }
               if (f.severity === "critical" || f.severity === "warning") {
+                const original = f.severity;
                 (f as any).severity = "info";
+                console.log(`[Merge][FixA] Absence cap applied: "${f.title}" | ${original} → info`);
               }
             }
           }

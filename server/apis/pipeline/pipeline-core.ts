@@ -2070,14 +2070,26 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
             } catch { /* parse failure — use empty findings */ }
           }
 
-          // CODE BACKSTOP: memo_omission findings missing absence_confidence are
-          // treated as "unverified" and capped at severity "info" — prevents bypassing
-          // the verification gate by field omission.
+          // CODE BACKSTOP: absence-verification gate — any finding asserting
+          // something is missing/absent/not-confirmed must carry verified absence
+          // confidence or be capped at info. Gates on claim shape, not gap_type alone.
+          const ABSENCE_PATTERNS = /\b(does not confirm|does not disclose|absent|not disclosed|missing|no mention|fails to address|not addressed|not confirmed|no evidence of|no reference to|omits?|silent on|does not discuss|not discussed)\b/i;
+
           for (const f of findings) {
-            if ((f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged") && !f.absence_confidence) {
-              (f as any).absence_confidence = "unverified";
+            // Original gap_type gate (backward compat)
+            const hasAbsenceGapType = f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged";
+            // Broadened: claim-shape detection on any module's findings
+            const assertsAbsence = !hasAbsenceGapType &&
+              (ABSENCE_PATTERNS.test(f.full_analysis || "") || ABSENCE_PATTERNS.test(f.detail || ""));
+
+            if ((hasAbsenceGapType || assertsAbsence) && f.absence_confidence !== "verified_absent") {
+              if (!f.absence_confidence) {
+                (f as any).absence_confidence = "unverified";
+              }
               if (f.severity === "critical" || f.severity === "warning") {
+                const original = f.severity;
                 (f as any).severity = "info";
+                console.log(`[Merge][FixA] Absence cap applied: "${f.title}" | ${original} → info`);
               }
             }
           }
