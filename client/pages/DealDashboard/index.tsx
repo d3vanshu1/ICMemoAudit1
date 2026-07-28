@@ -25,7 +25,6 @@ import RerunSuggestionModal from "@/components/ic/modules/RerunSuggestionModal";
 import RunHistory from "@/components/ic/modules/RunHistory";
 import QAPanel from "@/components/ic/qa/QAPanel";
 import ReparseDocumentsModal from "@/components/ic/documents/ReparseDocumentsModal";
-import TimeoutProbeButton from "@/components/ic/diagnostics/TimeoutProbeButton";
 
 export { DealDashboardPage as Component };
 
@@ -2635,9 +2634,6 @@ export default function DealDashboardPage() {
         existingDocuments={docs.map((d) => ({ id: d.id, file_name: d.file_name }))}
         onCommitComplete={() => refetchDocs()}
       />
-
-      {/* TEMPORARY DIAGNOSTIC — remove after timeout cap is confirmed */}
-      <TimeoutProbeButton />
     </div>
   );
 }
