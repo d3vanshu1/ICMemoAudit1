@@ -172,15 +172,6 @@ const DocTableDataSchema = z.object({
 // ---------------------------------------------------------------------------
 
 /**
- * SCG cross-agreement config.
- * Compares "FS Summary" (live updated) vs "FS Summary (hardcoded)" (frozen reference).
- * Both sheets live in document a0172256 (the updated model with 22 sheets).
- * Document pinning prevents the original/pre-update model (321b6185) from being
- * selected — that model's FS Summary is identical to the hardcoded snapshot,
- * producing 0 divergences (false negative).
- */
-
-/**
  * SCG metric config: which row labels constitute "metrics" for figure reading.
  * Covers the standard P&L/BS/CF hierarchy. If a row label matches any pattern,
  * its values across all period columns are emitted as verified figures.
@@ -196,11 +187,15 @@ const SCG_METRIC_CONFIG: MetricConfig = {
   ],
 };
 
-const SCG_CROSS_AGREEMENT: CrossAgreementConfig = {
+/**
+ * SCG cross-agreement config (template — no hardcoded document IDs).
+ * Compares "FS Summary" (live updated) vs "FS Summary (hardcoded)" (frozen reference).
+ * Document pinning is resolved at runtime via `resolveLiveModelDocId()` which finds
+ * the document containing BOTH sheets — a structural signal that survives re-upload.
+ */
+const SCG_CROSS_AGREEMENT_TEMPLATE: Omit<CrossAgreementConfig, "sourceADocId" | "sourceBDocId"> = {
   sourceASheet: "FS Summary",
   sourceBSheet: "FS Summary (hardcoded)",
-  sourceADocId: "a0172256-4ab0-412b-a247-f70b16136b28",
-  sourceBDocId: "a0172256-4ab0-412b-a247-f70b16136b28",
   matchingRule: "exact",
   absThreshold: 1_000, // £1k absolute minimum — floor for ANY divergence to be recorded
   relThreshold: 0.0001, // 0.01% relative
@@ -208,6 +203,81 @@ const SCG_CROSS_AGREEMENT: CrossAgreementConfig = {
   materialityAbsFloor: 500_000, // £500k
   materialityRelFloor: 0.05, // 5%
 };
+
+// ---------------------------------------------------------------------------
+// Document resolution: resolves the live model by structural sheet presence
+// ---------------------------------------------------------------------------
+
+/** Schema for the resolution query */
+const DocSheetPresenceSchema = z.object({
+  document_id: z.string(),
+  file_name: z.string(),
+  has_source_a: z.coerce.boolean(),
+  has_source_b: z.coerce.boolean(),
+});
+
+/**
+ * Resolves the "live model" document ID for cross-agreement by finding the single
+ * document that contains BOTH comparison sheets (e.g., "FS Summary" AND "FS Summary (hardcoded)").
+ *
+ * Rationale: The live/updated model contains both the formula-driven live sheet and its
+ * hardcoded snapshot companion — this is a structural invariant that survives re-upload
+ * (unlike a UUID literal which breaks on re-upload). The original/frozen model lacks
+ * the "(hardcoded)" companion sheet entirely.
+ *
+ * Fail-loud: throws if 0 or >1 documents match (ambiguity = must be resolved by user).
+ */
+async function resolveLiveModelDocId(
+  db: DbClient,
+  dealId: string,
+  sourceASheet: string,
+  sourceBSheet: string,
+): Promise<{ docId: string; fileName: string }> {
+  // Query: for each financial_model document in this deal, check whether it
+  // contains both required sheets (case-insensitive match on sheet_or_page).
+  const candidates = await db.query(
+    `SELECT
+       d.id AS document_id,
+       d.file_name,
+       BOOL_OR(LOWER(TRIM(dt.sheet_or_page)) = LOWER($2)) AS has_source_a,
+       BOOL_OR(LOWER(TRIM(dt.sheet_or_page)) = LOWER($3)) AS has_source_b
+     FROM documents d
+     JOIN doc_tables dt ON dt.document_id = d.id
+     WHERE d.deal_id = $1
+       AND d.document_tag = 'financial_model'
+     GROUP BY d.id, d.file_name
+     HAVING
+       BOOL_OR(LOWER(TRIM(dt.sheet_or_page)) = LOWER($2)) = TRUE
+       AND BOOL_OR(LOWER(TRIM(dt.sheet_or_page)) = LOWER($3)) = TRUE
+     LIMIT 10`,
+    DocSheetPresenceSchema,
+    [dealId, sourceASheet, sourceBSheet],
+    { label: "Resolve live model: find doc with both comparison sheets" }
+  );
+
+  if (candidates.length === 0) {
+    throw new Error(
+      `[NumericVerify:Provenance] No document contains both "${sourceASheet}" and "${sourceBSheet}" sheets. ` +
+      `Cannot determine which file is the live model. Upload a model containing both sheets, or verify document tags.`
+    );
+  }
+
+  if (candidates.length > 1) {
+    const listing = candidates.map(c => `${c.file_name} (${c.document_id.slice(0, 8)})`).join("; ");
+    throw new Error(
+      `[NumericVerify:Provenance] AMBIGUOUS — ${candidates.length} documents contain both ` +
+      `"${sourceASheet}" and "${sourceBSheet}": [${listing}]. ` +
+      `Which file is the live model? Remove or re-tag the duplicate to resolve.`
+    );
+  }
+
+  const resolved = candidates[0];
+  console.log(
+    `[NumericVerify:Provenance] Resolved live model: "${resolved.file_name}" (${resolved.document_id.slice(0, 8)}) — ` +
+    `contains both "${sourceASheet}" and "${sourceBSheet}".`
+  );
+  return { docId: resolved.document_id, fileName: resolved.file_name };
+}
 
 // Period column detection: matches FY year columns and standard period labels
 const PERIOD_COL_PATTERN = /\b(20\d{2}|fy\s*\d{2,4}|cy\s*\d{2,4}|q[1-4]|h[12]|ytd|ltm)\b|^(actual|forecast|budget|plan)$/i;
@@ -901,6 +971,27 @@ export async function runNumericVerifyInline(
     tablesTotal: 0,
   };
 
+  // Step 0: Resolve provenance — which document is the "live model"?
+  // Uses structural sheet presence (both comparison sheets must exist in same doc).
+  const { docId: liveModelDocId, fileName: liveModelFileName } = await resolveLiveModelDocId(
+    db,
+    dealId,
+    SCG_CROSS_AGREEMENT_TEMPLATE.sourceASheet,
+    SCG_CROSS_AGREEMENT_TEMPLATE.sourceBSheet,
+  );
+
+  // Build the resolved cross-agreement config with pinned document ID
+  const crossAgreementConfig: CrossAgreementConfig = {
+    ...SCG_CROSS_AGREEMENT_TEMPLATE,
+    sourceADocId: liveModelDocId,
+    sourceBDocId: liveModelDocId,
+  };
+
+  console.log(
+    `[NumericInline] Provenance resolved: live model = "${liveModelFileName}" (${liveModelDocId.slice(0, 8)}). ` +
+    `Cross-agreement: "${crossAgreementConfig.sourceASheet}" vs "${crossAgreementConfig.sourceBSheet}".`
+  );
+
   // Step 1: Find documents with doc_tables for this deal
   const DocumentIdSchema = z.object({ document_id: z.string() });
   const documentIdRows = await db.query(
@@ -946,10 +1037,10 @@ export async function runNumericVerifyInline(
   }
 
   // Step 3: Load table data — only sheets relevant to cross-agreement + metrics
-  // For SCG: "FS Summary" and "FS Summary (hardcoded)" are the comparison targets
+  // Uses the resolved config (no hardcoded sheet names at this layer)
   const relevantSheets = new Set([
-    SCG_CROSS_AGREEMENT.sourceASheet.toLowerCase(),
-    SCG_CROSS_AGREEMENT.sourceBSheet.toLowerCase(),
+    crossAgreementConfig.sourceASheet.toLowerCase(),
+    crossAgreementConfig.sourceBSheet.toLowerCase(),
   ]);
 
   const loadable = tableIndex.filter(
@@ -1013,7 +1104,7 @@ export async function runNumericVerifyInline(
   }
 
   // Step 6: Layer 2 — Cross-agreement (only discrepancy source)
-  const crossResult = runCrossAgreement(tables, SCG_CROSS_AGREEMENT);
+  const crossResult = runCrossAgreement(tables, crossAgreementConfig);
 
   // Merge figures: cross-agreement also produces figures (from source A)
   allFigures.push(...crossResult.figures);
