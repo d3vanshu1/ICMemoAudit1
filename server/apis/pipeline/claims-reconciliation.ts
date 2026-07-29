@@ -71,6 +71,84 @@ interface MatchProposal {
 }
 
 // ---------------------------------------------------------------------------
+// Unit compatibility & basis alignment guards (Fix 3)
+// ---------------------------------------------------------------------------
+
+/** Coarse unit families for compatibility checking */
+type UnitFamily = "absolute_gbp" | "rate_pct" | "multiplier" | "count" | "unknown";
+
+function classifyClaimUnit(unit: string): UnitFamily {
+  const u = unit.trim().toLowerCase();
+  if (u === "£m" || u === "£k" || u === "£" || u === "£bn") return "absolute_gbp";
+  if (u === "%" || u === "bps" || u === "pp") return "rate_pct";
+  if (u === "x" || u === "turns") return "multiplier";
+  if (u === "#" || u === "headcount" || u === "units") return "count";
+  return "unknown";
+}
+
+/**
+ * Classify what unit family a model figure likely represents.
+ * Model figures store raw £ values (absolute) unless the label/context
+ * clearly indicates a percentage or multiple.
+ */
+function classifyModelFigureUnit(fig: Figure): UnitFamily {
+  const label = fig.name.toLowerCase();
+  // Rate indicators in the figure label
+  if (label.includes("margin") || label.includes("growth") || label.includes("%") ||
+      label.includes("nrr") || label.includes("churn") || label.includes("recurring %") ||
+      label.includes("retention") || label.includes("conversion rate") ||
+      label.includes("yield")) {
+    return "rate_pct";
+  }
+  // Multiplier indicators
+  if (label.includes(" multiple") || label.includes(" x ") || label.includes("ev/") ||
+      label.includes("turns")) {
+    return "multiplier";
+  }
+  // Headcount / count
+  if (label.includes("headcount") || label.includes("fte") || label.includes("# of")) {
+    return "count";
+  }
+  // Default: model figures are £ absolutes (stored in raw £)
+  return "absolute_gbp";
+}
+
+/**
+ * Returns true if claim unit and model figure unit families are compatible.
+ * Incompatible pairs should NEVER be reconciled — they'd produce false divergences.
+ */
+function unitsAreCompatible(claimFamily: UnitFamily, modelFamily: UnitFamily): boolean {
+  // If either is unknown, we can't assert incompatibility — allow match (be conservative)
+  if (claimFamily === "unknown" || modelFamily === "unknown") return true;
+  // Same family is always compatible
+  if (claimFamily === modelFamily) return true;
+  // All other cross-family combinations are incompatible
+  return false;
+}
+
+/**
+ * Basis alignment check: even when the LLM says "matched" and units technically align,
+ * verify that a scope_qualifier of "Total Group Revenue" on a rate/percentage claim
+ * is not being matched to an absolute revenue figure. This catches the lazy-default
+ * scenario where extraction tagged "96% recurring" with scope "Total Group Revenue"
+ * and reconciliation matches it to the actual revenue line.
+ */
+function basisGenuinelyAligns(claim: Claim, modelFig: Figure): boolean {
+  const claimFamily = classifyClaimUnit(claim.unit);
+  const modelFamily = classifyModelFigureUnit(modelFig);
+
+  // Cross-family match that slipped past unit guard (shouldn't happen, but defense in depth)
+  if (!unitsAreCompatible(claimFamily, modelFamily)) return false;
+
+  // Rate claim matched to a revenue/absolute model line by coincidental scope string
+  // e.g., claim "96% recurring" scope="Total Group Revenue" matched to model "Total Revenue"
+  if (claimFamily === "rate_pct" && modelFamily === "absolute_gbp") return false;
+  if (claimFamily === "absolute_gbp" && modelFamily === "rate_pct") return false;
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Materiality thresholds
 // ---------------------------------------------------------------------------
 const MATERIALITY_ABS_FLOOR = 2_000_000; // £2m — below this, delta is not material
@@ -247,6 +325,11 @@ export async function runReconciliation(
           const claim = reconcilableClaims[proposal.claim_index];
 
           if (proposal.match_status === "matched" && proposal.matched_label && proposal.matched_period) {
+            // ---- Fix 3: Unit-match guard ----
+            // Before even looking up the model figure, check if the claim's unit family
+            // is plausibly compatible with what the model line represents.
+            const claimUnitFamily = classifyClaimUnit(claim.unit);
+
             // Find the model figure by label + period
             const modelFig = findModelFigure(figures, proposal.matched_label, proposal.matched_period);
 
@@ -266,6 +349,57 @@ export async function runReconciliation(
                 delta_pct: null,
               });
               unreconcilable_count++;
+              continue;
+            }
+
+            // ---- Fix 3: Unit compatibility check ----
+            const modelUnitFamily = classifyModelFigureUnit(modelFig);
+            if (!unitsAreCompatible(claimUnitFamily, modelUnitFamily)) {
+              // % claim vs £m model (or vice versa) — NEVER reconcile, emit scope_mismatch
+              findings.push({
+                finding_kind: "scope_mismatch",
+                severity: "info",
+                title: `Unit mismatch: claim ${claim.value}${claim.unit} vs model figure "${modelFig.name}" (incompatible units)`,
+                detail: `Claim unit (${claim.unit} → ${claimUnitFamily}) is incompatible with model figure unit family (${modelUnitFamily}). ` +
+                  `Percentage/rate claims cannot be reconciled against absolute £ figures.`,
+                full_analysis: `[UNIT_MISMATCH] Claim: "${claim.verbatim_snippet}" (${claim.unit}) ` +
+                  `was matched by LLM to "${modelFig.name}" but units are incompatible ` +
+                  `(claim: ${claimUnitFamily}, model: ${modelUnitFamily}). ` +
+                  `Rejecting match to prevent false divergence.`,
+                severity_anchor: null,
+                source_docs: [claim.source_doc],
+                claim,
+                model_figure: modelFig,
+                delta_abs: null,
+                delta_pct: null,
+              });
+              scope_mismatch_count++;
+              continue;
+            }
+
+            // ---- Fix 3: Basis alignment check ----
+            if (!basisGenuinelyAligns(claim, modelFig)) {
+              // Scope string coincidence — bases don't genuinely align
+              findings.push({
+                finding_kind: "scope_mismatch",
+                severity: "info",
+                title: `Basis misalignment: ${claim.scope_qualifier} (${claim.unit}) vs "${modelFig.name}" — not like-for-like`,
+                detail: `Claim (${claim.unit}, scope: "${claim.scope_qualifier}") appears superficially matched to ` +
+                  `model figure "${modelFig.name}" but the basis/unit families indicate these are not genuinely comparable. ` +
+                  `A rate/percentage cannot be compared against an absolute figure even if scope strings match.`,
+                full_analysis: `[BASIS_MISALIGNMENT] Claim: "${claim.verbatim_snippet}" ` +
+                  `(unit: ${claim.unit}, scope: "${claim.scope_qualifier}") ` +
+                  `matched to model "${modelFig.name}" (inferred family: ${modelUnitFamily}). ` +
+                  `Basis alignment check FAILED — rejecting to prevent fabricated divergence. ` +
+                  `Coincidental scope string match is insufficient without genuine unit/basis agreement.`,
+                severity_anchor: null,
+                source_docs: [claim.source_doc],
+                claim,
+                model_figure: modelFig,
+                delta_abs: null,
+                delta_pct: null,
+              });
+              scope_mismatch_count++;
               continue;
             }
 
@@ -359,7 +493,7 @@ export async function runReconciliation(
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[Reconciliation] LLM matching failed: ${msg}`);
+        console.warn(`[Reconciliation] LLM matching failed: ${msg}`);
         // All reconcilable claims become unreconcilable on LLM failure
         unreconcilable_count += reconcilableClaims.length;
       }
@@ -491,7 +625,7 @@ function parseMatchProposals(responseText: string): MatchProposal[] {
       mismatch_reason: typeof p.mismatch_reason === "string" ? p.mismatch_reason : null,
     }));
   } catch {
-    console.error(`[Reconciliation] Failed to parse match proposals. First 500: ${jsonStr.slice(0, 500)}`);
+    console.warn(`[Reconciliation] Failed to parse match proposals. First 500: ${jsonStr.slice(0, 500)}`);
     return [];
   }
 }

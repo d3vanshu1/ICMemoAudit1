@@ -95,8 +95,11 @@ Your job: Extract every quantitative financial claim into a typed ledger with PR
 
 ## CRITICAL: Scope Classification Rules
 
-The scope_qualifier field is the most important output. It determines whether two numbers CAN be compared.
-These scope families are DIFFERENT THINGS — classifying them correctly prevents all fabrication:
+The scope_qualifier field is the ANTI-FABRICATION field. It determines whether two numbers CAN be compared.
+A wrong scope_qualifier causes false divergence findings — the exact failure mode we are eliminating.
+
+⚠️ ABSOLUTE RULE: scope_qualifier must reflect the ACTUAL BASIS of the number as stated in the memo.
+DO NOT default to "Total Group Revenue" or any other generic label. If in doubt, use a more specific scope.
 
 ### EBITDA Scope Families (all distinct, never interchangeable):
 - "Reported EBITDA" — as per statutory accounts
@@ -110,12 +113,39 @@ These scope families are DIFFERENT THINGS — classifying them correctly prevent
 - "EBITDA acquired via M&A (deal-sizing)" — average per-deal acquired EBITDA for M&A pacing assumptions
   ⚠️ THIS IS NOT ORGANIC EBITDA. "~£4m EBITDA p.a. at 5.5x" in context of M&A deal-sizing = this category.
 
-### Revenue Scope Families (all distinct):
-- "Total Group Revenue" — all entities, all sources
-- "Revenue (PF / pro-forma)" — includes completed + pipeline acquisitions
+### Revenue Scope Families (all distinct — DO NOT CONFLATE):
+- "Total Group Revenue" — ONLY use when the figure explicitly represents all entities, all sources, REPORTED (not adjusted). The headline "£194m revenue" or "FY26 Revenue: £194m" = Total Group Revenue.
+- "Revenue (PF / pro-forma)" — ONLY when explicitly labelled "pro-forma" or "PF" or the table header says "Pro Forma"
+- "Revenue (LfL / like-for-like)" — organic revenue growth series stripped of acquisition effects. ⚠️ LfL figures are DIFFERENT from Total Group Revenue. E.g., if reported revenue is £125m/£145m/£168m but LfL shows £154m/£166m/£177m, these are DIFFERENT series with DIFFERENT scopes.
 - "Revenue (excl-future-M&A)" — group revenue minus uncommitted future M&A
 - "Revenue (organic, excl recent acquisitions)" — strips out recent M&A contribution
 - "Revenue (run-rate)" — annualised from a recent sub-period
+- "Revenue (segment: <segment_name>)" — segment-level revenue, MUST carry the segment name. E.g., "Revenue (segment: Surgery Connect)", "Revenue (segment: IT Services)"
+
+### Operational Rates (NOT revenue, NOT EBITDA — these are distinct metrics):
+- "Recurring Revenue %" — percentage of revenue that is recurring (e.g., "96% recurring revenue")
+- "Net Revenue Retention (NRR)" — net retention rate (e.g., "102% NRR")
+- "Gross Revenue Retention" — before upsell
+- "Customer Churn Rate" — percentage of customers lost (e.g., "~5% churn", "7% churn L3Y")
+- "Cash Conversion %" — OCF/EBITDA or similar ratio (e.g., "90% cash conversion")
+⚠️ These are NEVER "Total Group Revenue" even though they relate to the revenue base. They are rates/percentages describing quality, not absolute revenue figures.
+
+### Market / TAM (NOT company metrics):
+- "TAM (market size)" — addressable market size (e.g., "£12.5bn UK B2B comms market")
+- "TAM growth rate" — market growth rate (e.g., "growing 3%")
+- "Segment TAM (<segment>)" — segment-level market (e.g., "UCaaS seats growing 5%")
+⚠️ Market figures are NEVER "Total Group Revenue". They describe the market, not the company's revenue.
+
+### Gross Profit Scope Families:
+- "Total Gross Profit" — all-entity, all-source gross profit (reported)
+- "Gross Profit (PF / pro-forma)" — pro-forma basis
+- "Gross Profit (LfL / like-for-like)" — organic/LfL gross profit, excludes M&A
+- "Gross Profit (segment: <segment_name>)" — segment-level GP
+- "GP Margin" — gross profit margin as a percentage
+
+### EBITDA Margin vs Absolute:
+- "Cash EBITDA Margin" — percentage (e.g., "29% Cash EBITDA margin") — NOT "Cash EBITDA"
+- "GP Margin" — gross profit margin percentage
 
 ### Valuation/Multiple Families:
 - "EV/EBITDA (entry)" — entry valuation basis
@@ -126,17 +156,25 @@ These scope families are DIFFERENT THINGS — classifying them correctly prevent
 ### Returns:
 - "Gross IRR" / "Net IRR" / "MoM" / "DPI" — these depend on a returns model
 
+### Cost / Capex / Other:
+- "DD Costs" — due diligence expenditure
+- "Capex" — capital expenditure
+- "OCF" — operating cash flow (EBITDA - Capex - WC typically)
+- "EFCF" — equity free cash flow
+- "Pro-forma adjustment" — bridge items (e.g., synergies, trading outperformance)
+
 ## CRITICAL: Claim Category Classification
 
 Classify each claim into exactly one category:
 
 1. **operating_metric** — Revenue, EBITDA, margins, costs that relate to the company's OPERATING performance.
    These are reconcilable against the operating/financial model.
-   Examples: "£57m Cash EBITDA FY Mar-26", "£194m revenue (PF)", "£63m June RR EBITDA"
+   Examples: "£57m Cash EBITDA FY Mar-26", "£194m revenue", "£63m June RR EBITDA", "96% recurring revenue"
+   ⚠️ Operational rates (NRR, churn, recurring %) ARE operating_metrics but their scope is the rate name, not "Total Group Revenue"
 
-2. **deal_mechanics** — M&A pacing assumptions, per-deal sizes, bolt-on pipeline.
-   NOT reconcilable against the operating model (these describe future deal activity, not current operations).
-   Examples: "~£4m EBITDA acquired p.a. at 5.5x", "4 bolt-ons per year", "pipeline of 20 targets"
+2. **deal_mechanics** — M&A pacing assumptions, per-deal sizes, bolt-on pipeline, DD costs.
+   NOT reconcilable against the operating model (these describe deal activity, not current operations).
+   Examples: "~£4m EBITDA acquired p.a. at 5.5x", "~£3m total DD cost"
 
 3. **valuation_structuring** — Entry EV, equity check, leverage ratios, structuring EBITDA.
    May reference operating metrics but the claim itself is about deal structure.
@@ -146,7 +184,7 @@ Classify each claim into exactly one category:
    Examples: "23.4% gross IRR", "2.9x MoM base case"
 
 5. **cross_reference** — Figures attributed to external reports (FDD findings, legal DD, QoE).
-   Examples: "FDD identifies £2.1m normalisation", "legal DD flags £500k contingent liability"
+   Examples: "FDD identifies £2.1m normalisation"
 
 ## Context Signals for Classification
 
@@ -158,23 +196,34 @@ classify as valuation_structuring.
 
 When a number projects future returns (IRR, MoM, exit), classify as returns_projection.
 
+## Scope Qualifier Self-Check (MANDATORY before outputting each claim)
+
+Before writing each claim, ask yourself:
+1. Is this a COMPANY metric or a MARKET metric? If market → "TAM (market size)" or "TAM growth rate"
+2. Is this a RATE/PERCENTAGE describing business quality? If yes → use the specific rate name (NRR, churn, recurring %, cash conversion %, margin)
+3. Is this from a LfL/like-for-like/organic series? If yes → "Revenue (LfL / like-for-like)" NOT "Total Group Revenue"
+4. Is this from a pro-forma table? If yes → "(PF / pro-forma)"
+5. Is this from a segment breakdown? If yes → carry the segment name
+6. Only use "Total Group Revenue" if the number genuinely represents ALL reported revenue across the entire group
+
 ## Extraction Rules
 
 1. Extract the VERBATIM snippet — the exact text from the memo. This is required.
 2. Do NOT invent claims or reinterpret. If a number appears, extract what it SAYS.
-3. If the scope is ambiguous from context, note the ambiguity in basis_note but make your best classification.
+3. If the scope is ambiguous, use the most specific scope you can infer from context.
 4. For run-rate vs full-year: "June RR" or "annualised from [month]" = run-rate. "FY Mar-26" = full-year.
 5. For PF (pro-forma): any revenue/EBITDA explicitly labelled "pro-forma" or "PF" = PF scope.
 6. Multiple claims from the same sentence are fine — extract each distinct metric separately.
 7. If a claim references another document's finding (e.g. "FDD shows £X"), tag as cross_reference.
 8. Preserve the period exactly as stated — don't normalise "FY Mar-26" to "2026".
+9. For growth rates (CAGRs), use the scope of what's growing: "Organic Cash EBITDA" CAGR → scope = "Organic Cash EBITDA", NOT "Total Group Revenue".
 
 ## Output Format
 
 Return a JSON array of claim objects. Each claim:
 {
   "metric": "revenue" | "EBITDA" | "gross_margin" | "net_income" | "net_debt" | "multiple" | "growth_rate" | "cost" | "capex" | "cash_flow" | "returns" | "other_financial",
-  "scope_qualifier": "<exact scope as described above>",
+  "scope_qualifier": "<exact scope — MUST reflect actual basis, never a lazy default>",
   "period": "<period string>",
   "value": <numeric value>,
   "unit": "£m" | "%" | "x" | "£k" | "£" | "p" | "years" | "bps" | "other",
@@ -278,6 +327,7 @@ export async function runClaimsExtraction(
     const llmBody = {
       model: SONNET_MODEL,
       max_tokens: 16_384,
+      temperature: 0, // Deterministic extraction — no sampling variance
       system: CLAIMS_EXTRACTION_PROMPT,
       messages: [
         {
