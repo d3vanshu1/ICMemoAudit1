@@ -15,7 +15,7 @@
  */
 import { api, z, postgres, anthropic } from "@superblocksteam/sdk-api";
 import { runClaimsExtraction, type ClaimsLedger } from "./claims-extraction.js";
-import { runReconciliation, type ReconciliationResult, type ReconciliationFinding } from "./claims-reconciliation.js";
+import { runReconciliation, type ReconciliationResult, type ReconciliationFinding, normalizeFigures, coordKey } from "./claims-reconciliation.js";
 import { runNumericVerifyInline, type Figure, type Discrepancy, type NumericVerifyResult } from "./numeric-verify-inline.js";
 import type { PipelineContext } from "./pipeline-config.js";
 
@@ -35,8 +35,8 @@ export default api({
     dealId: z.string(),
     /** If provided, only return findings on this page (0-based, 10 per page) */
     page: z.number().nullable(),
-    /** Max operating_metric claims to send to LLM matching (default: all). Use to stay within time budget. */
-    max_claims: z.number().nullable(),
+    /** If provided, only return findings matching these kinds (e.g. "data_divergence,scope_mismatch,cross_version") */
+    filter_kinds: z.string().nullable(),
   }),
 
   output: z.object({
@@ -54,6 +54,34 @@ export default api({
       figures_available: z.number(),
       discrepancies_available: z.number(),
     }),
+    // Diagnostic: coordinate-space debug info
+    coord_debug: z.object({
+      normalized_figures_count: z.number(),
+      figure_source_docs: z.array(z.string()),
+      figure_periods: z.array(z.string()),
+      sample_figure_keys: z.array(z.string()),
+      sample_claim_keys: z.array(z.string()),
+      sample_raw_figure_labels: z.array(z.string()),
+    }),
+    // Cross-agreement debug (map sizes, shared keys, comparison counts)
+    cross_agreement_debug: z.object({
+      status: z.string(),
+      sourceATablesFound: z.number(),
+      sourceBTablesFound: z.number(),
+      allTableSheets: z.array(z.string()),
+      mapASize: z.number(),
+      mapBSize: z.number(),
+      sharedKeys: z.number(),
+      comparedPairs: z.number(),
+      divergedPairs: z.number(),
+      identicalPairs: z.number(),
+      sampleSharedEntries: z.array(z.object({
+        label: z.string(),
+        period: z.string(),
+        valueA: z.number(),
+        valueB: z.number(),
+      })),
+    }).nullable(),
     // Pagination
     pagination: z.object({
       page: z.number(),
@@ -87,7 +115,7 @@ export default api({
     })),
   }),
 
-  async run(ctx, { dealId, page, max_claims }) {
+  async run(ctx, { dealId, page, filter_kinds }) {
     const startTime = Date.now();
 
     const pipelineCtx: PipelineContext = {
@@ -131,28 +159,13 @@ export default api({
     // original startTime budget, so we reset to avoid headroom exhaustion.
     const recoStartTime = Date.now();
 
-    // If max_claims is set, limit the operating_metric claims sent to matching
-    let effectiveLedger = ledger;
-    if (max_claims && max_claims > 0) {
-      const opClaims = ledger.claims.filter(c => c.claim_category === "operating_metric").slice(0, max_claims);
-      const otherClaims = ledger.claims.filter(c => c.claim_category !== "operating_metric");
-      effectiveLedger = {
-        ...ledger,
-        claims: [...opClaims, ...otherClaims],
-        extraction_metadata: {
-          ...ledger.extraction_metadata,
-          operating_metric_claims: opClaims.length,
-        },
-      };
-    }
-
     let reconciliation: ReconciliationResult;
     let recoError: string | null = null;
     if (figures.length > 0) {
       try {
         reconciliation = await runReconciliation(
           pipelineCtx,
-          effectiveLedger,
+          ledger,
           figures,
           discrepancies,
           recoStartTime,
@@ -185,8 +198,12 @@ export default api({
     }
 
     // --- Step 4: Format output for grading ---
-    const allFindings = reconciliation.findings;
-    const PAGE_SIZE = 10;
+    // Apply kind filter if provided (e.g. "data_divergence,scope_mismatch,cross_version")
+    const kindFilter = filter_kinds ? new Set(filter_kinds.split(",").map(k => k.trim())) : null;
+    const allFindings = kindFilter
+      ? reconciliation.findings.filter(f => kindFilter.has(f.finding_kind))
+      : reconciliation.findings;
+    const PAGE_SIZE = kindFilter ? 200 : 10; // when filtering, return more per page
     const pageNum = page ?? 0;
     const totalPages = Math.ceil(allFindings.length / PAGE_SIZE);
     const pagedFindings = allFindings.slice(pageNum * PAGE_SIZE, (pageNum + 1) * PAGE_SIZE);
@@ -218,8 +235,8 @@ export default api({
       cross_version: allFindings.filter(f => f.finding_kind === "cross_version").length,
       within_tolerance: reconciliation.within_tolerance_count,
       reconciled: reconciliation.reconciled_count,
-      extraction_total_claims: effectiveLedger.claims.length,
-      extraction_operating_metrics: effectiveLedger.extraction_metadata.operating_metric_claims,
+      extraction_total_claims: ledger.claims.length,
+      extraction_operating_metrics: ledger.extraction_metadata.operating_metric_claims,
       figures_available: figures.length,
       discrepancies_available: discrepancies.length,
     };
@@ -230,6 +247,25 @@ export default api({
       findings_on_page: pagedFindings.length,
     };
 
+    // --- Coordinate-space debug info ---
+    const normalizedFigs = normalizeFigures(figures);
+    const opClaims = ledger.claims.filter(c => c.claim_category === "operating_metric");
+    const sampleFigKeys = [...new Set(normalizedFigs.slice(0, 20).map(nf => coordKey(nf.metric, nf.scope_qualifier, nf.period)))];
+    const sampleClaimKeys = [...new Set(opClaims.slice(0, 20).map(c => coordKey(c.metric, c.scope_qualifier, c.period)))];
+    const sampleRawLabels = [...new Set(figures.slice(0, 30).map(f => `${f.name} | ${f.period}`))];
+    // Provenance: which doc(s) produced figures and what periods exist
+    const figureDocIds = [...new Set(figures.map(f => f.source_doc))];
+    const figurePeriods = [...new Set(figures.map(f => f.period))].sort();
+
+    const coordDebug = {
+      normalized_figures_count: normalizedFigs.length,
+      figure_source_docs: figureDocIds,
+      figure_periods: figurePeriods,
+      sample_figure_keys: sampleFigKeys.slice(0, 15),
+      sample_claim_keys: sampleClaimKeys.slice(0, 15),
+      sample_raw_figure_labels: sampleRawLabels.slice(0, 15),
+    };
+
     console.log(
       `[DiagReconciliation] Complete: ${summary.total_findings} findings ` +
       `(${summary.data_divergence} divergence, ${summary.unreconcilable} unreconcilable, ` +
@@ -237,6 +273,6 @@ export default api({
       `Elapsed: ${Math.round((Date.now() - startTime) / 1000)}s`
     );
 
-    return { summary, pagination, reco_error: recoError ?? reconciliation.matching_error ?? null, findings: formattedFindings };
+    return { summary, pagination, reco_error: recoError ?? reconciliation.matching_error ?? null, coord_debug: coordDebug, cross_agreement_debug: numericResult.crossAgreementDebug ?? null, findings: formattedFindings };
   },
 });

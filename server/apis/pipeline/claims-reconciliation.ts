@@ -22,8 +22,6 @@
 import { z } from "@superblocksteam/sdk-api";
 import type { Claim, ClaimsLedger } from "./claims-extraction.js";
 import type { Figure, Discrepancy } from "./numeric-verify-inline.js";
-import { callLLMWithHeadroom, type LLMResponse } from "./call-llm.js";
-import { SONNET_MODEL } from "./model-config.js";
 import type { PipelineContext } from "./pipeline-config.js";
 
 // ---------------------------------------------------------------------------
@@ -215,7 +213,332 @@ const CRITICAL_ABS_THRESHOLD = 10_000_000; // £10m — above this, finding is c
 const CRITICAL_REL_THRESHOLD = 0.15;       // 15%
 
 // ---------------------------------------------------------------------------
-// LLM Matching Prompt
+// Coordinate normalization — model-side mapping into claims vocabulary
+// ---------------------------------------------------------------------------
+
+export interface NormalizedFigure {
+  raw: Figure;
+  metric: string;         // Canonical metric family: "revenue", "ebitda", "gross_margin", etc.
+  scope_qualifier: string; // Claims-vocabulary scope: "Total Group Revenue", "Adjusted EBITDA", etc.
+  period: string;         // Normalized period string
+}
+
+/** Mapping rules: raw Excel label → {metric, scope_qualifier} in claims vocabulary */
+interface LabelMapping {
+  pattern: RegExp;
+  metric: string;
+  scope_qualifier: string;
+}
+
+const LABEL_MAPPINGS: LabelMapping[] = [
+  // Revenue family — order matters (more specific patterns first)
+  { pattern: /^(lfl|like.for.like)\s+revenue/i, metric: "revenue", scope_qualifier: "Revenue (LfL)" },
+  { pattern: /lfl|like.for.like/i, metric: "revenue", scope_qualifier: "Revenue (LfL)" },
+  { pattern: /organic\s+revenue/i, metric: "revenue", scope_qualifier: "Revenue (Organic)" },
+  { pattern: /pro.?forma\s+revenue|revenue.*pro.?forma|pf\s+revenue/i, metric: "revenue", scope_qualifier: "Revenue (Pro Forma)" },
+  { pattern: /recurring\s+revenue|arr|mrr/i, metric: "revenue", scope_qualifier: "Recurring Revenue" },
+  { pattern: /net\s+revenue/i, metric: "revenue", scope_qualifier: "Net Revenue" },
+  // "Total Group revenue" is the headline reported revenue line — prefer it over the excl. lines
+  { pattern: /total\s+group\s+revenue/i, metric: "revenue", scope_qualifier: "Total Group Revenue" },
+  // "Total revenue (excl. ...)" variants are sub-aggregates — map to a distinct scope
+  { pattern: /total\s+revenue\s*\(excl/i, metric: "revenue", scope_qualifier: "Total Revenue (excl. adjustments)" },
+  { pattern: /total\s+revenue|^revenue$/i, metric: "revenue", scope_qualifier: "Total Group Revenue" },
+  // EBITDA family — order matters
+  { pattern: /adj(usted)?\.?\s+cash\s+ebitda/i, metric: "ebitda", scope_qualifier: "Adjusted EBITDA" },
+  { pattern: /adj(usted)?\.?\s+ebitda/i, metric: "ebitda", scope_qualifier: "Adjusted EBITDA" },
+  { pattern: /reported\s+ebitda|ebitda.*reported|non.?pro.?forma.*ebitda|ebitda.*non.?pro.?forma/i, metric: "ebitda", scope_qualifier: "Cash EBITDA (Reported / Non Pro Forma)" },
+  { pattern: /cash\s+ebitda/i, metric: "ebitda", scope_qualifier: "Cash EBITDA" },
+  { pattern: /run.?rate\s+ebitda/i, metric: "ebitda", scope_qualifier: "Run-rate EBITDA" },
+  { pattern: /organic.*ebitda|ebitda.*organic/i, metric: "ebitda", scope_qualifier: "Organic Cash EBITDA" },
+  { pattern: /pep.*ebitda|ebitda.*pep/i, metric: "ebitda", scope_qualifier: "PEP Cash EBITDA" },
+  { pattern: /^ebitda$/i, metric: "ebitda", scope_qualifier: "Cash EBITDA" },
+  // Gross Profit family
+  { pattern: /surgery\s+intellect.*gp|gp.*surgery\s+intellect/i, metric: "gross_margin", scope_qualifier: "Gross Profit (segment: Surgery Intellect)" },
+  { pattern: /(total\s+)?gross\s+profit/i, metric: "gross_margin", scope_qualifier: "Total Gross Profit" },
+  { pattern: /gross\s+margin/i, metric: "gross_margin", scope_qualifier: "Total Gross Profit" },
+];
+
+/**
+ * Normalize model figures into claims coordinate vocabulary.
+ * Each raw figure is mapped to {metric, scope_qualifier, period} using deterministic rules.
+ * Figures that don't match any known pattern are omitted (they can't match claims anyway).
+ */
+export function normalizeFigures(figures: Figure[]): NormalizedFigure[] {
+  const results: NormalizedFigure[] = [];
+  for (const fig of figures) {
+    const label = fig.name.trim();
+    let mapped = false;
+    for (const mapping of LABEL_MAPPINGS) {
+      if (mapping.pattern.test(label)) {
+        results.push({
+          raw: fig,
+          metric: mapping.metric,
+          scope_qualifier: mapping.scope_qualifier,
+          period: normalizePeriod(fig.period),
+        });
+        mapped = true;
+        break; // First matching pattern wins
+      }
+    }
+    if (!mapped) {
+      // Log unmapped figures for diagnostic visibility
+      console.warn(`[Reconciliation] Unmapped figure label: "${label}" (period: ${fig.period})`);
+    }
+  }
+  return results;
+}
+
+/**
+ * Normalize period strings to canonical form for coordinate matching.
+ * Both claims and model figures go through this before indexing.
+ *
+ * Canonical forms:
+ *   "fy-mar-26" (for FY Mar-26, FY26, FY2026, 2026, Mar-26)
+ *   "fy-mar-25" (for FY Mar-25, FY25, FY2025, 2025, Mar-25)
+ *   "fy-mar-27f" (for forecasts: FY Mar-27F, FY27F, 2027F)
+ */
+function normalizePeriod(period: string): string {
+  const p = period.trim().toLowerCase();
+
+  // Handle "FY Mar-XX" format (most common in this deal)
+  const fyMarMatch = p.match(/fy\s*mar[-\s]?(\d{2,4})(f|b|le|a)?/i);
+  if (fyMarMatch) {
+    let yr = parseInt(fyMarMatch[1], 10);
+    if (yr >= 100) yr = yr - 2000; // 2026 → 26
+    const rawSuffix = fyMarMatch[2]?.toLowerCase() ?? "";
+    // "LE" (Latest Estimate) for the current deal year is functionally equivalent to "actual"
+    // "A" (Actual) is just explicit — same as no suffix. Drop both.
+    const suffix = (rawSuffix === "le" || rawSuffix === "a") ? "" : rawSuffix;
+    return `fy-mar-${yr}${suffix}`;
+  }
+
+  // Handle "FY XX" or "FYXX" format
+  const fyMatch = p.match(/fy\s*(\d{2,4})(f|b|le|a)?/i);
+  if (fyMatch) {
+    let yr = parseInt(fyMatch[1], 10);
+    if (yr >= 100) yr = yr - 2000;
+    const rawSuffix = fyMatch[2]?.toLowerCase() ?? "";
+    const suffix = (rawSuffix === "le" || rawSuffix === "a") ? "" : rawSuffix;
+    return `fy-mar-${yr}${suffix}`;
+  }
+
+  // Handle "Mar-XX" format
+  const marMatch = p.match(/mar[-\s]?(\d{2,4})(f|b|le|a)?/i);
+  if (marMatch) {
+    let yr = parseInt(marMatch[1], 10);
+    if (yr >= 100) yr = yr - 2000;
+    const rawSuffix = marMatch[2]?.toLowerCase() ?? "";
+    const suffix = (rawSuffix === "le" || rawSuffix === "a") ? "" : rawSuffix;
+    return `fy-mar-${yr}${suffix}`;
+  }
+
+  // Handle plain year: "2026", "2025", "26", "25"
+  // Also "2026 actual", "2025 forecast", "2027 budget" (with trailing descriptor)
+  const yearWithSuffix = p.match(/^(\d{4})\s*(actual|forecast|budget|estimate)?$/i) || p.match(/^(\d{2})\s*(actual|forecast|budget|estimate)?$/i);
+  if (yearWithSuffix) {
+    let yr = parseInt(yearWithSuffix[1], 10);
+    if (yr >= 100) yr = yr - 2000;
+    // "actual" → no suffix, "forecast" → "f", "budget" → "b", "estimate" → ""
+    let suffix = "";
+    const desc = yearWithSuffix[2]?.toLowerCase();
+    if (desc === "forecast") suffix = "f";
+    else if (desc === "budget") suffix = "b";
+    return `fy-mar-${yr}${suffix}`;
+  }
+
+  // Fallback: return lowercased trimmed (for periods like "LTM", "L3Y", etc.)
+  return p.replace(/\s+/g, "-");
+}
+
+/**
+ * Build a coordinate lookup key from metric + scope + period.
+ * All parts are lowercased and trimmed.
+ */
+export function coordKey(metric: string, scope: string, period: string): string {
+  return `${metric.toLowerCase().trim()}|${scope.toLowerCase().trim()}|${normalizePeriod(period)}`;
+}
+
+/**
+ * Fuzzy period lookup: if exact coordKey misses, try variations.
+ * Handles cases where claim says "FY Mar-26" but model says "2026" etc.
+ */
+function fuzzyPeriodLookup(
+  index: Map<string, NormalizedFigure[]>,
+  metric: string,
+  scope: string,
+  period: string,
+): NormalizedFigure[] {
+  // The normalizePeriod function already handles most variation,
+  // so if exact lookup failed, the metric+scope just doesn't exist.
+  // But let's try scope-insensitive matching with period variations.
+  const normalizedMetric = metric.toLowerCase().trim();
+  const normalizedScope = scope.toLowerCase().trim();
+  const normalizedPeriod = normalizePeriod(period);
+
+  // Try: exact metric + scope but with the period canonicalized differently
+  // This handles edge cases where claim period didn't normalize the same way
+  const results: NormalizedFigure[] = [];
+  for (const [key, nfs] of index.entries()) {
+    const [km, ks, kp] = key.split("|");
+    if (km === normalizedMetric && ks === normalizedScope && kp === normalizedPeriod) {
+      results.push(...nfs);
+    }
+  }
+  if (results.length > 0) return results;
+
+  // Last resort: metric matches, period matches, scope is a substring match
+  // (e.g., claim says "Adjusted EBITDA" but model normalized to "Cash EBITDA (Adjusted)")
+  for (const [key, nfs] of index.entries()) {
+    const [km, ks, kp] = key.split("|");
+    if (km === normalizedMetric && kp === normalizedPeriod) {
+      // Check if either scope contains the other
+      if (ks.includes(normalizedScope) || normalizedScope.includes(ks)) {
+        results.push(...nfs);
+      }
+    }
+  }
+  return results;
+}
+
+/** Result from processMatch — caller updates counters */
+interface MatchResult {
+  kind: "reconciled" | "within_tolerance" | "scope_mismatch" | "unreconcilable";
+  finding: ReconciliationFinding | null;
+}
+
+/**
+ * Process a coordinate match: apply guards, compute delta, classify finding.
+ * Pushes finding to the findings array and returns the classification.
+ */
+function processMatch(
+  claim: Claim,
+  nf: NormalizedFigure,
+  figures: Figure[],
+  findings: ReconciliationFinding[],
+): MatchResult {
+  const modelFig = nf.raw;
+
+  // Guard 1: Unit compatibility
+  const claimFamily = classifyClaimUnit(claim.unit);
+  const modelFamily = classifyModelFigureUnit(modelFig);
+  if (!unitsAreCompatible(claimFamily, modelFamily)) {
+    findings.push({
+      finding_kind: "scope_mismatch",
+      severity: "info",
+      title: `${claim.scope_qualifier}: unit mismatch (${claim.unit} vs ${modelFamily})`,
+      detail: `Claim unit "${claim.unit}" (${claimFamily}) incompatible with model figure ` +
+        `"${modelFig.name}" unit family (${modelFamily}).`,
+      full_analysis: `[SCOPE_MISMATCH] Unit incompatibility. Claim: "${claim.verbatim_snippet}" ` +
+        `unit=${claim.unit} (${claimFamily}). Model: "${modelFig.name}" classified as ${modelFamily}. ` +
+        `Cannot compute meaningful delta.`,
+      severity_anchor: null,
+      source_docs: [claim.source_doc],
+      claim,
+      model_figure: modelFig,
+      delta_abs: null,
+      delta_pct: null,
+    });
+    return { kind: "scope_mismatch", finding: findings[findings.length - 1] };
+  }
+
+  // Guard 2: Basis alignment
+  if (!basisGenuinelyAligns(claim, modelFig)) {
+    findings.push({
+      finding_kind: "scope_mismatch",
+      severity: "info",
+      title: `${claim.scope_qualifier}: basis misalignment`,
+      detail: `Claim basis (${claimFamily}) does not align with model figure ` +
+        `"${modelFig.name}" (${modelFamily}).`,
+      full_analysis: `[SCOPE_MISMATCH] Basis misalignment. Claim "${claim.verbatim_snippet}" ` +
+        `classified as ${claimFamily} but model "${modelFig.name}" is ${modelFamily}. ` +
+        `Not comparable.`,
+      severity_anchor: null,
+      source_docs: [claim.source_doc],
+      claim,
+      model_figure: modelFig,
+      delta_abs: null,
+      delta_pct: null,
+    });
+    return { kind: "scope_mismatch", finding: findings[findings.length - 1] };
+  }
+
+  // Guard 3: EBITDA basis compatibility
+  if (!ebitdaBasisCompatible(claim, modelFig)) {
+    findings.push({
+      finding_kind: "scope_mismatch",
+      severity: "info",
+      title: `${claim.scope_qualifier}: EBITDA basis conflict with "${modelFig.name}"`,
+      detail: `Claim EBITDA basis "${claim.scope_qualifier}" is incompatible with model figure ` +
+        `"${modelFig.name}". Different adjustment/reporting basis.`,
+      full_analysis: `[SCOPE_MISMATCH] EBITDA-basis guard fired. Claim: "${claim.verbatim_snippet}" ` +
+        `(scope="${claim.scope_qualifier}") vs model "${modelFig.name}". ` +
+        `These represent different EBITDA definitions and cannot be compared.`,
+      severity_anchor: null,
+      source_docs: [claim.source_doc],
+      claim,
+      model_figure: modelFig,
+      delta_abs: null,
+      delta_pct: null,
+    });
+    return { kind: "scope_mismatch", finding: findings[findings.length - 1] };
+  }
+
+  // ----- Compute delta (code-verified, never LLM-computed) -----
+  const claimVal = normalizeClaimValue(claim);
+  const modelVal = modelFig.value;
+
+  const deltaAbs = Math.abs(claimVal - modelVal);
+  const deltaPct = modelVal !== 0 ? deltaAbs / Math.abs(modelVal) : (deltaAbs > 0 ? 1 : 0);
+
+  // ----- Materiality classification -----
+  const belowMateriality = deltaAbs < MATERIALITY_ABS_FLOOR && deltaPct < MATERIALITY_REL_FLOOR;
+
+  // Historical-actuals backstop: for settled past years, a tight tolerance (1%)
+  // should not fire — these are just rounding differences in settled accounts.
+  const isHistorical = isHistoricalActualPeriod(claim.period);
+  const historicalBackstopSafe = isHistorical && deltaPct < 0.01;
+
+  if (belowMateriality || historicalBackstopSafe) {
+    // Within tolerance — no finding, just count
+    return { kind: "within_tolerance", finding: null };
+  }
+
+  // Material divergence — classify severity
+  const severity: "critical" | "warning" = (deltaAbs >= CRITICAL_ABS_THRESHOLD || deltaPct >= CRITICAL_REL_THRESHOLD)
+    ? "critical" : "warning";
+
+  const sign = claimVal > modelVal ? "higher" : "lower";
+  const deltaFormatted = deltaAbs >= 1_000_000
+    ? `£${(deltaAbs / 1_000_000).toFixed(1)}m`
+    : `£${(deltaAbs / 1_000).toFixed(0)}k`;
+
+  const finding: ReconciliationFinding = {
+    finding_kind: "data_divergence",
+    severity,
+    title: `${claim.scope_qualifier} (${claim.period}): memo ${sign} than model by ${deltaFormatted} (${(deltaPct * 100).toFixed(1)}%)`,
+    detail: `Memo cites ${formatValue(claim)} but model shows £${(modelVal / 1_000_000).toFixed(1)}m ` +
+      `for "${modelFig.name}" (${modelFig.period}). Delta: ${deltaFormatted} (${(deltaPct * 100).toFixed(1)}%).`,
+    full_analysis: `[DATA_DIVERGENCE] Code-verified delta computation.\n` +
+      `  Claim: "${claim.verbatim_snippet}" → ${formatValue(claim)} (normalized: £${(claimVal / 1_000_000).toFixed(2)}m)\n` +
+      `  Model: "${modelFig.name}" ${modelFig.period} → £${(modelVal / 1_000_000).toFixed(2)}m (source: ${modelFig.source_sheet}!${modelFig.source_cell})\n` +
+      `  Delta: ${deltaFormatted} (${(deltaPct * 100).toFixed(1)}%) — memo is ${sign}\n` +
+      `  Materiality: abs=${deltaAbs >= MATERIALITY_ABS_FLOOR ? "ABOVE" : "below"} floor (${MATERIALITY_ABS_FLOOR/1e6}m), ` +
+      `rel=${deltaPct >= MATERIALITY_REL_FLOOR ? "ABOVE" : "below"} floor (${(MATERIALITY_REL_FLOOR*100)}%)\n` +
+      `  Classification: ${severity} data_divergence`,
+    severity_anchor: deltaAbs,
+    source_docs: [claim.source_doc, modelFig.source_doc ?? "Financial Model"],
+    claim,
+    model_figure: modelFig,
+    delta_abs: deltaAbs,
+    delta_pct: deltaPct,
+  };
+
+  findings.push(finding);
+  return { kind: "reconciled", finding };
+}
+
+// ---------------------------------------------------------------------------
+// LLM Matching Prompt (legacy — retained for reference, not used in Step 3)
 // ---------------------------------------------------------------------------
 
 function buildMatchingPrompt(claims: Claim[], figures: Figure[]): string {
@@ -357,295 +680,69 @@ export async function runReconciliation(
     }
   }
 
-  // ----- Step 3: LLM proposes matches for reconcilable claims -----
-  // Batch claims to avoid exceeding Anthropic's context/token limits.
-  // With 200+ claims and 126 figures, a single prompt can hit ~100k tokens.
-  const MATCH_BATCH_SIZE = 50; // 50 claims per batch keeps prompt under 50k tokens
+  // ----- Step 3: Deterministic coordinate matching -----
+  // Normalize model figures into the same coordinate space as claims, then direct-lookup.
+  // No LLM needed — matching is by {metric, scope_qualifier, period} coordinates.
   if (reconcilableClaims.length > 0 && figures.length > 0) {
-    const elapsed = Date.now() - phaseStart;
-    if (elapsed < timeBudgetMs - 60_000) {
-      try {
-        const allProposals: MatchProposal[] = [];
-        const batchCount = Math.ceil(reconcilableClaims.length / MATCH_BATCH_SIZE);
-        console.log(`[Reconciliation] Matching ${reconcilableClaims.length} claims in ${batchCount} batches of ${MATCH_BATCH_SIZE}`);
+    const normalizedFigures = normalizeFigures(figures);
+    console.log(`[Reconciliation] Normalized ${normalizedFigures.length} figure coordinates from ${figures.length} raw figures`);
 
-        for (let batchIdx = 0; batchIdx < batchCount; batchIdx++) {
-          const batchStart = batchIdx * MATCH_BATCH_SIZE;
-          const batchClaims = reconcilableClaims.slice(batchStart, batchStart + MATCH_BATCH_SIZE);
+    // Build lookup index: key = "metric|scope|period" → NormalizedFigure[]
+    const figureIndex = new Map<string, NormalizedFigure[]>();
+    for (const nf of normalizedFigures) {
+      const key = coordKey(nf.metric, nf.scope_qualifier, nf.period);
+      if (!figureIndex.has(key)) figureIndex.set(key, []);
+      figureIndex.get(key)!.push(nf);
+    }
 
-          // Check time budget before each batch
-          const batchElapsed = Date.now() - phaseStart;
-          if (batchElapsed >= timeBudgetMs - 45_000) {
-            console.warn(`[Reconciliation] Time budget approaching limit — stopping after ${batchIdx}/${batchCount} batches`);
-            // Remaining claims become unreconcilable
-            const remainingClaims = reconcilableClaims.length - batchStart;
-            unreconcilable_count += remainingClaims;
-            break;
-          }
+    // ----- Step 4: Coordinate-match each claim and compute delta -----
+    for (const claim of reconcilableClaims) {
+      const key = coordKey(claim.metric, claim.scope_qualifier, claim.period);
+      const matches = figureIndex.get(key);
 
-          const matchPrompt = buildMatchingPrompt(batchClaims, figures);
-          const response: LLMResponse = await callLLMWithHeadroom(
-            ctx,
-            {
-              model: SONNET_MODEL,
-              max_tokens: 4_096,
-              system: matchPrompt,
-              messages: [{ role: "user", content: "Match each claim to the model figures. Return only the JSON array." }],
-            },
-            `Reconciliation: match batch ${batchIdx + 1}/${batchCount}`,
-            { pipelineStartTime, maxPerCallTimeout: 60_000, retries: 2 },
-          );
+      if (!matches || matches.length === 0) {
+        // Try fuzzy period matching (e.g., "FY Mar-26" vs "2026" or "Mar-26")
+        const fuzzyMatches = fuzzyPeriodLookup(figureIndex, claim.metric, claim.scope_qualifier, claim.period);
 
-          const batchProposals = parseMatchProposals(response.content[0]?.text ?? "");
-          // Adjust claim_index to be global (relative to full reconcilableClaims array)
-          for (const p of batchProposals) {
-            allProposals.push({ ...p, claim_index: p.claim_index + batchStart });
-          }
-          console.log(`[Reconciliation] Batch ${batchIdx + 1}: ${batchProposals.length} proposals`);
+        if (fuzzyMatches.length === 0) {
+          // No model counterpart for this coordinate
+          findings.push({
+            finding_kind: "unreconcilable",
+            severity: "info",
+            title: `${claim.scope_qualifier}: no model counterpart`,
+            detail: `Memo cites ${claim.scope_qualifier}: ${formatValue(claim)} (${claim.period}). ` +
+              `No matching metric found in the operating model.`,
+            full_analysis: `[UNRECONCILABLE] Claim: "${claim.verbatim_snippet}" ` +
+              `→ ${claim.scope_qualifier} (${claim.period}) has no counterpart in the verified figures set. ` +
+              `Coordinate lookup key: "${key}".`,
+            severity_anchor: null,
+            source_docs: [claim.source_doc],
+            claim,
+            model_figure: null,
+            delta_abs: null,
+            delta_pct: null,
+          });
+          unreconcilable_count++;
+          continue;
         }
 
-        console.log(`[Reconciliation] Got ${allProposals.length} total match proposals`);
-
-        // ----- Step 4: Code-verified delta computation -----
-        for (const proposal of allProposals) {
-          if (proposal.claim_index < 0 || proposal.claim_index >= reconcilableClaims.length) continue;
-          const claim = reconcilableClaims[proposal.claim_index];
-
-          if (proposal.match_status === "matched" && proposal.matched_label && proposal.matched_period) {
-            // ---- Fix 3: Unit-match guard ----
-            // Before even looking up the model figure, check if the claim's unit family
-            // is plausibly compatible with what the model line represents.
-            const claimUnitFamily = classifyClaimUnit(claim.unit);
-
-            // Find the model figure by label + period
-            const modelFig = findModelFigure(figures, proposal.matched_label, proposal.matched_period);
-
-            if (!modelFig) {
-              // LLM proposed a match but the figure doesn't exist — treat as unreconcilable
-              findings.push({
-                finding_kind: "unreconcilable",
-                severity: "info",
-                title: `${claim.scope_qualifier}: no model figure found at "${proposal.matched_label}" / "${proposal.matched_period}"`,
-                detail: `LLM proposed match to "${proposal.matched_label}" (${proposal.matched_period}) but no verified figure exists at that address.`,
-                full_analysis: `[UNRECONCILABLE] Claim: "${claim.verbatim_snippet}" — Proposed model line "${proposal.matched_label}" at period "${proposal.matched_period}" not found in verified figures set.`,
-                severity_anchor: null,
-                source_docs: [claim.source_doc],
-                claim,
-                model_figure: null,
-                delta_abs: null,
-                delta_pct: null,
-              });
-              unreconcilable_count++;
-              continue;
-            }
-
-            // ---- Fix 3: Unit compatibility check ----
-            const modelUnitFamily = classifyModelFigureUnit(modelFig);
-            if (!unitsAreCompatible(claimUnitFamily, modelUnitFamily)) {
-              // % claim vs £m model (or vice versa) — NEVER reconcile, emit scope_mismatch
-              findings.push({
-                finding_kind: "scope_mismatch",
-                severity: "info",
-                title: `Unit mismatch: claim ${claim.value}${claim.unit} vs model figure "${modelFig.name}" (incompatible units)`,
-                detail: `Claim unit (${claim.unit} → ${claimUnitFamily}) is incompatible with model figure unit family (${modelUnitFamily}). ` +
-                  `Percentage/rate claims cannot be reconciled against absolute £ figures.`,
-                full_analysis: `[UNIT_MISMATCH] Claim: "${claim.verbatim_snippet}" (${claim.unit}) ` +
-                  `was matched by LLM to "${modelFig.name}" but units are incompatible ` +
-                  `(claim: ${claimUnitFamily}, model: ${modelUnitFamily}). ` +
-                  `Rejecting match to prevent false divergence.`,
-                severity_anchor: null,
-                source_docs: [claim.source_doc],
-                claim,
-                model_figure: modelFig,
-                delta_abs: null,
-                delta_pct: null,
-              });
-              scope_mismatch_count++;
-              continue;
-            }
-
-            // ---- Fix 3: Basis alignment check ----
-            if (!basisGenuinelyAligns(claim, modelFig)) {
-              // Scope string coincidence — bases don't genuinely align
-              findings.push({
-                finding_kind: "scope_mismatch",
-                severity: "info",
-                title: `Basis misalignment: ${claim.scope_qualifier} (${claim.unit}) vs "${modelFig.name}" — not like-for-like`,
-                detail: `Claim (${claim.unit}, scope: "${claim.scope_qualifier}") appears superficially matched to ` +
-                  `model figure "${modelFig.name}" but the basis/unit families indicate these are not genuinely comparable. ` +
-                  `A rate/percentage cannot be compared against an absolute figure even if scope strings match.`,
-                full_analysis: `[BASIS_MISALIGNMENT] Claim: "${claim.verbatim_snippet}" ` +
-                  `(unit: ${claim.unit}, scope: "${claim.scope_qualifier}") ` +
-                  `matched to model "${modelFig.name}" (inferred family: ${modelUnitFamily}). ` +
-                  `Basis alignment check FAILED — rejecting to prevent fabricated divergence. ` +
-                  `Coincidental scope string match is insufficient without genuine unit/basis agreement.`,
-                severity_anchor: null,
-                source_docs: [claim.source_doc],
-                claim,
-                model_figure: modelFig,
-                delta_abs: null,
-                delta_pct: null,
-              });
-              scope_mismatch_count++;
-              continue;
-            }
-
-            // ---- EBITDA-basis code guard ----
-            // Prevents "Reported / Non Pro Forma" EBITDA claims from matching
-            // PEP/management-case model figures. Targeted protection for £54.9m case.
-            if (!ebitdaBasisCompatible(claim, modelFig)) {
-              findings.push({
-                finding_kind: "scope_mismatch",
-                severity: "info",
-                title: `EBITDA basis mismatch: "${claim.scope_qualifier}" vs model "${modelFig.name}" — different reporting bases`,
-                detail: `Claim EBITDA basis ("${claim.scope_qualifier}") is incompatible with model figure basis ("${modelFig.name}"). ` +
-                  `Reported/Non-PF ≠ PEP/management case ≠ Organic ≠ Run-rate. ` +
-                  `These are different EBITDA families and cannot be compared.`,
-                full_analysis: `[EBITDA_BASIS_GUARD] Claim: "${claim.verbatim_snippet}" ` +
-                  `(scope: "${claim.scope_qualifier}") matched by LLM to model "${modelFig.name}" ` +
-                  `but EBITDA basis families are incompatible. ` +
-                  `Rejecting to prevent false divergence (e.g., £54.9m Non-PF vs £57m PEP = fake £2.1m gap).`,
-                severity_anchor: null,
-                source_docs: [claim.source_doc],
-                claim,
-                model_figure: modelFig,
-                delta_abs: null,
-                delta_pct: null,
-              });
-              scope_mismatch_count++;
-              continue;
-            }
-
-            // CODE computes the delta — never LLM
-            const claimValueInUnits = normalizeClaimValue(claim);
-            const modelValueInUnits = modelFig.value; // Already in £ (raw cell value)
-            const deltaAbs = Math.abs(claimValueInUnits - modelValueInUnits);
-            const deltaPct = modelValueInUnits !== 0 ? deltaAbs / Math.abs(modelValueInUnits) : (deltaAbs > 0 ? 1 : 0);
-
-            // Classify
-            if (deltaAbs < MATERIALITY_ABS_FLOOR && deltaPct < MATERIALITY_REL_FLOOR) {
-              // Within tolerance — no finding
-              within_tolerance_count++;
-              reconciled_count++;
-              continue;
-            }
-
-            // Above materiality floor — but check historical-actuals backstop first
-            // BACKSTOP: If the claim references a PAST ACTUAL year (settled financials)
-            // and diverges materially from the model, this is almost certainly a scope
-            // mislabel (e.g., LfL tagged as reported) rather than a genuine data
-            // contradiction. Actuals don't change — a large historical gap is a labeling
-            // error. Classify as scope_mismatch (confirm basis) not data_divergence.
-            if (isHistoricalActualPeriod(claim.period) && deltaPct >= MATERIALITY_REL_FLOOR) {
-              findings.push({
-                finding_kind: "scope_mismatch",
-                severity: "info",
-                title: `Historical actual divergence (likely mislabel): ${claim.scope_qualifier} ${claim.period} — confirm basis`,
-                detail: `Memo cites ${claim.scope_qualifier}: ${formatValue(claim)} (${claim.period}). ` +
-                  `Model shows £${(modelValueInUnits / 1_000_000).toFixed(1)}m. ` +
-                  `Since ${claim.period} is a historical actual (settled), this ${(deltaPct * 100).toFixed(0)}% gap ` +
-                  `likely indicates a scope/basis mislabel rather than a data contradiction.`,
-                full_analysis: `[HISTORICAL_ACTUAL_BACKSTOP] Claim: "${claim.verbatim_snippet}" ` +
-                  `→ ${claim.scope_qualifier} = ${formatValue(claim)} (${claim.period}). ` +
-                  `Model: "${modelFig.name}" = £${(modelValueInUnits / 1_000_000).toFixed(2)}m. ` +
-                  `Delta: ${(deltaPct * 100).toFixed(1)}%. Historical actuals are settled — this gap ` +
-                  `almost certainly reflects a scope difference (LfL vs reported, PF vs non-PF) ` +
-                  `rather than a genuine inconsistency. Confirm like-for-like basis before asserting contradiction.`,
-                severity_anchor: deltaAbs,
-                source_docs: [claim.source_doc, modelFig.source_doc],
-                claim,
-                model_figure: modelFig,
-                delta_abs: deltaAbs,
-                delta_pct: deltaPct,
-              });
-              scope_mismatch_count++;
-              continue;
-            }
-
-            // Genuine forward-looking or current-year divergence → emit data_divergence finding
-            const severity = (deltaAbs >= CRITICAL_ABS_THRESHOLD || deltaPct >= CRITICAL_REL_THRESHOLD) ? "warning" : "info";
-            // Note: severity is capped at "warning" for memo-vs-model divergences.
-            // Only cross-version (live vs frozen) gets "critical" because it signals stale data.
-
-            const deltaSign = claimValueInUnits > modelValueInUnits ? "+" : "−";
-            const deltaFormatted = deltaAbs >= 1_000_000
-              ? `${deltaSign}£${(deltaAbs / 1_000_000).toFixed(1)}m`
-              : `${deltaSign}£${(deltaAbs / 1_000).toFixed(0)}k`;
-
-            findings.push({
-              finding_kind: "data_divergence",
-              severity,
-              title: `${claim.metric} gap: memo ${formatValue(claim)} vs model £${(modelValueInUnits / 1_000_000).toFixed(1)}m (${deltaFormatted})`,
-              detail: `Memo claims ${claim.scope_qualifier} of ${formatValue(claim)} (${claim.period}). ` +
-                `Model figure "${modelFig.name}" shows £${(modelValueInUnits / 1_000_000).toFixed(1)}m at ${modelFig.period}. ` +
-                `Delta: ${deltaFormatted} (${(deltaPct * 100).toFixed(1)}%).`,
-              full_analysis: `[DATA_DIVERGENCE] Memo claim: "${claim.verbatim_snippet}" ` +
-                `→ ${claim.scope_qualifier} = ${formatValue(claim)} (${claim.period}). ` +
-                `Model: "${modelFig.name}" @ [${modelFig.source_cell}] = £${(modelValueInUnits / 1_000_000).toFixed(2)}m (${modelFig.period}). ` +
-                `Code-computed delta: ${deltaFormatted} (${(deltaPct * 100).toFixed(1)}%). ` +
-                `Confirm whether this represents a pro-forma/annualisation gap, a timing difference, or a genuine inconsistency.`,
-              severity_anchor: deltaAbs,
-              source_docs: [claim.source_doc, modelFig.source_doc],
-              claim,
-              model_figure: modelFig,
-              delta_abs: deltaAbs,
-              delta_pct: deltaPct,
-            });
-            reconciled_count++;
-
-          } else if (proposal.match_status === "scope_mismatch") {
-            // Scope mismatch — NEVER assert contradiction
-            findings.push({
-              finding_kind: "scope_mismatch",
-              severity: "info",
-              title: `Scope mismatch: ${claim.scope_qualifier} — confirm like-for-like basis`,
-              detail: `Memo cites ${claim.scope_qualifier}: ${formatValue(claim)} (${claim.period}). ` +
-                `Model has a similar metric but different scope. ${proposal.mismatch_reason ?? ""}`,
-              full_analysis: `[SCOPE_MISMATCH] Memo claim: "${claim.verbatim_snippet}" ` +
-                `→ scope: "${claim.scope_qualifier}". ` +
-                `Model scope differs: ${proposal.mismatch_reason ?? "unspecified"}. ` +
-                `These metrics have different scope definitions and are not directly comparable. ` +
-                `Do NOT assert a contradiction — flag for scope confirmation only.`,
-              severity_anchor: null,
-              source_docs: [claim.source_doc],
-              claim,
-              model_figure: null,
-              delta_abs: null,
-              delta_pct: null,
-            });
-            scope_mismatch_count++;
-
-          } else {
-            // no_model_line — unreconcilable
-            findings.push({
-              finding_kind: "unreconcilable",
-              severity: "info",
-              title: `${claim.scope_qualifier}: no model counterpart`,
-              detail: `Memo cites ${claim.scope_qualifier}: ${formatValue(claim)} (${claim.period}). ` +
-                `No matching metric found in the operating model.`,
-              full_analysis: `[UNRECONCILABLE] Claim: "${claim.verbatim_snippet}" ` +
-                `→ ${claim.scope_qualifier} has no counterpart in the verified figures set. ` +
-                `This metric/scope is not covered by the uploaded financial model.`,
-              severity_anchor: null,
-              source_docs: [claim.source_doc],
-              claim,
-              model_figure: null,
-              delta_abs: null,
-              delta_pct: null,
-            });
-            unreconcilable_count++;
-          }
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[Reconciliation] LLM matching failed: ${msg}`);
-        // All reconcilable claims become unreconcilable on LLM failure
-        unreconcilable_count += reconcilableClaims.length;
-        matching_error = msg;
+        // Use the fuzzy match
+        const nf = fuzzyMatches[0];
+        const fuzzyResult = processMatch(claim, nf, figures, findings);
+        if (fuzzyResult.kind === "reconciled") reconciled_count++;
+        else if (fuzzyResult.kind === "within_tolerance") within_tolerance_count++;
+        else if (fuzzyResult.kind === "scope_mismatch") scope_mismatch_count++;
+        else if (fuzzyResult.kind === "unreconcilable") unreconcilable_count++;
+        continue;
       }
-    } else {
-      console.warn(`[Reconciliation] Skipped LLM matching — time budget exhausted`);
-      unreconcilable_count += reconcilableClaims.length;
+
+      // Direct coordinate match found
+      const nf = matches[0]; // Use first match (multiple only if duplicate periods)
+      const matchResult = processMatch(claim, nf, figures, findings);
+      if (matchResult.kind === "reconciled") reconciled_count++;
+      else if (matchResult.kind === "within_tolerance") within_tolerance_count++;
+      else if (matchResult.kind === "scope_mismatch") scope_mismatch_count++;
+      else if (matchResult.kind === "unreconcilable") unreconcilable_count++;
     }
   } else if (figures.length === 0) {
     console.log(`[Reconciliation] No verified figures available — all claims unreconcilable`);

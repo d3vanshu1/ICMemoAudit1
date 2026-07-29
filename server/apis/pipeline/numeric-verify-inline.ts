@@ -33,6 +33,20 @@ export interface NumericVerifyResult {
   documentsTotal: number;
   tablesLoaded: number;
   tablesTotal: number;
+  /** Diagnostic: cross-agreement comparison stats */
+  crossAgreementDebug?: {
+    status: string;
+    sourceATablesFound: number;
+    sourceBTablesFound: number;
+    allTableSheets: string[];
+    mapASize: number;
+    mapBSize: number;
+    sharedKeys: number;
+    comparedPairs: number;
+    divergedPairs: number;
+    identicalPairs: number;
+    sampleSharedEntries: Array<{ label: string; period: string; valueA: number; valueB: number }>;
+  };
 }
 
 export interface Figure {
@@ -179,7 +193,7 @@ const DocTableDataSchema = z.object({
 const SCG_METRIC_CONFIG: MetricConfig = {
   isRegex: true,
   labelPatterns: [
-    "^Total\\s+(direct\\s+costs|overheads|revenue)",
+    "^Total\\s+(direct\\s+costs|overheads|revenue|Group\\s+revenue)",
     "^(Revenue|EBITDA|EBIT|Gross\\s+Profit|Net\\s+Income|Operating\\s+Profit)",
     "^(Adjusted|Adj\\.?|Normalised|Underlying|Reported)\\s+(EBITDA|EBIT|Revenue)",
     "^(ARR|MRR|Net\\s+Revenue|Recurring\\s+Revenue)",
@@ -521,12 +535,27 @@ interface CrossAgreementEntry {
   isAnnual: boolean;
 }
 
+interface CrossAgreementDebug {
+  status: "ok" | "source_not_found" | "ambiguous_source";
+  sourceATablesFound: number;
+  sourceBTablesFound: number;
+  allTableSheets: string[];
+  mapASize: number;
+  mapBSize: number;
+  sharedKeys: number;
+  comparedPairs: number;
+  divergedPairs: number;
+  identicalPairs: number;
+  sampleSharedEntries: Array<{ label: string; period: string; valueA: number; valueB: number }>;
+}
+
 function runCrossAgreement(
   tables: ParsedTable[],
   config: CrossAgreementConfig
-): { discrepancies: Discrepancy[]; figures: Figure[] } {
+): { discrepancies: Discrepancy[]; figures: Figure[]; debug: CrossAgreementDebug } {
   const discrepancies: Discrepancy[] = [];
   const figures: Figure[] = [];
+  const emptyDebug: CrossAgreementDebug = { status: "source_not_found", sourceATablesFound: 0, sourceBTablesFound: 0, allTableSheets: tables.map(t => `${t.sheetOrPage} [${t.documentId.slice(0,8)}]`), mapASize: 0, mapBSize: 0, sharedKeys: 0, comparedPairs: 0, divergedPairs: 0, identicalPairs: 0, sampleSharedEntries: [] };
 
   // Find tables matching source A and source B (document-pinned when configured)
   const sourceATables = tables.filter((t) =>
@@ -540,25 +569,37 @@ function runCrossAgreement(
 
   if (sourceATables.length === 0 || sourceBTables.length === 0) {
     console.log(`[NumericInline:CrossAgreement] Source not found: A="${config.sourceASheet}"${config.sourceADocId ? ` doc=${config.sourceADocId.slice(0,8)}` : ""} (${sourceATables.length}), B="${config.sourceBSheet}"${config.sourceBDocId ? ` doc=${config.sourceBDocId.slice(0,8)}` : ""} (${sourceBTables.length})`);
-    return { discrepancies, figures };
+    return { discrepancies, figures, debug: { ...emptyDebug, sourceATablesFound: sourceATables.length, sourceBTablesFound: sourceBTables.length } };
   }
 
   // Fail loud if multiple tables match a source spec — never silently take [0]
+  // EXCEPTION: if all matching tables are from the SAME document (pinned), take the
+  // first one. This handles docs with duplicate sheet entries (e.g., multiple table
+  // regions parsed from the same sheet). The ambiguity guard is for cross-document
+  // confusion, not intra-document duplicates.
   if (sourceATables.length > 1) {
-    console.warn(
-      `[NumericInline:CrossAgreement] AMBIGUOUS source A: ${sourceATables.length} tables match "${config.sourceASheet}"` +
-      `${config.sourceADocId ? ` in doc ${config.sourceADocId.slice(0,8)}` : ""}. ` +
-      `Documents: [${sourceATables.map(t => t.documentId.slice(0,8)).join(", ")}]. Skipping cross-agreement.`
-    );
-    return { discrepancies, figures };
+    const uniqueDocIds = new Set(sourceATables.map(t => t.documentId));
+    if (uniqueDocIds.size > 1) {
+      console.warn(
+        `[NumericInline:CrossAgreement] AMBIGUOUS source A: ${sourceATables.length} tables match "${config.sourceASheet}"` +
+        `${config.sourceADocId ? ` in doc ${config.sourceADocId.slice(0,8)}` : ""}. ` +
+        `Documents: [${sourceATables.map(t => t.documentId.slice(0,8)).join(", ")}]. Skipping cross-agreement.`
+      );
+      return { discrepancies, figures, debug: { ...emptyDebug, status: "ambiguous_source" as const, sourceATablesFound: sourceATables.length, sourceBTablesFound: sourceBTables.length } };
+    }
+    console.log(`[NumericInline:CrossAgreement] Source A: ${sourceATables.length} tables match (same doc) — using first.`);
   }
   if (sourceBTables.length > 1) {
-    console.warn(
-      `[NumericInline:CrossAgreement] AMBIGUOUS source B: ${sourceBTables.length} tables match "${config.sourceBSheet}"` +
-      `${config.sourceBDocId ? ` in doc ${config.sourceBDocId.slice(0,8)}` : ""}. ` +
-      `Documents: [${sourceBTables.map(t => t.documentId.slice(0,8)).join(", ")}]. Skipping cross-agreement.`
-    );
-    return { discrepancies, figures };
+    const uniqueDocIds = new Set(sourceBTables.map(t => t.documentId));
+    if (uniqueDocIds.size > 1) {
+      console.warn(
+        `[NumericInline:CrossAgreement] AMBIGUOUS source B: ${sourceBTables.length} tables match "${config.sourceBSheet}"` +
+        `${config.sourceBDocId ? ` in doc ${config.sourceBDocId.slice(0,8)}` : ""}. ` +
+        `Documents: [${sourceBTables.map(t => t.documentId.slice(0,8)).join(", ")}]. Skipping cross-agreement.`
+      );
+      return { discrepancies, figures, debug: { ...emptyDebug, status: "ambiguous_source" as const, sourceATablesFound: sourceATables.length, sourceBTablesFound: sourceBTables.length } };
+    }
+    console.log(`[NumericInline:CrossAgreement] Source B: ${sourceBTables.length} tables match (same doc) — using first.`);
   }
 
   const tableA = sourceATables[0];
@@ -597,6 +638,13 @@ function runCrossAgreement(
     if (!mapB.has(key)) mapB.set(key, e);
   }
 
+  // Diagnostic: log cross-agreement map sizes and shared keys
+  const sharedKeys = [...mapA.keys()].filter(k => mapB.has(k));
+  console.log(
+    `[NumericInline:CrossAgreement] Map sizes: A=${mapA.size}, B=${mapB.size}, shared=${sharedKeys.length}. ` +
+    `Sample shared keys: ${sharedKeys.slice(0, 5).join("; ")}`
+  );
+
   // Compare: find keys present in both maps with divergence > threshold
   // Group divergences by period for rolled-up reporting
   const divergencesByPeriod = new Map<string, Array<{
@@ -609,9 +657,14 @@ function runCrossAgreement(
     refB: string;
   }>>();
 
+  let comparedCount = 0;
+  let divergedCount = 0;
+  let identicalCount = 0;
+
   for (const [key, entryA] of mapA) {
     const entryB = mapB.get(key);
     if (!entryB) continue;
+    comparedCount++;
 
     // Restrict labels if configured
     if (config.restrictLabels && config.restrictLabels.length > 0) {
@@ -653,6 +706,7 @@ function runCrossAgreement(
     // Apply threshold: divergence must exceed BOTH abs AND rel thresholds
     // (i.e., flag only when the difference is meaningful in both absolute and relative terms)
     if (absDiff > config.absThreshold && relDiff > config.relThreshold) {
+      divergedCount++;
       const period = periodBaseYear(entryA.period);
       if (!divergencesByPeriod.has(period)) divergencesByPeriod.set(period, []);
       divergencesByPeriod.get(period)!.push({
@@ -664,6 +718,8 @@ function runCrossAgreement(
         refA: entryA.sourceRef,
         refB: entryB.sourceRef,
       });
+    } else if (absDiff === 0) {
+      identicalCount++;
     }
 
     // Emit verified figures from source A (live model = authoritative)
@@ -676,6 +732,12 @@ function runCrossAgreement(
       source_sheet: tableA.sheetOrPage,
     });
   }
+
+  console.log(
+    `[NumericInline:CrossAgreement] Comparison complete: ${comparedCount} pairs compared, ` +
+    `${divergedCount} diverged (above threshold), ${identicalCount} identical. ` +
+    `Periods with divergences: ${divergencesByPeriod.size}`
+  );
 
   // Roll up: one discrepancy per period containing ALL metrics, tiered
   const materialityFloor = { abs: config.materialityAbsFloor, rel: config.materialityRelFloor };
@@ -732,7 +794,28 @@ function runCrossAgreement(
     });
   }
 
-  return { discrepancies, figures };
+  // Build sample shared entries for debugging
+  const sampleSharedEntries = sharedKeys.slice(0, 10).map(k => {
+    const a = mapA.get(k)!;
+    const b = mapB.get(k)!;
+    return { label: a.label, period: a.period, valueA: a.value, valueB: b.value };
+  });
+
+  const debug: CrossAgreementDebug = {
+    status: "ok",
+    sourceATablesFound: 1,
+    sourceBTablesFound: 1,
+    allTableSheets: tables.map(t => `${t.sheetOrPage} [${t.documentId.slice(0,8)}]`),
+    mapASize: mapA.size,
+    mapBSize: mapB.size,
+    sharedKeys: sharedKeys.length,
+    comparedPairs: comparedCount,
+    divergedPairs: divergedCount,
+    identicalPairs: identicalCount,
+    sampleSharedEntries,
+  };
+
+  return { discrepancies, figures, debug };
 }
 
 function extractAllNumericEntries(table: ParsedTable): CrossAgreementEntry[] {
@@ -1114,10 +1197,15 @@ export async function runNumericVerifyInline(
 
   // Step 5: Layer 1 — Extract metric figures from the LIVE MODEL only.
   // Figures are the source-of-truth model values fed to the LLM — they must come
-  // exclusively from the resolved live model, not from the original/frozen version
-  // (which would inject stale values as "trustworthy" alongside the live ones).
+  // exclusively from the resolved live model's primary (live) sheet, not from the
+  // hardcoded/frozen comparison sheet (which would inject reference/stale values
+  // alongside the live ones and create ambiguity for downstream reconciliation).
   let allFigures: Figure[] = [];
-  for (const table of tables.filter(t => t.documentId === liveModelDocId)) {
+  const primarySheet = crossAgreementConfig.sourceASheet.toLowerCase();
+  for (const table of tables.filter(t =>
+    t.documentId === liveModelDocId &&
+    t.sheetOrPage.trim().toLowerCase() === primarySheet
+  )) {
     const tableFigures = extractMetricFigures(table, SCG_METRIC_CONFIG);
     allFigures.push(...tableFigures);
   }
@@ -1125,8 +1213,14 @@ export async function runNumericVerifyInline(
   // Step 6: Layer 2 — Cross-agreement (only discrepancy source)
   const crossResult = runCrossAgreement(tables, crossAgreementConfig);
 
-  // Merge figures: cross-agreement also produces figures (from source A)
-  allFigures.push(...crossResult.figures);
+  // NOTE: Cross-agreement also emits figures from source A for every compared row.
+  // We intentionally DO NOT merge them into allFigures because:
+  //   1. Layer 1 already captures all metric-config-matching figures from the primary sheet.
+  //   2. Cross-agreement figures include non-metric rows (detail lines) that would pollute
+  //      the reconciliation coordinate space.
+  //   3. Cross-agreement compares by base year across both sheets, so its "figures" may
+  //      include hardcoded-sheet periods not present in the live sheet's annual columns.
+  // The cross-agreement's job is solely to detect divergences between tabs.
 
   // Deduplicate figures by (name, period, source_sheet, document_id)
   // document_id is included to prevent the original model's figures from
@@ -1163,5 +1257,6 @@ export async function runNumericVerifyInline(
     documentsTotal: documentIds.length,
     tablesLoaded: allRawRows.length,
     tablesTotal: tableIndex.length,
+    crossAgreementDebug: crossResult.debug,
   };
 }
