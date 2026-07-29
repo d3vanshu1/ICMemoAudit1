@@ -2013,6 +2013,14 @@ export default function DealDashboardPage() {
 
       if (orphanedModules.length === 0) return;
 
+      // Gate: Do NOT resume until docs are loaded and selectedSubjectIds is populated.
+      // Without this, the auto-resume can fire before the useEffect sets subjectIds,
+      // sending an empty array that kills the run via the server's subject guard.
+      if (!docsInitialized.current) {
+        console.log("[auto-resume] Skipping — docs not yet loaded (selectedSubjectIds would be empty)");
+        return;
+      }
+
       // Small delay to let browser connections stabilize after wake
       await new Promise((r) => setTimeout(r, 1_000));
 

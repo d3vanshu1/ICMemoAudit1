@@ -643,6 +643,42 @@ function cancelledResult(runId: string, gate: string): PipelineResult {
 }
 
 // ---------------------------------------------------------------------------
+// Error Capture — persists error details to module_runs for post-mortem.
+// Uses IF NOT EXISTS-style try/catch so the column can be added lazily.
+// ---------------------------------------------------------------------------
+
+/**
+ * Marks a run as failed and persists the error message + phase into the DB.
+ * Falls back gracefully if the error_message/error_phase columns don't exist yet.
+ */
+async function markRunFailed(
+  db: PipelineContext["integrations"]["db"],
+  runId: string,
+  errorMessage: string,
+  errorPhase: string
+): Promise<void> {
+  try {
+    await db.execute(
+      `UPDATE module_runs
+       SET status = 'failed'::module_status,
+           completed_at = now(),
+           error_message = $2,
+           error_phase = $3
+       WHERE id = $1 AND status = 'running'::module_status`,
+      [runId, errorMessage, errorPhase],
+      { label: `Mark run failed — ${errorPhase}` }
+    );
+  } catch {
+    // error_message/error_phase columns may not exist yet — fall back to status-only
+    await db.execute(
+      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
+      [runId],
+      { label: `Mark run failed (legacy) — ${errorPhase}` }
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Core Pipeline Function
 // ---------------------------------------------------------------------------
 export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput): Promise<PipelineResult> {
@@ -1092,29 +1128,72 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     }
   }
 
-  // --- Subject & Evidence Pool Guard ---
+  // --- Subject & Evidence Pool Guard (resume-aware) ---
   // ALL analysis modules (everything routed through pipeline-core) require:
   //   1. At least one subject document ID — the memo(s) under review
   //   2. At least one evidence document — reference material beyond the subject
   // Executive Summary is NOT routed through pipeline-core so is unaffected.
-  const subjectIds = input.subjectDocumentIds ?? [];
-  if (subjectIds.length === 0) {
-    // Mark run failed with a clear error message
-    await ctx.integrations.db.execute(
-      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
-      [runId],
-      { label: "Mark run failed — no subject document selected" }
+  //
+  // RESUME-AWARENESS: If the run already has analysis checkpoints, the subject
+  // was validated on the original invocation. Don't kill a multi-hour run because
+  // a resume call arrived with empty subject IDs (auto-resume race condition).
+  let subjectIds = input.subjectDocumentIds ?? [];
+  if (subjectIds.length === 0 && runId) {
+    // Attempt to reconstruct subject IDs: IC memo documents for this deal
+    // (same logic as the frontend auto-preselect)
+    const icMemoRows = await ctx.integrations.db.query(
+      `SELECT id FROM documents WHERE deal_id = $1 AND document_tag = 'ic_memo'`,
+      z.object({ id: z.string() }),
+      [dealId],
+      { label: "Reconstruct subjectIds from ic_memo docs (resume fallback)" }
     );
+    if (icMemoRows.length > 0) {
+      subjectIds = icMemoRows.map(r => r.id);
+      console.log(`[pipeline] Reconstructed subjectIds from ${icMemoRows.length} ic_memo doc(s) (resume fallback)`);
+    }
+  }
+  if (subjectIds.length === 0 && runId) {
+    // Even reconstruction failed — check if the run already has checkpoints.
+    // If so, skip the guard (subject was validated on first invocation).
+    const [existingCp] = await ctx.integrations.db.query(
+      `SELECT COUNT(*)::int AS cnt FROM pipeline_analysis WHERE run_id = $1`,
+      z.object({ cnt: z.coerce.number() }),
+      [runId],
+      { label: "Check existing checkpoints for resume guard bypass" }
+    );
+    if (existingCp && existingCp.cnt > 0) {
+      console.warn(`[pipeline] Subject guard bypass: run ${runId} has ${existingCp.cnt} analysis checkpoints but empty subjectIds on resume — proceeding without subject exclusion`);
+      // Proceed with empty subjectIds — extraction routing already encoded subject/evidence split
+    } else {
+      // True fresh start with no checkpoints and no subject — fail
+      const errMsg = "Cannot run this module without selecting a subject memo. Please choose the 'Memo(s) under review' before running.";
+      await markRunFailed(ctx.integrations.db, runId, errMsg, "no_subject_document");
+      return {
+        status: "failed",
+        runId,
+        phase: "no_subject_document",
+        progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
+        result: null,
+        failedChunks: 0,
+        truncatedChunks: 0,
+        truncatedMerges: 0,
+        firstError: errMsg,
+      };
+    }
+  } else if (subjectIds.length === 0) {
+    // No runId (shouldn't happen in practice) — original guard
+    const errMsg = "Cannot run this module without selecting a subject memo. Please choose the 'Memo(s) under review' before running.";
+    await markRunFailed(ctx.integrations.db, runId!, errMsg, "no_subject_document");
     return {
       status: "failed",
-      runId,
+      runId: runId!,
       phase: "no_subject_document",
       progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
       result: null,
       failedChunks: 0,
       truncatedChunks: 0,
       truncatedMerges: 0,
-      firstError: "Cannot run this module without selecting a subject memo. Please choose the 'Memo(s) under review' before running.",
+      firstError: errMsg,
     };
   }
 
@@ -1133,21 +1212,18 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   );
   const evidenceCount = evidenceCountRows[0]?.cnt ?? 0;
   if (evidenceCount === 0) {
-    await ctx.integrations.db.execute(
-      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
-      [runId],
-      { label: "Mark run failed — no evidence documents" }
-    );
+    const errMsg = "Cannot run this module without at least one reference document in the evidence pool. Upload documents beyond the subject memo before running.";
+    await markRunFailed(ctx.integrations.db, runId!, errMsg, "no_evidence_documents");
     return {
       status: "failed",
-      runId,
+      runId: runId!,
       phase: "no_evidence_documents",
       progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
       result: null,
       failedChunks: 0,
       truncatedChunks: 0,
       truncatedMerges: 0,
-      firstError: "Cannot run this module without at least one reference document in the evidence pool. Upload documents beyond the subject memo before running.",
+      firstError: errMsg,
     };
   }
 
@@ -1311,18 +1387,15 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   });
 
   if (routed.length === 0) {
-    await ctx.integrations.db.execute(
-      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
-      [runId],
-      { label: "Mark run failed — no chunks" }
-    );
+    const errMsg = "No extraction chunks matched this module's document tags (check document tagging)";
+    await markRunFailed(ctx.integrations.db, runId!, errMsg, "routing");
     return {
       status: "failed",
-      runId,
+      runId: runId!,
       phase: "routing",
       progress: { analysisTotal: 0, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
       result: null,
-      firstError: "No extraction chunks matched this module's document tags (check document tagging)",
+      firstError: errMsg,
     };
   }
 
@@ -1439,7 +1512,8 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
   if (staleRows.length > 0 && staleRows[0].cnt > 0) {
     // Stale checkpoints detected — cannot resume this run. Create a new run_id.
-    console.error(`[pipeline] VERSION MISMATCH: ${staleRows[0].cnt} analysis rows for run ${runId} have a different prompt_version than current (${currentVersion}). Starting fresh run.`);
+    const errMsg = `VERSION MISMATCH: ${staleRows[0].cnt} analysis rows have a different prompt_version than current (${currentVersion}). Starting fresh run.`;
+    console.error(`[pipeline] ${errMsg}`);
 
     // Create a brand new run instead of reusing this stale one
     const freshRunRows = await ctx.integrations.db.query(
@@ -1453,12 +1527,8 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     const freshRunId = freshRunRows[0].run_id;
     console.log(`[pipeline] Created fresh run ${freshRunId} (replacing stale ${runId})`);
 
-    // Mark the old run as failed
-    await ctx.integrations.db.execute(
-      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
-      [runId],
-      { label: "Mark stale run as failed" }
-    );
+    // Mark the old run as failed with error capture
+    await markRunFailed(ctx.integrations.db, runId!, errMsg, "version_mismatch");
 
     // Recurse with the new run_id (this is safe — it will enter the fresh-start path)
     return runPipelineCore(ctx, { ...input, runId: freshRunId });
@@ -1718,19 +1788,16 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   });
 
   if (analysisResults.length === 0) {
-    await ctx.integrations.db.execute(
-      `UPDATE module_runs SET status = 'failed'::module_status, completed_at = now() WHERE id = $1 AND status = 'running'::module_status`,
-      [runId],
-      { label: "Mark run failed — no analysis results" }
-    );
+    const errMsg = firstError ?? "All chunks failed or no analysis results produced";
+    await markRunFailed(ctx.integrations.db, runId!, errMsg, "analysis");
     return {
       status: "failed",
-      runId,
+      runId: runId!,
       phase: "analysis",
       progress: { analysisTotal: routed.length, analysisCompleted: 0, mergeRound: 0, mergeTotal: 0 },
       result: null,
       failedChunks,
-      firstError: firstError ?? "All chunks failed or no analysis results produced",
+      firstError: errMsg,
     };
   }
 
