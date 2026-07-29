@@ -614,11 +614,16 @@ async function checkCancelled(ctx: PipelineContext, runId: string, gate: string)
       return true;
     }
   } catch (err: unknown) {
-    // Discriminate: 42703 = undefined_column (pre-migration) → silent legacy fallback
-    // Any other error → log as console.error but return false (don't silently disable gate)
+    // Discriminate: 42703 = undefined_column (pre-migration) → silent legacy fallback.
+    // The Superblocks platform may wrap Postgres errors into a generic
+    // 'Integration "..." failed during "query"' message, so we also treat
+    // that wrapped form as a likely missing-column scenario (non-fatal).
     const errMsg = err instanceof Error ? err.message : String(err);
-    const isUndefinedColumn = errMsg.includes("42703") || errMsg.includes("does not exist");
-    if (!isUndefinedColumn) {
+    const isLikelyMissingColumn =
+      errMsg.includes("42703") ||
+      errMsg.includes("does not exist") ||
+      errMsg.includes('failed during "query"');
+    if (!isLikelyMissingColumn) {
       console.error(`[pipeline:cancel-gate] UNEXPECTED ERROR at gate "${gate}" for run ${runId}: ${errMsg}`);
     }
     // Pre-migration: column doesn't exist → cancellation indistinguishable server-side.
