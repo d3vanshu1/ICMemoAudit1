@@ -417,7 +417,39 @@ export async function runReconciliation(
               continue;
             }
 
-            // Above materiality floor → emit data_divergence finding
+            // Above materiality floor — but check historical-actuals backstop first
+            // BACKSTOP: If the claim references a PAST ACTUAL year (settled financials)
+            // and diverges materially from the model, this is almost certainly a scope
+            // mislabel (e.g., LfL tagged as reported) rather than a genuine data
+            // contradiction. Actuals don't change — a large historical gap is a labeling
+            // error. Classify as scope_mismatch (confirm basis) not data_divergence.
+            if (isHistoricalActualPeriod(claim.period) && deltaPct >= MATERIALITY_REL_FLOOR) {
+              findings.push({
+                finding_kind: "scope_mismatch",
+                severity: "info",
+                title: `Historical actual divergence (likely mislabel): ${claim.scope_qualifier} ${claim.period} — confirm basis`,
+                detail: `Memo cites ${claim.scope_qualifier}: ${formatValue(claim)} (${claim.period}). ` +
+                  `Model shows £${(modelValueInUnits / 1_000_000).toFixed(1)}m. ` +
+                  `Since ${claim.period} is a historical actual (settled), this ${(deltaPct * 100).toFixed(0)}% gap ` +
+                  `likely indicates a scope/basis mislabel rather than a data contradiction.`,
+                full_analysis: `[HISTORICAL_ACTUAL_BACKSTOP] Claim: "${claim.verbatim_snippet}" ` +
+                  `→ ${claim.scope_qualifier} = ${formatValue(claim)} (${claim.period}). ` +
+                  `Model: "${modelFig.name}" = £${(modelValueInUnits / 1_000_000).toFixed(2)}m. ` +
+                  `Delta: ${(deltaPct * 100).toFixed(1)}%. Historical actuals are settled — this gap ` +
+                  `almost certainly reflects a scope difference (LfL vs reported, PF vs non-PF) ` +
+                  `rather than a genuine inconsistency. Confirm like-for-like basis before asserting contradiction.`,
+                severity_anchor: deltaAbs,
+                source_docs: [claim.source_doc, modelFig.source_doc],
+                claim,
+                model_figure: modelFig,
+                delta_abs: deltaAbs,
+                delta_pct: deltaPct,
+              });
+              scope_mismatch_count++;
+              continue;
+            }
+
+            // Genuine forward-looking or current-year divergence → emit data_divergence finding
             const severity = (deltaAbs >= CRITICAL_ABS_THRESHOLD || deltaPct >= CRITICAL_REL_THRESHOLD) ? "warning" : "info";
             // Note: severity is capped at "warning" for memo-vs-model divergences.
             // Only cross-version (live vs frozen) gets "critical" because it signals stale data.
@@ -559,6 +591,48 @@ export async function runReconciliation(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Historical-actuals backstop: determines if a claim's period represents a
+ * PAST ACTUAL year (settled financials that don't change).
+ *
+ * Returns true for periods like "FY Mar-23A", "FY Mar-24", "FY23", "2023", "FY Mar-25"
+ * Returns false for:
+ *   - Current year (FY Mar-26) or any year >= 2026 (deal year)
+ *   - Forecasts: "FY Mar-27F", "FY Mar-28F"
+ *   - Budget/LE: "FY Mar-26LE", "FY Mar-26B"
+ *   - Run-rates: "Jun-26 RR"
+ *   - Multi-year ranges: "FY23-26", "FY26-31F" (these are growth rates, not actuals)
+ *   - Non-year periods: "L3Y", "LTM", "current"
+ *
+ * The cutoff is conservative: anything that MIGHT be current or forward → false.
+ * Only clearly settled past years trigger the backstop.
+ */
+function isHistoricalActualPeriod(period: string): boolean {
+  const p = period.trim();
+
+  // Exclude multi-year ranges (CAGRs) — these aren't single-year actuals
+  if (p.includes("-") && /\d{2,4}.*-.*\d{2,4}/.test(p)) return false;
+
+  // Exclude run-rates, LTM, L3Y, current
+  const lp = p.toLowerCase();
+  if (lp.includes("rr") || lp.includes("ltm") || lp.includes("l3y") || lp.includes("current")) return false;
+
+  // Exclude budgets and forecasts (F, B, LE suffix)
+  if (/[FfBb]$/.test(p) || /LE$/i.test(p)) return false;
+
+  // Extract the year from the period string
+  const yearMatch = p.match(/\b(20\d{2})\b/) || p.match(/\b(\d{2})\b/);
+  if (!yearMatch) return false;
+
+  let year = parseInt(yearMatch[1], 10);
+  if (year < 100) year += 2000; // "23" → 2023
+
+  // Current deal year is 2026 (FY Mar-26 is the current year in this deal context)
+  // Anything before 2026 is a past actual; 2026+ is current/forward
+  const CURRENT_DEAL_YEAR = 2026;
+  return year < CURRENT_DEAL_YEAR;
+}
 
 function normalizeClaimValue(claim: Claim): number {
   // Convert claim value to the same units as model figures (raw £)

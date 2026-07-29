@@ -103,15 +103,18 @@ DO NOT default to "Total Group Revenue" or any other generic label. If in doubt,
 
 ### EBITDA Scope Families (all distinct, never interchangeable):
 - "Reported EBITDA" — as per statutory accounts
-- "Adjusted EBITDA" — post management adjustments (add-backs, one-offs removed)
-- "Cash EBITDA" — adjusted EBITDA less cash items (capex, WC, etc.)
+- "Adjusted EBITDA" — post management adjustments (add-backs, one-offs removed). Use ONLY when the memo explicitly says "Adjusted" without "Non Pro Forma" qualifier.
+- "Cash EBITDA (Reported / Non Pro Forma)" — the REPORTED (non-pro-forma) adjusted cash EBITDA from the financials table. ⚠️ When a table is labelled "Non Pro Forma" or "Non-PF", use THIS scope — it is DISTINCT from PEP/management case figures. E.g., "Adj. Cash EBITDA (Non Pro Forma) 33.5 38.7 44.5 54.9" → scope = "Cash EBITDA (Reported / Non Pro Forma)", NOT "Adjusted EBITDA".
+- "Cash EBITDA" — standalone usage without "adjusted" or "non-PF" qualifier (e.g., "£55m Cash EBITDA" in deal scorecard)
 - "Organic Cash EBITDA" — excludes contribution from recent/pending acquisitions
-- "PEP Cash EBITDA (Organic)" — specific to the PEP methodology, organic only
+- "PEP Cash EBITDA (Organic)" — specific to the PEP methodology, organic only. Use when the context explicitly references the "PEP case" or "PEP plan" EBITDA.
 - "Run-rate EBITDA" — annualised from a recent period (NOT a full-year actual)
 - "Entry EBITDA" — the EBITDA used for entry multiple calculation (may differ from reported)
 - "Structuring EBITDA" — basis for leverage/pricing in the deal structure
 - "EBITDA acquired via M&A (deal-sizing)" — average per-deal acquired EBITDA for M&A pacing assumptions
   ⚠️ THIS IS NOT ORGANIC EBITDA. "~£4m EBITDA p.a. at 5.5x" in context of M&A deal-sizing = this category.
+
+⚠️ CRITICAL EBITDA DISAMBIGUATION: The model's PEP case may show ~£57m for FY26, while the REPORTED (Non Pro Forma) table shows ~£54.9m for the same year. These are DIFFERENT figures with DIFFERENT scopes. If the table says "Non Pro Forma", scope it "Cash EBITDA (Reported / Non Pro Forma)" — NEVER "Adjusted EBITDA" which would false-match against the PEP figure.
 
 ### Revenue Scope Families (all distinct — DO NOT CONFLATE):
 - "Total Group Revenue" — ONLY use when the figure explicitly represents all entities, all sources, REPORTED (not adjusted). The headline "£194m revenue" or "FY26 Revenue: £194m" = Total Group Revenue.
