@@ -2070,12 +2070,48 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
             } catch { /* parse failure — use empty findings */ }
           }
 
+          // Fix #3: Code-derived source_docs from claim_id provenance.
+          // The LLM must not choose the source document — derive it deterministically
+          // from the claim_id's extraction origin. "c5-2" → routed[5].document_id → filename.
+          for (const f of findings) {
+            if (!f.claim_ids || f.claim_ids.length === 0) continue;
+            const derivedSources = new Set<string>();
+            for (const cid of f.claim_ids) {
+              const match = String(cid).match(/^c(\d+)-/);
+              if (!match) continue;
+              const chunkIdx = parseInt(match[1], 10);
+              if (chunkIdx >= 0 && chunkIdx < routed.length) {
+                const docId = routed[chunkIdx].document_id;
+                const fileName = idToFileName.get(docId);
+                if (fileName) derivedSources.add(fileName);
+              }
+            }
+            if (derivedSources.size > 0) {
+              const original = f.source_docs?.join(", ") ?? "(none)";
+              (f as any).source_docs = Array.from(derivedSources);
+              if (original !== (f as any).source_docs.join(", ")) {
+                console.log(`[Merge][Fix3-Provenance] "${f.title}" source_docs overridden: ${original} → ${(f as any).source_docs.join(", ")}`);
+              }
+            }
+          }
+
           // CODE BACKSTOP: absence-verification gate — any finding asserting
           // something is missing/absent/not-confirmed must carry verified absence
           // confidence or be capped at info. Gates on claim shape, not gap_type alone.
           const ABSENCE_PATTERNS = /\b(does not confirm|does not disclose|absent|not disclosed|missing|no mention|fails to address|not addressed|not confirmed|no evidence of|no reference to|omits?|silent on|does not discuss|not discussed)\b/i;
 
+          // Fix #2: Quantified data findings are exempt from the absence cap.
+          // A finding carrying a £/$  numeric delta in severity_anchor is a data
+          // divergence, not an absence claim — even if its prose mentions "does not
+          // confirm which version." Route these as principal data findings.
+          const QUANTIFIED_ANCHOR_PATTERN = /[£$€]\s*[\d.,]+|[\d.,]+\s*[£$€]|[−\-–]\s*[£$€]|[£$€]\s*[−\-–]/;
+
           for (const f of findings) {
+            // Exemption: quantified severity_anchor → data finding, skip absence cap
+            const hasQuantifiedAnchor = typeof (f as any).severity_anchor === "string" &&
+              QUANTIFIED_ANCHOR_PATTERN.test((f as any).severity_anchor);
+            if (hasQuantifiedAnchor) continue;
+
             // Original gap_type gate (backward compat)
             const hasAbsenceGapType = f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged";
             // Broadened: claim-shape detection on any module's findings
@@ -2115,6 +2151,26 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
                 })) as MergedFinding[];
               }
             } catch { /* non-fatal */ }
+          }
+
+          // Fix #3: Provenance override for housekeeping findings (same as principal)
+          for (const f of housekeepingFindings) {
+            const hkClaimIds = (f as any).claim_ids as string[] | undefined;
+            if (!hkClaimIds || hkClaimIds.length === 0) continue;
+            const derivedSources = new Set<string>();
+            for (const cid of hkClaimIds) {
+              const match = String(cid).match(/^c(\d+)-/);
+              if (!match) continue;
+              const chunkIdx = parseInt(match[1], 10);
+              if (chunkIdx >= 0 && chunkIdx < routed.length) {
+                const docId = routed[chunkIdx].document_id;
+                const fileName = idToFileName.get(docId);
+                if (fileName) derivedSources.add(fileName);
+              }
+            }
+            if (derivedSources.size > 0) {
+              (f as any).source_docs = Array.from(derivedSources);
+            }
           }
 
           // --- Observability: Fix 2 (scope-mismatch) + Fix 3 (severity anchors) ---
