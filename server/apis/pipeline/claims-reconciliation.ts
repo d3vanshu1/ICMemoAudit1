@@ -56,6 +56,8 @@ export interface ReconciliationResult {
   scope_mismatch_count: number;
   within_tolerance_count: number;
   cross_version_findings: number;
+  /** Internal error from LLM matching step (null if LLM succeeded or wasn't attempted) */
+  matching_error?: string | null;
 }
 
 /** LLM match proposal for a single claim */
@@ -144,6 +146,62 @@ function basisGenuinelyAligns(claim: Claim, modelFig: Figure): boolean {
   // e.g., claim "96% recurring" scope="Total Group Revenue" matched to model "Total Revenue"
   if (claimFamily === "rate_pct" && modelFamily === "absolute_gbp") return false;
   if (claimFamily === "absolute_gbp" && modelFamily === "rate_pct") return false;
+
+  return true;
+}
+
+/**
+ * EBITDA-basis code guard: prevents "Reported / Non Pro Forma" claims from
+ * matching PEP/management-case model figures (and vice versa).
+ *
+ * This is the targeted protection for the £54.9m case: the memo's Non-PF reported
+ * EBITDA (£54.9m) must NEVER match the model's PEP/management figure (£57m).
+ * A £2.1m delta would be above materiality floor and emit a false data_divergence.
+ *
+ * Returns false (incompatible) when EBITDA bases conflict.
+ * Returns true (compatible) for non-EBITDA claims or when bases genuinely match.
+ */
+function ebitdaBasisCompatible(claim: Claim, modelFig: Figure): boolean {
+  const cs = claim.scope_qualifier.toLowerCase();
+  const ml = modelFig.name.toLowerCase();
+
+  // Only apply to EBITDA-family claims
+  const isEbitdaClaim = cs.includes("ebitda");
+  if (!isEbitdaClaim) return true; // Not an EBITDA claim — guard doesn't apply
+
+  // "Reported" / "Non Pro Forma" / "Non-PF" basis indicators
+  const claimIsReported = cs.includes("reported") || cs.includes("non pro forma") || cs.includes("non-pf");
+  const modelIsReported = ml.includes("reported") || ml.includes("non pro forma") || ml.includes("non-pf");
+
+  // "PEP" basis indicators
+  const claimIsPep = cs.includes("pep");
+  const modelIsPep = ml.includes("pep");
+
+  // "Organic" basis indicators (distinct from plain Adjusted)
+  const claimIsOrganic = cs.includes("organic");
+  const modelIsOrganic = ml.includes("organic");
+
+  // "Run-rate" basis indicators
+  const claimIsRunRate = cs.includes("run-rate") || cs.includes("run rate");
+  const modelIsRunRate = ml.includes("run-rate") || ml.includes("run rate");
+
+  // Incompatible pairs:
+  // Reported/Non-PF claim vs non-reported model figure (PEP, Adjusted, or unlabeled)
+  if (claimIsReported && !modelIsReported) return false;
+  // Non-reported claim vs reported model figure
+  if (!claimIsReported && modelIsReported) return false;
+
+  // PEP claim vs non-PEP model (or vice versa)
+  if (claimIsPep && !modelIsPep) return false;
+  if (!claimIsPep && modelIsPep) return false;
+
+  // Organic vs non-organic (if one explicitly says organic and the other doesn't)
+  if (claimIsOrganic && !modelIsOrganic) return false;
+  if (!claimIsOrganic && modelIsOrganic) return false;
+
+  // Run-rate vs non-run-rate
+  if (claimIsRunRate && !modelIsRunRate) return false;
+  if (!claimIsRunRate && modelIsRunRate) return false;
 
   return true;
 }
@@ -249,6 +307,7 @@ export async function runReconciliation(
   let unreconcilable_count = 0;
   let scope_mismatch_count = 0;
   let within_tolerance_count = 0;
+  let matching_error: string | null = null;
 
   // ----- Step 1: Filter to operating_metric claims only (reconcilable) -----
   const reconcilableClaims = ledger.claims.filter(c => c.claim_category === "operating_metric");
@@ -299,28 +358,56 @@ export async function runReconciliation(
   }
 
   // ----- Step 3: LLM proposes matches for reconcilable claims -----
+  // Batch claims to avoid exceeding Anthropic's context/token limits.
+  // With 200+ claims and 126 figures, a single prompt can hit ~100k tokens.
+  const MATCH_BATCH_SIZE = 50; // 50 claims per batch keeps prompt under 50k tokens
   if (reconcilableClaims.length > 0 && figures.length > 0) {
     const elapsed = Date.now() - phaseStart;
     if (elapsed < timeBudgetMs - 60_000) {
       try {
-        const matchPrompt = buildMatchingPrompt(reconcilableClaims, figures);
-        const response: LLMResponse = await callLLMWithHeadroom(
-          ctx,
-          {
-            model: SONNET_MODEL,
-            max_tokens: 8_192,
-            system: matchPrompt,
-            messages: [{ role: "user", content: "Match each claim to the model figures. Return only the JSON array." }],
-          },
-          "Reconciliation: match claims to model",
-          { pipelineStartTime, maxPerCallTimeout: 90_000, retries: 2 },
-        );
+        const allProposals: MatchProposal[] = [];
+        const batchCount = Math.ceil(reconcilableClaims.length / MATCH_BATCH_SIZE);
+        console.log(`[Reconciliation] Matching ${reconcilableClaims.length} claims in ${batchCount} batches of ${MATCH_BATCH_SIZE}`);
 
-        const proposals = parseMatchProposals(response.content[0]?.text ?? "");
-        console.log(`[Reconciliation] Got ${proposals.length} match proposals`);
+        for (let batchIdx = 0; batchIdx < batchCount; batchIdx++) {
+          const batchStart = batchIdx * MATCH_BATCH_SIZE;
+          const batchClaims = reconcilableClaims.slice(batchStart, batchStart + MATCH_BATCH_SIZE);
+
+          // Check time budget before each batch
+          const batchElapsed = Date.now() - phaseStart;
+          if (batchElapsed >= timeBudgetMs - 45_000) {
+            console.warn(`[Reconciliation] Time budget approaching limit — stopping after ${batchIdx}/${batchCount} batches`);
+            // Remaining claims become unreconcilable
+            const remainingClaims = reconcilableClaims.length - batchStart;
+            unreconcilable_count += remainingClaims;
+            break;
+          }
+
+          const matchPrompt = buildMatchingPrompt(batchClaims, figures);
+          const response: LLMResponse = await callLLMWithHeadroom(
+            ctx,
+            {
+              model: SONNET_MODEL,
+              max_tokens: 4_096,
+              system: matchPrompt,
+              messages: [{ role: "user", content: "Match each claim to the model figures. Return only the JSON array." }],
+            },
+            `Reconciliation: match batch ${batchIdx + 1}/${batchCount}`,
+            { pipelineStartTime, maxPerCallTimeout: 60_000, retries: 2 },
+          );
+
+          const batchProposals = parseMatchProposals(response.content[0]?.text ?? "");
+          // Adjust claim_index to be global (relative to full reconcilableClaims array)
+          for (const p of batchProposals) {
+            allProposals.push({ ...p, claim_index: p.claim_index + batchStart });
+          }
+          console.log(`[Reconciliation] Batch ${batchIdx + 1}: ${batchProposals.length} proposals`);
+        }
+
+        console.log(`[Reconciliation] Got ${allProposals.length} total match proposals`);
 
         // ----- Step 4: Code-verified delta computation -----
-        for (const proposal of proposals) {
+        for (const proposal of allProposals) {
           if (proposal.claim_index < 0 || proposal.claim_index >= reconcilableClaims.length) continue;
           const claim = reconcilableClaims[proposal.claim_index];
 
@@ -392,6 +479,32 @@ export async function runReconciliation(
                   `matched to model "${modelFig.name}" (inferred family: ${modelUnitFamily}). ` +
                   `Basis alignment check FAILED — rejecting to prevent fabricated divergence. ` +
                   `Coincidental scope string match is insufficient without genuine unit/basis agreement.`,
+                severity_anchor: null,
+                source_docs: [claim.source_doc],
+                claim,
+                model_figure: modelFig,
+                delta_abs: null,
+                delta_pct: null,
+              });
+              scope_mismatch_count++;
+              continue;
+            }
+
+            // ---- EBITDA-basis code guard ----
+            // Prevents "Reported / Non Pro Forma" EBITDA claims from matching
+            // PEP/management-case model figures. Targeted protection for £54.9m case.
+            if (!ebitdaBasisCompatible(claim, modelFig)) {
+              findings.push({
+                finding_kind: "scope_mismatch",
+                severity: "info",
+                title: `EBITDA basis mismatch: "${claim.scope_qualifier}" vs model "${modelFig.name}" — different reporting bases`,
+                detail: `Claim EBITDA basis ("${claim.scope_qualifier}") is incompatible with model figure basis ("${modelFig.name}"). ` +
+                  `Reported/Non-PF ≠ PEP/management case ≠ Organic ≠ Run-rate. ` +
+                  `These are different EBITDA families and cannot be compared.`,
+                full_analysis: `[EBITDA_BASIS_GUARD] Claim: "${claim.verbatim_snippet}" ` +
+                  `(scope: "${claim.scope_qualifier}") matched by LLM to model "${modelFig.name}" ` +
+                  `but EBITDA basis families are incompatible. ` +
+                  `Rejecting to prevent false divergence (e.g., £54.9m Non-PF vs £57m PEP = fake £2.1m gap).`,
                 severity_anchor: null,
                 source_docs: [claim.source_doc],
                 claim,
@@ -528,6 +641,7 @@ export async function runReconciliation(
         console.warn(`[Reconciliation] LLM matching failed: ${msg}`);
         // All reconcilable claims become unreconcilable on LLM failure
         unreconcilable_count += reconcilableClaims.length;
+        matching_error = msg;
       }
     } else {
       console.warn(`[Reconciliation] Skipped LLM matching — time budget exhausted`);
@@ -585,6 +699,7 @@ export async function runReconciliation(
     scope_mismatch_count,
     within_tolerance_count,
     cross_version_findings,
+    matching_error,
   };
 }
 
