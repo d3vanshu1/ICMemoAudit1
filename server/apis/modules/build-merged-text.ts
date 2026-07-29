@@ -35,6 +35,8 @@ export interface MergedFinding {
   category?: "principal_finding" | "housekeeping" | "human_review_flag";
   /** Severity anchor: the £ figure or source statement justifying the assigned severity (Fix 3 observability) */
   severity_anchor?: string;
+  /** Finding kind: data_divergence (numeric/cross-version), source_stated_risk, absence_claim, process_observation */
+  finding_kind?: "data_divergence" | "source_stated_risk" | "absence_claim" | "process_observation";
   verification?: {
     status: "revised" | "upheld";
     evidenceQuoted?: string;

@@ -2065,6 +2065,9 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
                     ? { independent: f.independent }
                     : {}),
                   ...(typeof f.severity_anchor === "string" ? { severity_anchor: f.severity_anchor } : {}),
+                  ...(f.finding_kind === "data_divergence" || f.finding_kind === "source_stated_risk" || f.finding_kind === "absence_claim" || f.finding_kind === "process_observation"
+                    ? { finding_kind: f.finding_kind as "data_divergence" | "source_stated_risk" | "absence_claim" | "process_observation" }
+                    : {}),
                 }));
               }
             } catch { /* parse failure — use empty findings */ }
@@ -2100,17 +2103,20 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
           // confidence or be capped at info. Gates on claim shape, not gap_type alone.
           const ABSENCE_PATTERNS = /\b(does not confirm|does not disclose|absent|not disclosed|missing|no mention|fails to address|not addressed|not confirmed|no evidence of|no reference to|omits?|silent on|does not discuss|not discussed)\b/i;
 
-          // Fix #2: Quantified data findings are exempt from the absence cap.
-          // A finding carrying a £/$  numeric delta in severity_anchor is a data
-          // divergence, not an absence claim — even if its prose mentions "does not
-          // confirm which version." Route these as principal data findings.
-          const QUANTIFIED_ANCHOR_PATTERN = /[£$€]\s*[\d.,]+|[\d.,]+\s*[£$€]|[−\-–]\s*[£$€]|[£$€]\s*[−\-–]/;
+          // Fix #2 (tightened): Data-divergence findings are exempt from the absence cap.
+          // Exemption requires EITHER:
+          //   (a) finding_kind === "data_divergence" (LLM-tagged at source), OR
+          //   (b) severity_anchor carries a delta signature: two currency values,
+          //       a signed delta (−£1.8m), or comparison words (vs/differs/higher/lower).
+          // A bare "£5.3m" does NOT qualify — it must show a comparison.
+          const DELTA_SIGNATURE_PATTERN = /([£$€][\d.,]+[kmbn]*\s*(vs|versus|\/|→|to)\s*[£$€][\d.,]+|[−\-–][£$€]\s*[\d.,]+|[£$€]\s*[−\-–]\s*[\d.,]+|\b(differs? by|lower than|higher than|exceeds.*by|shortfall of|gap of|delta of|revision of|decline of|increase of)\b.*[£$€])/i;
 
           for (const f of findings) {
-            // Exemption: quantified severity_anchor → data finding, skip absence cap
-            const hasQuantifiedAnchor = typeof (f as any).severity_anchor === "string" &&
-              QUANTIFIED_ANCHOR_PATTERN.test((f as any).severity_anchor);
-            if (hasQuantifiedAnchor) continue;
+            // Exemption: data_divergence finding_kind OR delta signature in anchor
+            const isDataDivergence = (f as any).finding_kind === "data_divergence";
+            const hasDeltaSignature = typeof (f as any).severity_anchor === "string" &&
+              DELTA_SIGNATURE_PATTERN.test((f as any).severity_anchor);
+            if (isDataDivergence || hasDeltaSignature) continue;
 
             // Original gap_type gate (backward compat)
             const hasAbsenceGapType = f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged";
