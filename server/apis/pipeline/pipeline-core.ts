@@ -65,6 +65,8 @@ import { runPostCompletionAudit } from "./post-completion-audit.js";
 import { runExtractionPhase } from "./extraction-phase.js";
 import { runDocTablesPhase } from "./doc-tables-phase.js";
 import { runNumericVerifyInline } from "./numeric-verify-inline.js";
+import { runClaimsExtraction, type ClaimsLedger } from "./claims-extraction.js";
+import { runReconciliation, type ReconciliationResult, type ReconciliationFinding } from "./claims-reconciliation.js";
 import { runCleanParsedTextPhase } from "./clean-parsed-text.js";
 import { runWebResearchPhase } from "./web-research-phase.js";
 import { upsertModuleOutput } from "../modules/upsert-module-output.js";
@@ -1349,6 +1351,54 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     }
   }
 
+  // --- Step 0.8: Claims-Reconciliation (contradiction_check only) ---
+  // Extracts structured claims from IC memos and reconciles against verified figures.
+  // Architecture: LLM classifies scope; CODE computes delta. No LLM-computed numbers.
+  let claimsReconciliation: ReconciliationResult | null = null;
+  if (moduleId === "contradiction_check") {
+    const claimsTimeBudget = Math.min(120_000, Math.max(0, timeRemaining() - 120_000));
+    if (claimsTimeBudget >= 60_000) {
+      try {
+        // Step 0.8a: Extract structured claims from IC memos
+        const claimsLedger: ClaimsLedger = await runClaimsExtraction(
+          ctx, dealId, startTime, claimsTimeBudget * 0.5
+        );
+
+        // Step 0.8b: Reconcile claims against verified figures
+        if (claimsLedger.claims.length > 0 && numericReport) {
+          const reconTimeBudget = Math.min(90_000, Math.max(0, timeRemaining() - 90_000));
+          if (reconTimeBudget >= 45_000) {
+            claimsReconciliation = await runReconciliation(
+              ctx,
+              claimsLedger,
+              numericReport.figures ?? [],
+              numericReport.discrepancies ?? [],
+              startTime,
+              reconTimeBudget,
+            );
+            console.log(
+              `[ClaimsReconciliation] ${claimsReconciliation.findings.length} findings ` +
+              `(${claimsReconciliation.reconciled_count} reconciled, ` +
+              `${claimsReconciliation.within_tolerance_count} within tolerance, ` +
+              `${claimsReconciliation.unreconcilable_count} unreconcilable)`
+            );
+          } else {
+            console.log(`[ClaimsReconciliation] Skipped reconciliation — insufficient time budget`);
+          }
+        } else if (claimsLedger.claims.length === 0) {
+          console.log(`[ClaimsReconciliation] No claims extracted — skipping reconciliation`);
+        } else {
+          console.log(`[ClaimsReconciliation] No numeric report available — skipping reconciliation`);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[ClaimsReconciliation] Failed (non-fatal): ${msg}`);
+      }
+    } else {
+      console.log(`[ClaimsReconciliation] Skipped — insufficient time budget (${claimsTimeBudget}ms)`);
+    }
+  }
+
   // --- Step 1: Load universal extractions + route ---
   // Page sizes tuned per table to stay under the 4MB gRPC response limit.
   // Row payload varies significantly: extraction_json ~2-4KB, result_json ~3-6KB,
@@ -1881,6 +1931,40 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // we have the full set from intermediate rounds to fall back on.
   let accumulatedFindings: MergedFinding[] = [];
   let accumulatedHousekeeping: MergedFinding[] = [];
+
+  // --- Pre-seed with claims-reconciliation findings (code-verified, bypass merge LLM) ---
+  // These findings are produced by Step 0.8's deterministic pipeline:
+  //   LLM classifies scope → code computes delta → finding emitted.
+  // They go directly into accumulatedFindings because they are already verified
+  // and should NOT be re-interpreted or contradicted by the merge LLM.
+if (claimsReconciliation && claimsReconciliation.findings.length > 0) {
+  const reconFindings: MergedFinding[] = claimsReconciliation.findings.map(rf => ({
+    title: rf.title,
+    severity: rf.severity,
+    detail: rf.detail,
+    full_analysis: rf.full_analysis,
+    source_docs: rf.source_docs,
+    category: (rf.finding_kind === "data_divergence" || rf.finding_kind === "cross_version")
+      ? "principal_finding" as const
+      : "housekeeping" as const,
+    numeric_unverified: false,
+    finding_kind: (rf.finding_kind === "cross_version" ? "data_divergence" : rf.finding_kind) as MergedFinding["finding_kind"],
+    severity_anchor: rf.severity_anchor != null ? `£${(rf.severity_anchor / 1_000_000).toFixed(1)}m` : undefined,
+  }));
+
+  // data_divergence and cross_version → findings; unreconcilable and scope_mismatch → housekeeping
+  for (const f of reconFindings) {
+    if (f.category === "principal_finding") {
+      accumulatedFindings.push(f);
+    } else {
+      accumulatedHousekeeping.push(f);
+    }
+  }
+  console.log(
+    `[ClaimsReconciliation] Pre-seeded ${accumulatedFindings.length} findings + ` +
+    `${accumulatedHousekeeping.length} housekeeping from reconciliation`
+  );
+}
 
   // Build numeric block for merge
   // Architecture: figures = trustworthy cell values (flag where narrative disagrees);
