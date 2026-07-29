@@ -44,6 +44,8 @@ import RunMigration006 from './pipeline/run-migration-006.js';
 import RunMigration007 from './pipeline/run-migration-007.js';
 import RunMigration009 from './pipeline/run-migration-009.js';
 import RunMigration010 from './pipeline/run-migration-010.js';
+import RunMigration011 from './pipeline/run-migration-011.js';
+import RunMigration012 from './pipeline/run-migration-012.js';
 import DiagTimeoutProbe from './pipeline/diag-timeout-probe.js';
 import ReadTimeoutProbeResult from './pipeline/read-timeout-probe-result.js';
 import ListTimeoutProbes from './pipeline/list-timeout-probes.js';
@@ -130,7 +132,7 @@ const apis = {
   AnalyzeChunk, UniversalExtract, MergeFindings, FormatReport, WebResearch,
   SaveModuleResult, LoadModuleResults, GetRunHistory, GetRunOutput,
   // Server-side pipeline
-  RunModulePipeline, ResumeStalePipelines, DiagnoseParsedText, CleanParsedTextDryRun, CountSheets, DiagnoseChunks, DiagnoseRuns, DiagnoseChunkCoverage, DiagnoseChunkDetail, DiagnoseRunEvidence, DiagnoseFindingTrace, DiagnoseExtractionRaw, ResetDealRun, ResetModuleMerge, RunMigration004, RunMigration005, RunMigration006, RunMigration007, RunMigration009, RunMigration010, DiagTimeoutProbe, ReadTimeoutProbeResult, ListTimeoutProbes, DiagMergeNodeSize, DiagRawFlagAggregate, DiagMergeFunnel, DiagPromptExport, ExportFindings, UnstickPool, ExtractReportChunk, DiagClaimsExtraction, DiagReconciliation,
+  RunModulePipeline, ResumeStalePipelines, DiagnoseParsedText, CleanParsedTextDryRun, CountSheets, DiagnoseChunks, DiagnoseRuns, DiagnoseChunkCoverage, DiagnoseChunkDetail, DiagnoseRunEvidence, DiagnoseFindingTrace, DiagnoseExtractionRaw, ResetDealRun, ResetModuleMerge, RunMigration004, RunMigration005, RunMigration006, RunMigration007, RunMigration009, RunMigration010, RunMigration011, RunMigration012, DiagTimeoutProbe, ReadTimeoutProbeResult, ListTimeoutProbes, DiagMergeNodeSize, DiagRawFlagAggregate, DiagMergeFunnel, DiagPromptExport, ExportFindings, UnstickPool, ExtractReportChunk, DiagClaimsExtraction, DiagReconciliation,
   // DB setup
   SetupSchema, RunCheckpointMigration, CreatePipelineTable, CheckSchemaHealth, AddConcurrentRunIndex,
   // Deals

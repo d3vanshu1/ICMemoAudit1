@@ -657,12 +657,15 @@ function cancelledResult(runId: string, gate: string): PipelineResult {
 /**
  * Marks a run as failed and persists the error message + phase into the DB.
  * Falls back gracefully if the error_message/error_phase columns don't exist yet.
+ * Also writes to integration-owned `pipeline_errors` table for post-mortem.
  */
 async function markRunFailed(
   db: PipelineContext["integrations"]["db"],
   runId: string,
   errorMessage: string,
-  errorPhase: string
+  errorPhase: string,
+  dealId?: string,
+  moduleId?: string
 ): Promise<void> {
   try {
     await db.execute(
@@ -682,6 +685,25 @@ async function markRunFailed(
       [runId],
       { label: `Mark run failed (legacy) — ${errorPhase}` }
     );
+  }
+
+  // Persist to integration-owned pipeline_errors table (best-effort)
+  try {
+    await db.execute(
+      `INSERT INTO pipeline_errors (run_id, deal_id, module_id, error_phase, error_message, error_stack)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        runId,
+        dealId ?? "00000000-0000-0000-0000-000000000000",
+        moduleId ?? "unknown",
+        errorPhase,
+        errorMessage.slice(0, 4000),
+        new Error().stack?.slice(0, 2000) ?? null,
+      ],
+      { label: `Persist error to pipeline_errors — ${errorPhase}` }
+    );
+  } catch {
+    // pipeline_errors table may not exist yet — non-fatal
   }
 }
 
@@ -1174,7 +1196,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     } else {
       // True fresh start with no checkpoints and no subject — fail
       const errMsg = "Cannot run this module without selecting a subject memo. Please choose the 'Memo(s) under review' before running.";
-      await markRunFailed(ctx.integrations.db, runId, errMsg, "no_subject_document");
+      await markRunFailed(ctx.integrations.db, runId, errMsg, "no_subject_document", dealId, moduleId);
       return {
         status: "failed",
         runId,
@@ -1190,7 +1212,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   } else if (subjectIds.length === 0) {
     // No runId (shouldn't happen in practice) — original guard
     const errMsg = "Cannot run this module without selecting a subject memo. Please choose the 'Memo(s) under review' before running.";
-    await markRunFailed(ctx.integrations.db, runId!, errMsg, "no_subject_document");
+    await markRunFailed(ctx.integrations.db, runId!, errMsg, "no_subject_document", dealId, moduleId);
     return {
       status: "failed",
       runId: runId!,
@@ -1220,7 +1242,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   const evidenceCount = evidenceCountRows[0]?.cnt ?? 0;
   if (evidenceCount === 0) {
     const errMsg = "Cannot run this module without at least one reference document in the evidence pool. Upload documents beyond the subject memo before running.";
-    await markRunFailed(ctx.integrations.db, runId!, errMsg, "no_evidence_documents");
+    await markRunFailed(ctx.integrations.db, runId!, errMsg, "no_evidence_documents", dealId, moduleId);
     return {
       status: "failed",
       runId: runId!,
@@ -1443,7 +1465,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
   if (routed.length === 0) {
     const errMsg = "No extraction chunks matched this module's document tags (check document tagging)";
-    await markRunFailed(ctx.integrations.db, runId!, errMsg, "routing");
+    await markRunFailed(ctx.integrations.db, runId!, errMsg, "routing", dealId, moduleId);
     return {
       status: "failed",
       runId: runId!,
@@ -1583,7 +1605,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
     console.log(`[pipeline] Created fresh run ${freshRunId} (replacing stale ${runId})`);
 
     // Mark the old run as failed with error capture
-    await markRunFailed(ctx.integrations.db, runId!, errMsg, "version_mismatch");
+    await markRunFailed(ctx.integrations.db, runId!, errMsg, "version_mismatch", dealId, moduleId);
 
     // Recurse with the new run_id (this is safe — it will enter the fresh-start path)
     return runPipelineCore(ctx, { ...input, runId: freshRunId });
@@ -1844,7 +1866,7 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
   if (analysisResults.length === 0) {
     const errMsg = firstError ?? "All chunks failed or no analysis results produced";
-    await markRunFailed(ctx.integrations.db, runId!, errMsg, "analysis");
+    await markRunFailed(ctx.integrations.db, runId!, errMsg, "analysis", dealId, moduleId);
     return {
       status: "failed",
       runId: runId!,

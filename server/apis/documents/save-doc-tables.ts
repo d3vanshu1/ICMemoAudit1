@@ -52,14 +52,18 @@ export default api({
       for (const table of batch) {
         await ctx.integrations.db.execute(
           `INSERT INTO doc_tables (document_id, sheet_or_page, caption, data)
-           VALUES ($1, $2, $3, $4)`,
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (document_id, sheet_or_page)
+           DO UPDATE SET caption = EXCLUDED.caption,
+                         data = EXCLUDED.data,
+                         created_at = now()`,
           [
             table.documentId,
             table.sheetOrPage,
             table.caption,
             JSON.stringify(table.data),
           ],
-          { label: `Save doc_table: ${table.sheetOrPage}` }
+          { label: `Upsert doc_table: ${table.sheetOrPage}` }
         );
         saved++;
       }
