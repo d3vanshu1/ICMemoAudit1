@@ -58,6 +58,7 @@
  */
 import { z } from "@superblocksteam/sdk-api";
 import { buildMergedText, type MergedFinding } from "../modules/build-merged-text.js";
+import { parseCanonicalFindings, ensureFindingIds, buildMergedFinding } from "./canonical-finding.js";
 import { NUMERIC_MODULES } from "../modules/constants.js";
 import { SUB_AGENT_PROMPTS } from "../modules/analyze-chunk.js";
 import { MERGE_PROMPTS, FINDINGS_RULE_FINAL, FINDINGS_RULE_INTERMEDIATE } from "../modules/merge-findings.js";
@@ -301,9 +302,10 @@ function appendReconciliationFindings(
       if (key) existingKeys.add(key);
     }
 
-    const codeVerifiedFindings: MergedFinding[] = claimsReconciliation.findings
+    const codeVerifiedFindings: MergedFinding[] = ensureFindingIds(claimsReconciliation.findings
       .filter(rf => rf.finding_kind === "data_divergence" || rf.finding_kind === "cross_version")
       .map(rf => ({
+        finding_id: "", // ensureFindingIds replaces empty strings with UUIDs
         title: rf.title,
         severity: rf.severity,
         detail: rf.detail,
@@ -313,7 +315,7 @@ function appendReconciliationFindings(
         numeric_unverified: false,
         finding_kind: (rf.finding_kind === "cross_version" ? "data_divergence" : rf.finding_kind) as MergedFinding["finding_kind"],
         severity_anchor: rf.severity_anchor != null ? `£${(rf.severity_anchor / 1_000_000).toFixed(1)}m` : undefined,
-      }));
+      })));
 
     // Remove LLM paraphrases: if code-verified finding has ≥2 £-amounts,
     // drop any existing finding that mentions the same set of amounts.
@@ -341,9 +343,10 @@ function appendReconciliationFindings(
     console.log(`[pipeline] Appended ${codeVerifiedFindings.length} code-verified reconciliation finding(s) to final report`);
 
     // --- Append reconciliation housekeeping (scope_mismatch, unreconcilable) ---
-    const reconHousekeeping: MergedFinding[] = claimsReconciliation.findings
+    const reconHousekeeping: MergedFinding[] = ensureFindingIds(claimsReconciliation.findings
       .filter(rf => rf.finding_kind === "scope_mismatch" || rf.finding_kind === "unreconcilable")
       .map(rf => ({
+        finding_id: "", // ensureFindingIds assigns a fresh UUID
         title: rf.title,
         severity: rf.severity,
         detail: rf.detail,
@@ -353,7 +356,7 @@ function appendReconciliationFindings(
         numeric_unverified: false,
         finding_kind: rf.finding_kind as MergedFinding["finding_kind"],
         severity_anchor: rf.severity_anchor != null ? `£${(rf.severity_anchor / 1_000_000).toFixed(1)}m` : undefined,
-      }));
+      })));
 
     if (reconHousekeeping.length > 0) {
       housekeepingFindings = [...housekeepingFindings, ...reconHousekeeping];
@@ -1542,8 +1545,17 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
             // ✅ Fast-path engaged: final merge node complete, no output yet → format directly
             console.log(`[pipeline:fast-path] Final merge node found at level ${topCheckpoint.tree_level}, skipping to formatting`);
 
-            // Reconstruct findings from the lightweight query (text is rebuilt from findings)
-            const findings = JSON.parse(topCheckpoint.findings_json) as MergedFinding[];
+            // Reconstruct findings from checkpoint — RC1: use canonical parser (mode=reload preserves UUIDs)
+            const fpRaw = JSON.parse(topCheckpoint.findings_json);
+            const fpParseResult = parseCanonicalFindings(fpRaw, {
+              mode: "reload",
+              source: `fast-path checkpoint L${topCheckpoint.tree_level}:N0 findings_json`,
+            });
+            if (fpParseResult.malformed_count > 0) {
+              console.error(`[pipeline:fast-path] ${fpParseResult.malformed_count} malformed findings in checkpoint — run may produce incomplete output`);
+            }
+            const findings = fpParseResult.findings;
+
             // Reconstruct housekeeping findings from checkpoint merged_json if available
             let fastPathHousekeeping: MergedFinding[] = [];
             try {
@@ -1554,7 +1566,12 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
                 { label: "Fast-path: load housekeeping from checkpoint" }
               );
               if (cpRow?.hk && Array.isArray(cpRow.hk)) {
-                fastPathHousekeeping = cpRow.hk as MergedFinding[];
+                // RC1: canonical parser for housekeeping reload
+                const hkReloadResult = parseCanonicalFindings(cpRow.hk, {
+                  mode: "reload",
+                  source: `fast-path checkpoint L${topCheckpoint.tree_level}:N0 housekeepingFindings`,
+                });
+                fastPathHousekeeping = hkReloadResult.findings;
               }
             } catch { /* non-fatal — proceed without housekeeping */ }
 
@@ -2973,35 +2990,21 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
           if (findingsRaw) {
             try {
               const parsed = JSON.parse(findingsRaw);
-              if (Array.isArray(parsed)) {
-                findings = parsed.map((f: Record<string, unknown>) => ({
-                  severity: (f.severity === "critical" || f.severity === "warning" || f.severity === "info") ? f.severity : "info",
-                  title: String(f.title ?? "Untitled"),
-                  detail: String(f.detail ?? ""),
-                  full_analysis: String(f.full_analysis ?? f.detail ?? ""),
-                  source_docs: Array.isArray(f.source_docs) ? f.source_docs.map(String) : [],
-                  ...(Array.isArray(f.claim_ids) && f.claim_ids.length > 0 ? { claim_ids: f.claim_ids.map(String) } : {}),
-                  ...(f.absence_confidence === "verified_absent" ||
-                    f.absence_confidence === "likely_absent" ||
-                    f.absence_confidence === "unverified"
-                    ? { absence_confidence: f.absence_confidence as string }
-                    : {}),
-                  ...(f.gap_type === "diligence_gap" || f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged"
-                    ? { gap_type: f.gap_type as "diligence_gap" | "memo_omission" | "open_item_acknowledged" }
-                    : {}),
-                  ...(Array.isArray(f.evidence_docs) && f.evidence_docs.length > 0
-                    ? { evidence_docs: f.evidence_docs.map(String) }
-                    : {}),
-                  ...(typeof f.independent === "boolean"
-                    ? { independent: f.independent }
-                    : {}),
-                  ...(typeof f.severity_anchor === "string" ? { severity_anchor: f.severity_anchor } : {}),
-                  ...(f.finding_kind === "data_divergence" || f.finding_kind === "source_stated_risk" || f.finding_kind === "absence_claim" || f.finding_kind === "process_observation"
-                    ? { finding_kind: f.finding_kind as "data_divergence" | "source_stated_risk" | "absence_claim" | "process_observation" }
-                    : {}),
-                }));
+              // RC1: use canonical parser — preserves ALL fields including finding_kind,
+              // severity_anchor, issue_key, structured_impact that the old .map() dropped.
+              const parseResult = parseCanonicalFindings(parsed, {
+                mode: "fresh",
+                source: `merge R${currentRound}:G${group.idx} findings_json`,
+                truncated,
+              });
+              findings = parseResult.findings;
+              if (parseResult.malformed_count > 0) {
+                console.warn(`[Merge][canonical-parser] ${parseResult.malformed_count} malformed findings at R${currentRound}:G${group.idx}`);
               }
-            } catch { /* parse failure — use empty findings */ }
+              if (parseResult.invalid.length > 0) {
+                console.warn(`[Merge][canonical-parser] ${parseResult.invalid.length} findings with field issues: ${parseResult.invalid.map(x => x.issues.join("; ")).join(" | ")}`);
+              }
+    } catch { /* parse failure — use empty findings */ }
           }
 
           // Fix #3: Code-derived source_docs from claim_id provenance.
@@ -3073,20 +3076,16 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
           if (housekeepingRaw) {
             try {
               const parsed = JSON.parse(housekeepingRaw);
-              if (Array.isArray(parsed)) {
-                housekeepingFindings = parsed.map((f: Record<string, unknown>) => ({
-                  severity: (f.severity === "critical" || f.severity === "warning" || f.severity === "info") ? f.severity : "info" as const,
-                  title: String(f.title ?? "Untitled"),
-                  detail: String(f.detail ?? ""),
-                  full_analysis: String(f.full_analysis ?? f.detail ?? ""),
-                  source_docs: Array.isArray(f.source_docs) ? f.source_docs.map(String) : [],
-                  ...(typeof f.materiality_rationale === "string" ? { materiality_rationale: f.materiality_rationale } : {}),
-                  ...(f.category === "housekeeping" || f.category === "human_review_flag"
-                    ? { category: f.category as string }
-                    : { category: "housekeeping" }),
-                  ...(typeof f.severity_anchor === "string" ? { severity_anchor: f.severity_anchor } : {}),
-                })) as MergedFinding[];
-              }
+              // RC1: canonical parser for housekeeping — same full schema, all fields preserved
+              const hkParseResult = parseCanonicalFindings(parsed, {
+                mode: "fresh",
+                source: `merge R${currentRound}:G${group.idx} housekeeping_appendix`,
+                truncated,
+              });
+              // Ensure all housekeeping findings have category set
+              housekeepingFindings = hkParseResult.findings.map(f =>
+                f.category ? f : { ...f, category: "housekeeping" as const }
+              );
             } catch { /* non-fatal */ }
           }
 

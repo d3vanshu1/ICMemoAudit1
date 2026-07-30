@@ -3,6 +3,7 @@ import { buildMergedText, type MergedFinding } from "./build-merged-text.js";
 import { NUMERIC_MODULES } from "./constants.js";
 import { getModuleModel } from "../pipeline/model-config.js";
 import { LEGAL_TAX_REGULATORY_SCOPE_BOUNDARY } from "./analyze-chunk.js";
+import { parseCanonicalFindings, type CanonicalFinding } from "../pipeline/canonical-finding.js";
 
 // ---------------------------------------------------------------------------
 // Integration
@@ -534,8 +535,8 @@ export default api({
 
   output: z.object({
     executiveHeader: z.string(),
-    findings: z.array(FindingSchema),
-    housekeepingFindings: z.array(FindingSchema).optional(),
+    findings: z.array(z.any()),
+    housekeepingFindings: z.array(z.any()).optional(),
     mergedText: z.string(),
   }),
 
@@ -664,135 +665,92 @@ No deterministic numeric verification was performed for this analysis. All figur
 
     const findingsRaw = extractTag(output, "findings_json");
 
-    let findings: Array<{
-      severity: "critical" | "warning" | "info";
-      title: string;
-      detail: string;
-      full_analysis: string;
-      source_docs: string[];
-      claim_ids?: string[];
-      absence_confidence?: string;
-      gap_type?: "diligence_gap" | "memo_omission" | "open_item_acknowledged";
-      evidence_docs?: string[];
-      independent?: boolean;
-      evidence?: Array<{ figure: string; source_doc: string; verbatim_snippet: string; verified: boolean }>;
-      materiality_rationale?: string;
-      category?: string;
-      numeric_unverified?: boolean;
-    }> = [];
+    // Determine if LLM output was truncated (max_tokens reached)
+    const wasTruncated = result.stop_reason === "max_tokens";
+
+    let findings: CanonicalFinding[] = [];
 
     if (findingsRaw) {
       try {
         const parsed = JSON.parse(findingsRaw);
-        if (Array.isArray(parsed)) {
-          findings = parsed.map((f: Record<string, unknown>) => {
-            // Enforce: numeric_unverified findings capped at info
-            const rawSeverity = f.severity === "critical" || f.severity === "warning" || f.severity === "info"
-              ? f.severity : "info";
-            const isNumericUnverified = f.numeric_unverified === true;
-            const severity = isNumericUnverified && rawSeverity !== "info" ? "info" as const : rawSeverity;
+        const parseResult = parseCanonicalFindings(parsed, {
+          mode: "fresh",
+          source: "merge-findings",
+          truncated: wasTruncated,
+        });
+        findings = parseResult.findings;
 
-            return {
-              severity,
-              title: String(f.title ?? "Untitled"),
-              detail: String(f.detail ?? ""),
-              full_analysis: String(f.full_analysis ?? f.detail ?? ""),
-              source_docs: Array.isArray(f.source_docs)
-                ? f.source_docs.map(String)
-                : [],
-              ...(Array.isArray(f.claim_ids) && f.claim_ids.length > 0
-                ? { claim_ids: f.claim_ids.map(String) }
-                : {}),
-              ...(f.absence_confidence === "verified_absent" ||
-                f.absence_confidence === "likely_absent" ||
-                f.absence_confidence === "unverified"
-                ? { absence_confidence: f.absence_confidence as string }
-                : {}),
-            ...(f.gap_type === "diligence_gap" || f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged"
-              ? { gap_type: f.gap_type as "diligence_gap" | "memo_omission" | "open_item_acknowledged" }
-              : {}),
-              ...(Array.isArray(f.evidence_docs) && f.evidence_docs.length > 0
-                ? { evidence_docs: f.evidence_docs.map(String) }
-                : {}),
-              ...(typeof f.independent === "boolean"
-                ? { independent: f.independent }
-                : {}),
-              // Fix 3: evidence trace array
-              ...(Array.isArray(f.evidence)
-                ? { evidence: (f.evidence as Array<Record<string, unknown>>).map(e => ({
-                    figure: String(e.figure ?? ""),
-                    source_doc: String(e.source_doc ?? ""),
-                    verbatim_snippet: String(e.verbatim_snippet ?? ""),
-                    verified: e.verified === true,
-                  })) }
-                : {}),
-              // Fix 4: materiality rationale
-              ...(typeof f.materiality_rationale === "string" && f.materiality_rationale
-                ? { materiality_rationale: f.materiality_rationale }
-                : {}),
-              // Fix 4/cross-cutting: category classification
-              ...(f.category === "principal_finding" || f.category === "housekeeping" || f.category === "human_review_flag"
-                ? { category: f.category as "principal_finding" | "housekeeping" | "human_review_flag" }
-                : {}),
-              // Fix 3: numeric_unverified flag
-              ...(isNumericUnverified ? { numeric_unverified: true } : {}),
-            };
-          });
+        if (parseResult.invalid.length > 0) {
+          console.warn(`[merge] ${parseResult.invalid.length} findings had field issues (kept with defaults)`);
+        }
+        if (parseResult.malformed_count > 0) {
+          console.error(`[merge] ${parseResult.malformed_count} findings were irrecoverably malformed`);
+        }
 
-          // CODE BACKSTOP: absence-verification gate — gates on claim shape,
-          // not gap_type alone. Any finding asserting absence without verified
-          // confidence is capped at info severity.
-          const ABSENCE_PATTERNS = /\b(does not confirm|does not disclose|absent|not disclosed|missing|no mention|fails to address|not addressed|not confirmed|no evidence of|no reference to|omits?|silent on|does not discuss|not discussed)\b/i;
+        // Business rule: numeric_unverified findings capped at info severity
+        for (const f of findings) {
+          if (f.numeric_unverified === true && f.severity !== "info") {
+            const original = f.severity;
+            (f as any).severity = "info";
+            console.log(`[Merge][NumCap] numeric_unverified cap: "${f.title}" | ${original} → info`);
+          }
+        }
 
-          for (const f of findings) {
-            const hasAbsenceGapType = f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged";
-            const assertsAbsence = !hasAbsenceGapType &&
-              (ABSENCE_PATTERNS.test(f.full_analysis || "") || ABSENCE_PATTERNS.test(f.detail || ""));
+        // CODE BACKSTOP: absence-verification gate — gates on claim shape,
+        // not gap_type alone. Any finding asserting absence without verified
+        // confidence is capped at info severity.
+        const ABSENCE_PATTERNS = /\b(does not confirm|does not disclose|absent|not disclosed|missing|no mention|fails to address|not addressed|not confirmed|no evidence of|no reference to|omits?|silent on|does not discuss|not discussed)\b/i;
 
-            if ((hasAbsenceGapType || assertsAbsence) && f.absence_confidence !== "verified_absent") {
-              if (!f.absence_confidence) {
-                (f as any).absence_confidence = "unverified";
-              }
-              if (f.severity === "critical" || f.severity === "warning") {
-                const original = f.severity;
-                (f as any).severity = "info";
-                console.log(`[Merge][FixA] Absence cap applied: "${f.title}" | ${original} → info`);
-              }
+        for (const f of findings) {
+          const hasAbsenceGapType = f.gap_type === "memo_omission" || f.gap_type === "open_item_acknowledged";
+          const assertsAbsence = !hasAbsenceGapType &&
+            (ABSENCE_PATTERNS.test(f.full_analysis || "") || ABSENCE_PATTERNS.test(f.detail || ""));
+
+          if ((hasAbsenceGapType || assertsAbsence) && f.absence_confidence !== "verified_absent") {
+            if (!f.absence_confidence) {
+              (f as any).absence_confidence = "unverified";
+            }
+            if (f.severity === "critical" || f.severity === "warning") {
+              const original = f.severity;
+              (f as any).severity = "info";
+              console.log(`[Merge][FixA] Absence cap applied: "${f.title}" | ${original} → info`);
             }
           }
         }
       } catch {
-        findings = [
-          {
-            severity: "info" as const,
-            title: "Analysis Complete",
-            detail: findingsRaw.slice(0, 300),
-            full_analysis: findingsRaw,
-            source_docs: [],
-          },
-        ];
+        findings = [{
+          finding_id: "", // Will be assigned below by ensureFindingIds-like logic in parseCanonicalFindings
+          severity: "info" as const,
+          title: "Analysis Complete",
+          detail: findingsRaw.slice(0, 300),
+          full_analysis: findingsRaw,
+          source_docs: [],
+        }] as unknown as CanonicalFinding[];
+        // Re-parse the single fallback item through canonical parser for UUID assignment
+        const fallbackResult = parseCanonicalFindings(
+          [{ severity: "info", title: "Analysis Complete", detail: findingsRaw.slice(0, 300), full_analysis: findingsRaw, source_docs: [] }],
+          { mode: "fresh", source: "merge-findings-fallback" }
+        );
+        findings = fallbackResult.findings;
       }
     }
 
     // Fix 6: Parse housekeeping appendix (sub-materiality + human_review_flag items)
     const housekeepingRaw = extractTag(output, "housekeeping_appendix");
-    let housekeepingFindings: typeof findings = [];
+    let housekeepingFindings: CanonicalFinding[] = [];
     if (housekeepingRaw) {
       try {
         const parsed = JSON.parse(housekeepingRaw);
-        if (Array.isArray(parsed)) {
-          housekeepingFindings = parsed.map((f: Record<string, unknown>) => ({
-            severity: f.severity === "critical" || f.severity === "warning" || f.severity === "info"
-              ? f.severity : "info" as const,
-            title: String(f.title ?? "Untitled"),
-            detail: String(f.detail ?? ""),
-            full_analysis: String(f.full_analysis ?? f.detail ?? ""),
-            source_docs: Array.isArray(f.source_docs) ? f.source_docs.map(String) : [],
-            ...(typeof f.materiality_rationale === "string" ? { materiality_rationale: f.materiality_rationale } : {}),
-            ...(f.category === "housekeeping" || f.category === "human_review_flag"
-              ? { category: f.category as string }
-              : { category: "housekeeping" as const }),
-          }));
+        const hkResult = parseCanonicalFindings(parsed, {
+          mode: "fresh",
+          source: "merge-findings-housekeeping",
+        });
+        housekeepingFindings = hkResult.findings;
+        // Ensure housekeeping items get category assigned if LLM omitted it
+        for (const f of housekeepingFindings) {
+          if (!f.category) {
+            (f as any).category = "housekeeping";
+          }
         }
       } catch {
         // Non-fatal: housekeeping parse failure doesn't break the pipeline
@@ -805,6 +763,11 @@ No deterministic numeric verification was performed for this analysis. All figur
     // byte-identical output.
     const mergedText = buildMergedText(executiveHeader, findings as MergedFinding[]);
 
-    return JSON.parse(JSON.stringify({ executiveHeader, findings, housekeepingFindings: housekeepingFindings.length > 0 ? housekeepingFindings : undefined, mergedText }));
+    return JSON.parse(JSON.stringify({
+      executiveHeader,
+      findings,
+      housekeepingFindings: housekeepingFindings.length > 0 ? housekeepingFindings : undefined,
+      mergedText,
+    }));
   },
 });

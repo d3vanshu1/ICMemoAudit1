@@ -1,15 +1,7 @@
 import { api, z, postgres } from "@superblocksteam/sdk-api";
+import { CanonicalFindingSchema, parseCanonicalFindings } from "../pipeline/canonical-finding.js";
 
 const IC_DILIGENCE_DB = "ba09e2b9-2715-4460-8131-896f50b0c414";
-
-const FindingSchema = z.object({
-  severity: z.enum(["critical", "warning", "info"]),
-  title: z.string(),
-  detail: z.string(),
-  full_analysis: z.string(),
-  source_docs: z.array(z.string()),
-  claim_ids: z.array(z.string()).optional(),
-});
 
 const RunOutputRowSchema = z.object({
   run_id: z.string(),
@@ -19,7 +11,7 @@ const RunOutputRowSchema = z.object({
   completed_at: z.string().nullable(),
   documents_included: z.any(), // TEXT[]
   executive_header: z.string().nullable(),
-  findings: z.any(), // JSONB
+  findings: z.any(), // JSONB — validated via canonical parser below
   full_report_markdown: z.string().nullable(),
 });
 
@@ -35,6 +27,8 @@ export default api({
     runId: z.string(),
   }),
 
+  // RC1: output uses CanonicalFindingSchema — all fields including finding_kind,
+  // severity_anchor, issue_key, structured_impact, evidence, etc.
   output: z.object({
     run: z.object({
       id: z.string(),
@@ -46,7 +40,7 @@ export default api({
     }).nullable(),
     output: z.object({
       executiveHeader: z.string(),
-      findings: z.array(FindingSchema),
+      findings: z.array(CanonicalFindingSchema),
       fullReport: z.string(),
     }).nullable(),
   }),
@@ -78,30 +72,19 @@ export default api({
 
     const row = rows[0];
 
-    // Parse findings from JSONB
-    let findings: Array<{
-      severity: "critical" | "warning" | "info";
-      title: string;
-      detail: string;
-      full_analysis: string;
-      source_docs: string[];
-    }> = [];
-
-    if (row.findings) {
+    // RC1: canonical parser — mode=reload (findings from DB already have finding_ids)
+    const findings = (() => {
+      if (!row.findings) return [];
       const raw = typeof row.findings === "string" ? JSON.parse(row.findings) : row.findings;
-      if (Array.isArray(raw)) {
-        findings = raw.map((f: Record<string, unknown>) => ({
-          severity:
-            f.severity === "critical" || f.severity === "warning" || f.severity === "info"
-              ? f.severity
-              : "info",
-          title: String(f.title ?? ""),
-          detail: String(f.detail ?? ""),
-          full_analysis: String(f.full_analysis ?? f.detail ?? ""),
-          source_docs: Array.isArray(f.source_docs) ? f.source_docs.map(String) : [],
-        }));
+      const result = parseCanonicalFindings(raw, {
+        mode: "reload",
+        source: `GetRunOutput run_id=${runId}`,
+      });
+      if (result.malformed_count > 0) {
+        console.error(`[GetRunOutput] ${result.malformed_count} malformed findings for run ${runId}`);
       }
-    }
+      return result.findings;
+    })();
 
     const docsIncluded = Array.isArray(row.documents_included)
       ? row.documents_included.map(String)

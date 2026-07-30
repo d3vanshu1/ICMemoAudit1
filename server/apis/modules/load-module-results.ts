@@ -1,15 +1,7 @@
 import { api, z, postgres } from "@superblocksteam/sdk-api";
+import { CanonicalFindingSchema, parseCanonicalFindings } from "../pipeline/canonical-finding.js";
 
 const IC_DILIGENCE_DB = "ba09e2b9-2715-4460-8131-896f50b0c414";
-
-const FindingSchema = z.object({
-  severity: z.enum(["critical", "warning", "info"]),
-  title: z.string(),
-  detail: z.string(),
-  full_analysis: z.string(),
-  source_docs: z.array(z.string()),
-  claim_ids: z.array(z.string()).optional(),
-});
 
 const ModuleStatusRowSchema = z.object({
   module_id: z.string(),
@@ -19,7 +11,7 @@ const ModuleStatusRowSchema = z.object({
   triggered_at: z.string(),
   completed_at: z.string().nullable(),
   executive_header: z.string().nullable(),
-  findings: z.any(), // JSONB — parsed below
+  findings: z.any(), // JSONB — validated via canonical parser below
   full_report_markdown: z.string().nullable(),
   output_created_at: z.string().nullable(),
 });
@@ -58,6 +50,7 @@ export default api({
     dealId: z.string(),
   }),
 
+  // RC1: output uses CanonicalFindingSchema — all fields preserved
   output: z.object({
     modules: z.array(
       z.object({
@@ -72,7 +65,7 @@ export default api({
         latestOutput: z
           .object({
             executiveHeader: z.string().nullable(),
-            findings: z.array(FindingSchema),
+            findings: z.array(CanonicalFindingSchema),
             fullReport: z.string(),
             createdAt: z.string(),
           })
@@ -104,30 +97,19 @@ export default api({
     }
 
     const modules = rows.map((row) => {
-      // Parse findings from JSONB
-      let findings: Array<{
-        severity: "critical" | "warning" | "info";
-        title: string;
-        detail: string;
-        full_analysis: string;
-        source_docs: string[];
-      }> = [];
-
-      if (row.findings) {
+      // RC1: canonical parser — mode=reload (findings from DB already have finding_ids)
+      const findings = (() => {
+        if (!row.findings) return [];
         const raw = typeof row.findings === "string" ? JSON.parse(row.findings) : row.findings;
-        if (Array.isArray(raw)) {
-          findings = raw.map((f: Record<string, unknown>) => ({
-            severity:
-              f.severity === "critical" || f.severity === "warning" || f.severity === "info"
-                ? f.severity
-                : "info",
-            title: String(f.title ?? ""),
-            detail: String(f.detail ?? ""),
-            full_analysis: String(f.full_analysis ?? f.detail ?? ""),
-            source_docs: Array.isArray(f.source_docs) ? f.source_docs.map(String) : [],
-          }));
+        const result = parseCanonicalFindings(raw, {
+          mode: "reload",
+          source: `LoadModuleResults module_id=${row.module_id} run_id=${row.run_id}`,
+        });
+        if (result.malformed_count > 0) {
+          console.error(`[LoadModuleResults] ${result.malformed_count} malformed findings for run ${row.run_id}`);
         }
-      }
+        return result.findings;
+      })();
 
       return {
         moduleId: row.module_id,

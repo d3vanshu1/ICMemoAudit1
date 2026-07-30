@@ -1,40 +1,23 @@
 /**
  * ExportFindings — permanent diagnostic API.
  *
- * Returns the final merge node's full findings array for a given runId,
- * plus a server-computed summary block (counts by severity, by gap_type,
- * total byte size). No writes, no LLM calls, no side effects.
+ * RC1: Now uses CanonicalFindingSchema at the output boundary — all finding fields
+ * preserved including finding_kind, severity_anchor, issue_key, structured_impact,
+ * evidence, verification, etc.
  *
- * The query uses the proven text-stripped pattern: `merged_json->'findings'`
- * (never fetches the `text` field), keeping responses safely under the 4MB
- * gRPC transport limit (~640KB for 350 findings).
+ * RC audit item #10 (§10 "persist one canonical post-quality artifact"):
+ * Primary source is module_outputs.findings (post-quality-pass canonical artifact).
+ * Falls back to merge_checkpoints only when module_outputs has no row (run incomplete).
+ * The fallback source is clearly flagged as pre-quality in the response.
  *
  * Pagination: `offset` + `limit` params let callers page through findings.
  * `severityFilter` applies BEFORE pagination (filter → slice).
  * Summary block always reflects the full unfiltered set.
  */
 import { api, z, postgres } from "@superblocksteam/sdk-api";
+import { CanonicalFindingSchema, parseCanonicalFindings } from "./canonical-finding.js";
 
 const IC_DILIGENCE_DB = "ba09e2b9-2715-4460-8131-896f50b0c414";
-
-const FindingSchema = z.object({
-  severity: z.enum(["critical", "warning", "info"]),
-  title: z.string(),
-  detail: z.string(),
-  full_analysis: z.string(),
-  source_docs: z.array(z.string()),
-  claim_ids: z.array(z.string()).optional(),
-  absence_confidence: z.string().optional(),
-  gap_type: z.enum(["diligence_gap", "memo_omission"]).optional(),
-  evidence_docs: z.array(z.string()).optional(),
-  independent: z.boolean().optional(),
-  verification: z.object({
-    status: z.enum(["revised", "upheld"]),
-    evidenceQuoted: z.string().optional(),
-    evidenceSource: z.string().optional(),
-    queriesRun: z.array(z.string()),
-  }).optional(),
-});
 
 const SummarySchema = z.object({
   totalCount: z.number(),
@@ -50,11 +33,13 @@ const SummarySchema = z.object({
     unclassified: z.number(),
   }),
   treeLevel: z.number(),
+  /** true = findings came from post-quality module_outputs; false = fell back to raw merge checkpoint */
+  fromCanonicalArtifact: z.boolean(),
 });
 
 export default api({
   name: "ExportFindings",
-  description: "Exports final merge node findings with pagination and severity/category summary",
+  description: "Exports final findings (post-quality artifact) with pagination and severity/category summary",
 
   integrations: {
     db: postgres(IC_DILIGENCE_DB),
@@ -76,10 +61,9 @@ export default api({
     offset: z.number(),
     returnedCount: z.number().describe("Number of findings in this page"),
     byteLength: z.number().describe("Byte length of the findings JSON in this response"),
-    findings: z.array(FindingSchema),
+    findings: z.array(CanonicalFindingSchema),
     summary: SummarySchema.describe("Always computed from the FULL unfiltered set"),
     filtered: z.boolean(),
-    // mode:"ids" fields — null when mode is "full"
     idManifest: z.object({
       generatedAt: z.string(),
       totalCount: z.number(),
@@ -95,25 +79,72 @@ export default api({
     const mode = rawMode ?? "full";
     const offset = rawOffset ?? 0;
 
-    // Fetch the final merge node's findings array (text-stripped by construction)
-    const RawRow = z.object({
-      tree_level: z.coerce.number(),
-      findings_json: z.string(),
+    // --- RC1/RC10: Primary source = module_outputs (canonical post-quality artifact) ---
+    const CanonicalOutputRow = z.object({
+      findings: z.any(),
       findings_bytes: z.coerce.number(),
+      from_canonical: z.literal(true),
+      tree_level: z.literal(-1),
     });
 
-    const [row] = await ctx.integrations.db.query(
-      `SELECT tree_level,
-              COALESCE(merged_json->'findings', '[]'::jsonb)::text AS findings_json,
-              octet_length(COALESCE(merged_json->'findings', '[]'::jsonb)::text) AS findings_bytes
-       FROM merge_checkpoints
-       WHERE module_run_id = $1
-       ORDER BY tree_level DESC, node_index ASC
-       LIMIT 1`,
-      RawRow,
-      [runId],
-      { label: "ExportFindings: fetch final merge node findings" }
-    );
+    const FallbackRow = z.object({
+      findings: z.any(),
+      findings_bytes: z.coerce.number(),
+      from_canonical: z.literal(false),
+      tree_level: z.coerce.number(),
+    });
+
+    type ExportRow = {
+      findings: unknown;
+      findings_bytes: number;
+      from_canonical: boolean;
+      tree_level: number;
+    };
+
+    let row: ExportRow | null = null;
+
+    // Try canonical artifact first
+    try {
+      const canonRows = await ctx.integrations.db.query(
+        `SELECT mo.findings,
+                octet_length(mo.findings::text) AS findings_bytes,
+                true AS from_canonical,
+                -1 AS tree_level
+         FROM module_outputs mo
+         WHERE mo.module_run_id = $1
+         LIMIT 1`,
+        CanonicalOutputRow,
+        [runId],
+        { label: "ExportFindings: fetch canonical artifact from module_outputs" }
+      );
+      if (canonRows.length > 0) {
+        const cr = canonRows[0];
+        row = { findings: cr.findings, findings_bytes: cr.findings_bytes, from_canonical: true, tree_level: -1 };
+      }
+    } catch {
+      // module_outputs may not have a row — fall through to checkpoint fallback
+    }
+
+    // Fallback: pre-quality merge checkpoint (flagged in response)
+    if (!row) {
+      const cpRows = await ctx.integrations.db.query(
+        `SELECT COALESCE(merged_json->'findings', '[]'::jsonb) AS findings,
+                octet_length(COALESCE(merged_json->'findings', '[]'::jsonb)::text) AS findings_bytes,
+                false AS from_canonical,
+                tree_level
+         FROM merge_checkpoints
+         WHERE module_run_id = $1
+         ORDER BY tree_level DESC, node_index ASC
+         LIMIT 1`,
+        FallbackRow,
+        [runId],
+        { label: "ExportFindings: fallback to merge checkpoint" }
+      );
+      if (cpRows.length > 0) {
+        const cr = cpRows[0];
+        row = { findings: cr.findings, findings_bytes: cr.findings_bytes, from_canonical: false, tree_level: cr.tree_level };
+      }
+    }
 
     if (!row) {
       return {
@@ -121,7 +152,7 @@ export default api({
         totalCount: 0,
         offset: 0,
         returnedCount: 0,
-        byteLength: 2, // "[]"
+        byteLength: 2,
         findings: [],
         summary: {
           totalCount: 0,
@@ -129,23 +160,32 @@ export default api({
           bySeverity: { critical: 0, warning: 0, info: 0 },
           byGapType: { diligence_gap: 0, memo_omission: 0, unclassified: 0 },
           treeLevel: -1,
+          fromCanonicalArtifact: false,
         },
         filtered: false,
       };
     }
 
-    // Parse the findings JSON
-    const allFindings: Array<z.infer<typeof FindingSchema>> = JSON.parse(row.findings_json);
+    // RC1: canonical parser
+    const rawFindings = typeof row.findings === "string"
+      ? JSON.parse(row.findings)
+      : row.findings;
+    const parseResult = parseCanonicalFindings(rawFindings, {
+      mode: "reload",
+      source: `ExportFindings run_id=${runId} canonical=${row.from_canonical}`,
+    });
+    if (parseResult.malformed_count > 0) {
+      console.error(`[ExportFindings] ${parseResult.malformed_count} malformed findings for run ${runId}`);
+    }
+    const allFindings = parseResult.findings;
 
-    // Compute summary from the FULL set (before any filter)
+    // Compute summary from the FULL set (before filter)
     const bySeverity = { critical: 0, warning: 0, info: 0 };
     const byGapType = { diligence_gap: 0, memo_omission: 0, unclassified: 0 };
-
     for (const f of allFindings) {
       if (f.severity === "critical") bySeverity.critical++;
       else if (f.severity === "warning") bySeverity.warning++;
       else bySeverity.info++;
-
       if (f.gap_type === "diligence_gap") byGapType.diligence_gap++;
       else if (f.gap_type === "memo_omission") byGapType.memo_omission++;
       else byGapType.unclassified++;
@@ -157,21 +197,19 @@ export default api({
       bySeverity,
       byGapType,
       treeLevel: row.tree_level,
+      fromCanonicalArtifact: row.from_canonical,
     };
 
-    // --- mode: "ids" — lightweight manifest only ---
+    // --- mode: "ids" ---
     if (mode === "ids") {
       const buckets: Record<string, string[]> = { critical: [], warning: [], info: [] };
       for (const f of allFindings) {
         buckets[f.severity]?.push(f.title);
       }
-      // Sort each bucket alphabetically for deterministic comparison
-      for (const key of Object.keys(buckets)) {
-        buckets[key].sort();
-      }
-      const criticalJson = JSON.stringify(buckets.critical);
-      const warningJson = JSON.stringify(buckets.warning);
-      const infoJson = JSON.stringify(buckets.info);
+      for (const key of Object.keys(buckets)) buckets[key].sort();
+      const cJ = JSON.stringify(buckets.critical);
+      const wJ = JSON.stringify(buckets.warning);
+      const iJ = JSON.stringify(buckets.info);
 
       return {
         runId,
@@ -179,30 +217,27 @@ export default api({
         offset: 0,
         returnedCount: 0,
         byteLength: 0,
-        findings: [] as Array<z.infer<typeof FindingSchema>>,
+        findings: [],
         summary,
         filtered: false,
         idManifest: {
           generatedAt: new Date().toISOString(),
           totalCount: allFindings.length,
           bySeverity: {
-            critical: { count: buckets.critical.length, titles: buckets.critical, byteLength: Buffer.byteLength(criticalJson, "utf8") },
-            warning: { count: buckets.warning.length, titles: buckets.warning, byteLength: Buffer.byteLength(warningJson, "utf8") },
-            info: { count: buckets.info.length, titles: buckets.info, byteLength: Buffer.byteLength(infoJson, "utf8") },
+            critical: { count: buckets.critical.length, titles: buckets.critical, byteLength: Buffer.byteLength(cJ, "utf8") },
+            warning: { count: buckets.warning.length, titles: buckets.warning, byteLength: Buffer.byteLength(wJ, "utf8") },
+            info: { count: buckets.info.length, titles: buckets.info, byteLength: Buffer.byteLength(iJ, "utf8") },
           },
         },
       };
     }
 
-    // --- mode: "full" (default) ---
-    // Apply severity filter if requested (BEFORE pagination)
+    // --- mode: "full" ---
     const filteredFindings = severityFilter
       ? allFindings.filter(f => f.severity === severityFilter)
       : allFindings;
 
     const totalCount = filteredFindings.length;
-
-    // Apply pagination
     const pageFindings = rawLimit != null
       ? filteredFindings.slice(offset, offset + rawLimit)
       : filteredFindings.slice(offset);
