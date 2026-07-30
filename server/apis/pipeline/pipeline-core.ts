@@ -104,6 +104,102 @@ const FORMAT_REPORT_MODEL = SONNET_MODEL; // Always Sonnet — report formatting
 const WEB_RESEARCH_MODULES = new Set(["external_risk_overlay", "social_reputation"]);
 
 // ---------------------------------------------------------------------------
+// Mode-B Shared Helper: Append code-verified reconciliation findings
+// ---------------------------------------------------------------------------
+// Called from both main-path (post-merge) and fast-path (format-on-resume).
+// Mutates finalFindings in-place: appends code-verified findings from reconciliation,
+// deduplicates against LLM paraphrases (by matching £-amounts), and concatenates
+// housekeeping findings. Must be called AFTER fabricated-arithmetic suppression so
+// reconciliation findings bypass that filter entirely.
+interface AppendReconResult {
+  finalFindings: MergedFinding[];
+  housekeepingFindings: MergedFinding[];
+}
+
+function appendReconciliationFindings(
+  finalFindings: MergedFinding[],
+  housekeepingFindings: MergedFinding[],
+  claimsReconciliation: ReconciliationResult | null,
+): AppendReconResult {
+  // --- Append code-verified reconciliation principal findings ---
+  if (claimsReconciliation && claimsReconciliation.findings.length > 0) {
+    const existingKeys = new Set<string>();
+    for (const f of finalFindings) {
+      const key = (f.title || "").toLowerCase().trim().replace(/\s+/g, " ");
+      if (key) existingKeys.add(key);
+    }
+
+    const codeVerifiedFindings: MergedFinding[] = claimsReconciliation.findings
+      .filter(rf => rf.finding_kind === "data_divergence" || rf.finding_kind === "cross_version")
+      .map(rf => ({
+        title: rf.title,
+        severity: rf.severity,
+        detail: rf.detail,
+        full_analysis: rf.full_analysis,
+        source_docs: rf.source_docs,
+        category: "principal_finding" as const,
+        numeric_unverified: false,
+        finding_kind: (rf.finding_kind === "cross_version" ? "data_divergence" : rf.finding_kind) as MergedFinding["finding_kind"],
+        severity_anchor: rf.severity_anchor != null ? `£${(rf.severity_anchor / 1_000_000).toFixed(1)}m` : undefined,
+      }));
+
+    // Remove LLM paraphrases: if code-verified finding has ≥2 £-amounts,
+    // drop any existing finding that mentions the same set of amounts.
+    let llmDropped = 0;
+    for (const cvf of codeVerifiedFindings) {
+      const cvKey = (cvf.title || "").toLowerCase().trim().replace(/\s+/g, " ");
+      const cvAmounts = cvf.detail.match(/£[\d,.]+m/g) ?? [];
+      if (cvAmounts.length >= 2) {
+        const beforeLen = finalFindings.length;
+        finalFindings = finalFindings.filter(f => {
+          const fText = `${f.title} ${f.detail}`;
+          return !cvAmounts.every(amt => fText.includes(amt));
+        });
+        llmDropped += beforeLen - finalFindings.length;
+      }
+      if (!existingKeys.has(cvKey)) {
+        finalFindings.push(cvf);
+        existingKeys.add(cvKey);
+      }
+    }
+
+    if (llmDropped > 0) {
+      console.log(`[pipeline] Replaced ${llmDropped} LLM-paraphrased finding(s) with code-verified versions`);
+    }
+    console.log(`[pipeline] Appended ${codeVerifiedFindings.length} code-verified reconciliation finding(s) to final report`);
+
+    // --- Append reconciliation housekeeping (scope_mismatch, unreconcilable) ---
+    const reconHousekeeping: MergedFinding[] = claimsReconciliation.findings
+      .filter(rf => rf.finding_kind === "scope_mismatch" || rf.finding_kind === "unreconcilable")
+      .map(rf => ({
+        title: rf.title,
+        severity: rf.severity,
+        detail: rf.detail,
+        full_analysis: rf.full_analysis,
+        source_docs: rf.source_docs,
+        category: "housekeeping" as const,
+        numeric_unverified: false,
+        finding_kind: rf.finding_kind as MergedFinding["finding_kind"],
+        severity_anchor: rf.severity_anchor != null ? `£${(rf.severity_anchor / 1_000_000).toFixed(1)}m` : undefined,
+      }));
+
+    if (reconHousekeeping.length > 0) {
+      housekeepingFindings = [...housekeepingFindings, ...reconHousekeeping];
+      const seen = new Set<string>();
+      housekeepingFindings = housekeepingFindings.filter(f => {
+        const key = (f.title || "").toLowerCase().trim().replace(/\s+/g, " ");
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      console.log(`[pipeline] Appended ${reconHousekeeping.length} reconciliation housekeeping finding(s)`);
+    }
+  }
+
+  return { finalFindings, housekeepingFindings };
+}
+
+// ---------------------------------------------------------------------------
 // Chunk Routing (server-side mirror of client/lib/chunkRouting.ts)
 // ---------------------------------------------------------------------------
 const MODULE_TAG_RELEVANCE: Record<string, Set<string>> = {
@@ -1023,6 +1119,32 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
             if (suppressedCount > 0) {
               console.log(`[pipeline:fast-path] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
             }
+
+            // --- Mode-B Fix (fast-path): Load reconciliation checkpoint and append ---
+            // On resumed runs, claimsReconciliation is not in memory. Load from checkpoint.
+            let fastPathRecon: ReconciliationResult | null = null;
+            if (moduleId === "contradiction_check") {
+              try {
+                const reconCpRows = await ctx.integrations.db.query(
+                  `SELECT payload FROM pipeline_checkpoints
+                   WHERE module_run_id = $1 AND checkpoint_key = 'reconciliation'`,
+                  z.object({ payload: z.any() }),
+                  [runId],
+                  { label: "Fast-path: load reconciliation checkpoint" }
+                );
+                if (reconCpRows.length > 0 && reconCpRows[0].payload) {
+                  fastPathRecon = reconCpRows[0].payload as ReconciliationResult;
+                  console.log(`[pipeline:fast-path] Loaded reconciliation checkpoint: ${fastPathRecon.findings.length} findings`);
+                }
+              } catch {
+                // pipeline_checkpoints may not exist — proceed without
+              }
+            }
+
+            // Apply shared Mode-B append + dedup (same logic as main path)
+            const reconAppendResult = appendReconciliationFindings(finalFindings, fastPathHousekeeping, fastPathRecon);
+            finalFindings = reconAppendResult.finalFindings;
+            fastPathHousekeeping = reconAppendResult.housekeepingFindings;
 
             // Deterministic independent override (same logic as Step 5.7)
             for (const f of finalFindings) {
@@ -2157,40 +2279,6 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   let accumulatedFindings: MergedFinding[] = [];
   let accumulatedHousekeeping: MergedFinding[] = [];
 
-  // --- Pre-seed with claims-reconciliation findings (code-verified, bypass merge LLM) ---
-  // These findings are produced by Step 0.8's deterministic pipeline:
-  //   LLM classifies scope → code computes delta → finding emitted.
-  // They go directly into accumulatedFindings because they are already verified
-  // and should NOT be re-interpreted or contradicted by the merge LLM.
-if (claimsReconciliation && claimsReconciliation.findings.length > 0) {
-  const reconFindings: MergedFinding[] = claimsReconciliation.findings.map(rf => ({
-    title: rf.title,
-    severity: rf.severity,
-    detail: rf.detail,
-    full_analysis: rf.full_analysis,
-    source_docs: rf.source_docs,
-    category: (rf.finding_kind === "data_divergence" || rf.finding_kind === "cross_version")
-      ? "principal_finding" as const
-      : "housekeeping" as const,
-    numeric_unverified: false,
-    finding_kind: (rf.finding_kind === "cross_version" ? "data_divergence" : rf.finding_kind) as MergedFinding["finding_kind"],
-    severity_anchor: rf.severity_anchor != null ? `£${(rf.severity_anchor / 1_000_000).toFixed(1)}m` : undefined,
-  }));
-
-  // data_divergence and cross_version → findings; unreconcilable and scope_mismatch → housekeeping
-  for (const f of reconFindings) {
-    if (f.category === "principal_finding") {
-      accumulatedFindings.push(f);
-    } else {
-      accumulatedHousekeeping.push(f);
-    }
-  }
-  console.log(
-    `[ClaimsReconciliation] Pre-seeded ${accumulatedFindings.length} findings + ` +
-    `${accumulatedHousekeeping.length} housekeeping from reconciliation`
-  );
-}
-
   // Build numeric block for merge
   // Architecture: figures = trustworthy cell values (flag where narrative disagrees);
   //               discrepancies = cross-agreement only (live vs frozen reference sheet).
@@ -2728,63 +2816,10 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
   }
 
   // --- Mode-B Fix: Append code-verified reconciliation findings AFTER suppression ---
-  // These findings are produced by Step 0.8's deterministic pipeline (LLM classifies
-  // scope → code computes delta). They must never be dropped by the merge LLM's output
-  // overwriting accumulatedFindings, and must never be suppressed by FABRICATED_ARITHMETIC_PATTERNS.
-  // Dedup: if the merge LLM also emitted a finding for the same (metric, period, scope),
-  // keep the code-verified version (from reconciliation), drop the LLM paraphrase.
-  if (claimsReconciliation && claimsReconciliation.findings.length > 0) {
-    // Build a key set of what's already in finalFindings for dedup
-    const existingKeys = new Set<string>();
-    for (const f of finalFindings) {
-      const key = (f.title || "").toLowerCase().trim().replace(/\s+/g, " ");
-      if (key) existingKeys.add(key);
-    }
-
-    // Collect code-verified findings that the merge LLM might have paraphrased
-    const codeVerifiedFindings: MergedFinding[] = claimsReconciliation.findings
-      .filter(rf => rf.finding_kind === "data_divergence" || rf.finding_kind === "cross_version")
-      .map(rf => ({
-        title: rf.title,
-        severity: rf.severity,
-        detail: rf.detail,
-        full_analysis: rf.full_analysis,
-        source_docs: rf.source_docs,
-        category: "principal_finding" as const,
-        numeric_unverified: false,
-        finding_kind: (rf.finding_kind === "cross_version" ? "data_divergence" : rf.finding_kind) as MergedFinding["finding_kind"],
-        severity_anchor: rf.severity_anchor != null ? `£${(rf.severity_anchor / 1_000_000).toFixed(1)}m` : undefined,
-      }));
-
-    // Remove any LLM-emitted finding that overlaps with a code-verified one
-    // (by checking if the code-verified title or key metric/period appears in the LLM version)
-    let llmDropped = 0;
-    for (const cvf of codeVerifiedFindings) {
-      const cvKey = (cvf.title || "").toLowerCase().trim().replace(/\s+/g, " ");
-      // Check for LLM paraphrases: same metric amounts or same period references
-      const cvAmounts = cvf.detail.match(/£[\d,.]+m/g) ?? [];
-      if (cvAmounts.length >= 2) {
-        // Remove any existing finding that mentions the same pair of amounts (LLM paraphrase)
-        const beforeLen = finalFindings.length;
-        finalFindings = finalFindings.filter(f => {
-          const fText = `${f.title} ${f.detail}`;
-          const matchesAll = cvAmounts.every(amt => fText.includes(amt));
-          return !matchesAll;
-        });
-        llmDropped += beforeLen - finalFindings.length;
-      }
-      // Exact title dedup
-      if (!existingKeys.has(cvKey)) {
-        finalFindings.push(cvf);
-        existingKeys.add(cvKey);
-      }
-    }
-
-    if (llmDropped > 0) {
-      console.log(`[pipeline] Replaced ${llmDropped} LLM-paraphrased finding(s) with code-verified versions`);
-    }
-    console.log(`[pipeline] Appended ${codeVerifiedFindings.length} code-verified reconciliation finding(s) to final report`);
-  }
+  // Uses the shared helper so main-path and fast-path can never drift.
+  const mainPathReconResult = appendReconciliationFindings(finalFindings, finalHousekeepingFindings, claimsReconciliation);
+  finalFindings = mainPathReconResult.finalFindings;
+  finalHousekeepingFindings = mainPathReconResult.housekeepingFindings;
 
   // === CANCEL GATE: pre-absence-verification ===
   if (await checkCancelled(ctx, runId, "pre_absence_verification")) return cancelledResult(runId, "pre_absence_verification");
