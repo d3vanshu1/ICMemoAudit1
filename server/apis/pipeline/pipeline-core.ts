@@ -372,6 +372,293 @@ function appendReconciliationFindings(
 }
 
 // ---------------------------------------------------------------------------
+// Shared post-merge pipeline: runs identically in main-path and fast-path.
+// Order: suppression → Layer-1 numeric validation → consolidation →
+//        reconciliation append → independent override → materiality gate.
+// ---------------------------------------------------------------------------
+interface PostMergePipelineInput {
+  findings: MergedFinding[];
+  housekeepingFindings: MergedFinding[];
+  numericReport: { figures: any[]; discrepancies: any[] } | null;
+  claimsReconciliation: ReconciliationResult | null;
+  fileTagMap: Map<string, string>;
+}
+
+interface PostMergePipelineResult {
+  findings: MergedFinding[];
+  housekeepingFindings: MergedFinding[];
+}
+
+async function runPostMergePipeline(input: PostMergePipelineInput): Promise<PostMergePipelineResult> {
+  let { findings, housekeepingFindings } = input;
+  const { numericReport, claimsReconciliation, fileTagMap } = input;
+
+  // === Stage 1: FABRICATED_ARITHMETIC suppression ===
+  const { FABRICATED_ARITHMETIC_PATTERNS } = await import("./fabricated-arithmetic-patterns.js");
+  const preSuppressCount = findings.length;
+  findings = findings.filter(f => {
+    const text = `${f.title} ${f.detail} ${f.full_analysis}`;
+    return !FABRICATED_ARITHMETIC_PATTERNS.some(pat => pat.test(text));
+  });
+  const suppressedCount = preSuppressCount - findings.length;
+  if (suppressedCount > 0) {
+    console.log(`[pipeline:postMerge] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
+  }
+
+  // === Stage 2: Layer-1 Numeric Divergence Validation (Defect 5) ===
+  if (numericReport && numericReport.figures.length > 0) {
+    const verifiedFigureLookup = new Map<string, string>();
+    for (const fig of numericReport.figures as Array<Record<string, unknown>>) {
+      const name = String(fig.name ?? "").toLowerCase().trim();
+      const period = String(fig.period ?? "").toLowerCase().trim();
+      if (name && period) {
+        verifiedFigureLookup.set(`${name}|||${period}`, String(fig.value ?? ""));
+      }
+    }
+
+    const normalizeNumericForLookup = (val: unknown): string | null => {
+      if (val == null) return null;
+      const s = String(val).replace(/[$£€%,\s]/g, "").trim();
+      return s.length > 0 ? s : null;
+    };
+
+    const extractNumericFigures = (text: string): string[] => {
+      const patterns = text.match(/[$£€]?\d[\d,]*\.?\d*[MmBbKk%]?/g);
+      return patterns ? [...new Set(patterns)] : [];
+    };
+
+    let numDivDemotedCount = 0;
+    findings = findings.map(f => {
+      if (f.finding_kind !== "data_divergence") return f;
+      if (f.numeric_unverified === false) return f;
+
+      let citedFigures: Array<{ value: string; source_doc?: string; metric?: string; period?: string }> = [];
+      if (f.evidence && f.evidence.length > 0) {
+        citedFigures = f.evidence.map(e => ({
+          value: e.figure,
+          source_doc: e.source_doc,
+          metric: (e as Record<string, unknown>).metric as string | undefined,
+          period: (e as Record<string, unknown>).period as string | undefined,
+        }));
+      } else {
+        const allText = `${f.title} ${f.detail}`;
+        citedFigures = extractNumericFigures(allText).map(v => ({ value: v }));
+      }
+
+      if (citedFigures.length === 0) return f;
+
+      let resolvedCount = 0;
+      let unresolvedCount = 0;
+      const resolvedPeriods: string[] = [];
+      const resolvedMetrics: string[] = [];
+
+      for (const cited of citedFigures) {
+        let matched = false;
+
+        if (cited.metric && cited.period) {
+          const coordKey = `${cited.metric.toLowerCase().trim()}|||${cited.period.toLowerCase().trim()}`;
+          if (verifiedFigureLookup.has(coordKey)) {
+            const [metric, period] = coordKey.split("|||");
+            resolvedMetrics.push(metric);
+            resolvedPeriods.push(period);
+            matched = true;
+            resolvedCount++;
+          }
+          if (!matched) { unresolvedCount++; }
+          continue;
+        }
+
+        const normalizedCited = normalizeNumericForLookup(cited.value);
+        if (!normalizedCited) { unresolvedCount++; continue; }
+
+        for (const [key, verifiedValue] of verifiedFigureLookup.entries()) {
+          const normalizedVerified = normalizeNumericForLookup(verifiedValue);
+          if (!normalizedVerified) continue;
+
+          if (normalizedCited === normalizedVerified ||
+              normalizedCited.replace(/[MmBb]$/, "000000").replace(/[Kk]$/, "000") ===
+              normalizedVerified.replace(/[MmBb]$/, "000000").replace(/[Kk]$/, "000")) {
+            const [metric, period] = key.split("|||");
+            resolvedMetrics.push(metric);
+            resolvedPeriods.push(period);
+            matched = true;
+            resolvedCount++;
+            break;
+          }
+        }
+        if (!matched) unresolvedCount++;
+      }
+
+      if (resolvedCount === 0) {
+        numDivDemotedCount++;
+        return {
+          ...f,
+          numeric_unverified: true,
+          severity: "info" as const,
+          category: "housekeeping" as const,
+          full_analysis: `[UNVERIFIED_DIVERGENCE] ${f.full_analysis}`,
+        };
+      }
+
+      if (resolvedCount >= 2) {
+        const uniqueMetrics = [...new Set(resolvedMetrics)];
+        const uniquePeriods = [...new Set(resolvedPeriods)];
+        if (uniqueMetrics.length === 1 && uniquePeriods.length > 1) {
+          numDivDemotedCount++;
+          return {
+            ...f,
+            numeric_unverified: true,
+            severity: "info" as const,
+            category: "housekeeping" as const,
+            full_analysis: `[PERIOD_MISMATCH] ${f.full_analysis}`,
+          };
+        }
+      }
+
+      return f;
+    });
+
+    if (numDivDemotedCount > 0) {
+      console.log(`[pipeline:postMerge] Numeric divergence validation: demoted ${numDivDemotedCount} finding(s)`);
+    }
+  }
+
+  // === Stage 3: Global Semantic Consolidation (Defect 1) ===
+  {
+    const preConsolidationCount = findings.length;
+
+    const parent: number[] = findings.map((_, i) => i);
+    function find(x: number): number {
+      while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+      return x;
+    }
+    function union(a: number, b: number): void {
+      const ra = find(a), rb = find(b);
+      if (ra !== rb) parent[ra] = rb;
+    }
+
+    const claimToIndices = new Map<string, number[]>();
+    for (let i = 0; i < findings.length; i++) {
+      const cids = findings[i].claim_ids ?? [];
+      for (const cid of cids) {
+        const normalized = cid.toLowerCase().trim();
+        if (!normalized) continue;
+        const existing = claimToIndices.get(normalized);
+        if (existing) { existing.push(i); } else { claimToIndices.set(normalized, [i]); }
+      }
+    }
+    for (const indices of claimToIndices.values()) {
+      for (let k = 1; k < indices.length; k++) { union(indices[0], indices[k]); }
+    }
+
+    const issueKeyToIndices = new Map<string, number[]>();
+    for (let i = 0; i < findings.length; i++) {
+      const ik = (findings[i] as any).issue_key;
+      if (!ik || typeof ik !== "string") continue;
+      const normalized = ik.toLowerCase().trim().replace(/[\s-]+/g, "_");
+      if (!normalized) continue;
+      const existing = issueKeyToIndices.get(normalized);
+      if (existing) { existing.push(i); } else { issueKeyToIndices.set(normalized, [i]); }
+    }
+    for (const indices of issueKeyToIndices.values()) {
+      for (let k = 1; k < indices.length; k++) { union(indices[0], indices[k]); }
+    }
+
+    const clusters = new Map<number, number[]>();
+    for (let i = 0; i < findings.length; i++) {
+      const root = find(i);
+      const existing = clusters.get(root);
+      if (existing) { existing.push(i); } else { clusters.set(root, [i]); }
+    }
+
+    const severityRank = { critical: 3, warning: 2, info: 1 } as const;
+    const consolidated: typeof findings = [];
+
+    for (const members of clusters.values()) {
+      if (members.length === 1) {
+        consolidated.push(findings[members[0]]);
+        continue;
+      }
+
+      members.sort((a, b) => {
+        const sa = severityRank[findings[a].severity] ?? 0;
+        const sb = severityRank[findings[b].severity] ?? 0;
+        if (sb !== sa) return sb - sa;
+        return (findings[b].full_analysis?.length ?? 0) - (findings[a].full_analysis?.length ?? 0);
+      });
+
+      const representative = findings[members[0]];
+
+      const allClaimIds = new Set<string>();
+      const allSourceDocs = new Set<string>();
+      const allEvidenceDocs = new Set<string>();
+      const allEvidence: Array<{ figure: string; source_doc: string; verbatim_snippet: string; verified: boolean }> = [];
+      const seenEvidenceKeys = new Set<string>();
+
+      for (const idx of members) {
+        const f = findings[idx];
+        for (const cid of f.claim_ids ?? []) allClaimIds.add(cid);
+        for (const sd of f.source_docs ?? []) allSourceDocs.add(sd);
+        for (const ed of f.evidence_docs ?? []) allEvidenceDocs.add(ed);
+        for (const ev of f.evidence ?? []) {
+          const key = `${ev.figure}|${ev.source_doc}`;
+          if (!seenEvidenceKeys.has(key)) {
+            seenEvidenceKeys.add(key);
+            allEvidence.push(ev);
+          }
+        }
+      }
+
+      const merged: typeof representative = {
+        ...representative,
+        severity: representative.severity,
+        claim_ids: [...allClaimIds],
+        source_docs: [...allSourceDocs],
+        evidence_docs: allEvidenceDocs.size > 0 ? [...allEvidenceDocs] : representative.evidence_docs,
+        evidence: allEvidence.length > 0 ? allEvidence : representative.evidence,
+      };
+
+      consolidated.push(merged);
+    }
+
+    findings = consolidated;
+    const consolidatedCount = preConsolidationCount - findings.length;
+    if (consolidatedCount > 0) {
+      console.log(`[pipeline:postMerge] Global consolidation: ${preConsolidationCount} → ${findings.length} findings (collapsed ${consolidatedCount} duplicates)`);
+    }
+  }
+
+  // === Stage 4: Reconciliation Append ===
+  const reconResult = appendReconciliationFindings(findings, housekeepingFindings, claimsReconciliation);
+  findings = reconResult.finalFindings;
+  housekeepingFindings = reconResult.housekeepingFindings;
+
+  // === Stage 5: Deterministic independent override ===
+  let independentOverrides = 0;
+  for (const f of findings) {
+    if (f.evidence_docs && f.evidence_docs.length > 0) {
+      const hasNonIcMemo = f.evidence_docs.some((docName) => {
+        const tag = fileTagMap.get(docName.toLowerCase());
+        return tag !== "ic_memo";
+      });
+      const oldValue = f.independent;
+      f.independent = hasNonIcMemo;
+      if (oldValue !== hasNonIcMemo) independentOverrides++;
+    }
+  }
+  if (independentOverrides > 0) {
+    console.log(`[pipeline:postMerge] Deterministic independent override: corrected ${independentOverrides} finding(s)`);
+  }
+
+  // === Stage 6: Materiality Gate (Defect 2) ===
+  const matResult = enforceMaterialityGate(findings, housekeepingFindings);
+  findings = matResult.findings;
+  housekeepingFindings = matResult.housekeepingFindings;
+
+  return { findings, housekeepingFindings };
+}
+
+// ---------------------------------------------------------------------------
 // Chunk Routing (server-side mirror of client/lib/chunkRouting.ts)
 // ---------------------------------------------------------------------------
 const MODULE_TAG_RELEVANCE: Record<string, Set<string>> = {
@@ -1280,20 +1567,27 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
 
             let finalFindings = finalNode.findings;
 
-            // Apply fabricated arithmetic suppression (no LLM, just regex — fast)
-            const { FABRICATED_ARITHMETIC_PATTERNS } = await import("./fabricated-arithmetic-patterns.js");
-            const preSuppressCount = finalFindings.length;
-            finalFindings = finalFindings.filter(f => {
-              const text = `${f.title} ${f.detail} ${f.full_analysis}`;
-              return !FABRICATED_ARITHMETIC_PATTERNS.some(pat => pat.test(text));
-            });
-            const suppressedCount = preSuppressCount - finalFindings.length;
-            if (suppressedCount > 0) {
-              console.log(`[pipeline:fast-path] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
-            }
+            // --- Fast-path: Load checkpoints needed for shared post-merge pipeline ---
+            // Load numericReport from checkpoint (Layer-1 validation + materiality need it)
+            let fastPathNumericReport: { figures: any[]; discrepancies: any[] } | null = null;
+            try {
+              const numCpRows = await ctx.integrations.db.query(
+                `SELECT payload FROM pipeline_checkpoints
+                 WHERE module_run_id = $1 AND checkpoint_key = 'numeric_report'`,
+                z.object({ payload: z.any() }),
+                [runId],
+                { label: "Fast-path: load numeric report checkpoint" }
+              );
+              if (numCpRows.length > 0 && numCpRows[0].payload) {
+                const saved = numCpRows[0].payload as { figures: unknown[]; discrepancies: unknown[] };
+                if (saved.figures && saved.discrepancies) {
+                  fastPathNumericReport = { figures: saved.figures as any[], discrepancies: saved.discrepancies as any[] };
+                  console.log(`[pipeline:fast-path] Loaded numeric report: ${saved.figures.length} figures`);
+                }
+              }
+            } catch { /* pipeline_checkpoints may not exist — proceed without */ }
 
-            // --- Mode-B Fix (fast-path): Load reconciliation checkpoint and append ---
-            // On resumed runs, claimsReconciliation is not in memory. Load from checkpoint.
+            // Load reconciliation from checkpoint (recon append needs it)
             let fastPathRecon: ReconciliationResult | null = null;
             if (moduleId === "contradiction_check") {
               try {
@@ -1313,27 +1607,16 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
               }
             }
 
-            // Apply shared Mode-B append + dedup (same logic as main path)
-            const reconAppendResult = appendReconciliationFindings(finalFindings, fastPathHousekeeping, fastPathRecon);
-            finalFindings = reconAppendResult.finalFindings;
-            fastPathHousekeeping = reconAppendResult.housekeepingFindings;
-
-            // Deterministic independent override (same logic as Step 5.7)
-            for (const f of finalFindings) {
-              if (f.evidence_docs && f.evidence_docs.length > 0) {
-                f.independent = f.evidence_docs.some((docName) => {
-                  const tag = fileTagMap.get(docName.toLowerCase());
-                  return tag !== "ic_memo";
-                });
-              }
-            }
-
-            // --- Defect 2: Materiality Enforcement (fast-path) ---
-            {
-              const matResult = enforceMaterialityGate(finalFindings, fastPathHousekeeping);
-              finalFindings = matResult.findings;
-              fastPathHousekeeping = matResult.housekeepingFindings;
-            }
+            // --- Run shared post-merge pipeline (identical to main path) ---
+            const postMergeResult = await runPostMergePipeline({
+              findings: finalFindings,
+              housekeepingFindings: fastPathHousekeeping,
+              numericReport: fastPathNumericReport,
+              claimsReconciliation: fastPathRecon,
+              fileTagMap,
+            });
+            finalFindings = postMergeResult.findings;
+            fastPathHousekeeping = postMergeResult.housekeepingFindings;
 
             // Fast-path format budget: derived from PLATFORM cap, not TIME_BUDGET.
             // The fast-path has no post-format phases (no extraction, no merge remaining) —
@@ -2978,299 +3261,17 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
     });
   }
 
-  // --- Post-processing: suppress fabricated arithmetic/reconciliation findings ---
-  // Only findings grounded in NumericVerify's deterministic output are trustworthy.
-  // NOTE: Code-verified reconciliation findings are appended AFTER this filter —
-  // they bypass FABRICATED_ARITHMETIC_PATTERNS entirely (they ARE code-verified).
-  const { FABRICATED_ARITHMETIC_PATTERNS } = await import("./fabricated-arithmetic-patterns.js");
-
-  const preSuppressCount = finalFindings.length;
-  finalFindings = finalFindings.filter(f => {
-    const text = `${f.title} ${f.detail} ${f.full_analysis}`;
-    return !FABRICATED_ARITHMETIC_PATTERNS.some(pat => pat.test(text));
+  // --- Post-merge pipeline: shared sequence (suppression → L1 → consolidation → recon → independent → materiality) ---
+  // Uses the shared helper so main-path and fast-path execute identical logic in identical order.
+  const postMergeMainResult = await runPostMergePipeline({
+    findings: finalFindings,
+    housekeepingFindings: finalHousekeepingFindings,
+    numericReport,
+    claimsReconciliation,
+    fileTagMap,
   });
-  const suppressedCount = preSuppressCount - finalFindings.length;
-  if (suppressedCount > 0) {
-    console.log(`[pipeline] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
-  }
-
-  // --- Defect 5, Layer 1: Numeric Divergence Validation (zero-LLM code pass) ---
-  // Demotes data_divergence findings that are period-collisions or untraceable.
-  // Preserves valid narrative-vs-model comparisons (1 verified + 1 unresolved = pass-through).
-  // Runs AFTER fabricated-arithmetic suppression, BEFORE reconciliation append.
-  if (numericReport && numericReport.figures.length > 0) {
-    // Build verified-figure lookup keyed on (metric_name_lower, period_lower) → value
-    const verifiedFigureLookup = new Map<string, string>();
-    for (const fig of numericReport.figures as Array<Record<string, unknown>>) {
-      const name = String(fig.name ?? "").toLowerCase().trim();
-      const period = String(fig.period ?? "").toLowerCase().trim();
-      if (name && period) {
-        verifiedFigureLookup.set(`${name}|||${period}`, String(fig.value ?? ""));
-      }
-    }
-
-    // Helper: normalize a numeric string for comparison (strip $, £, %, commas, whitespace)
-    const normalizeNumericForLookup = (val: unknown): string | null => {
-      if (val == null) return null;
-      const s = String(val).replace(/[$£€%,\s]/g, "").trim();
-      return s.length > 0 ? s : null;
-    };
-
-    // Helper: extract numeric figure strings from text via regex
-    const extractNumericFigures = (text: string): string[] => {
-      // Matches currency/number patterns like £194m, $12.5M, 15.3%, 1,234, etc.
-      const patterns = text.match(/[$£€]?\d[\d,]*\.?\d*[MmBbKk%]?/g);
-      return patterns ? [...new Set(patterns)] : [];
-    };
-
-    let numDivDemotedCount = 0;
-    finalFindings = finalFindings.map(f => {
-      // Only process data_divergence findings that are NOT already code-verified
-      if (f.finding_kind !== "data_divergence") return f;
-      if (f.numeric_unverified === false) return f; // already verified by prior pass
-
-      // Extract cited figures — prefer structured evidence[] coordinates
-      let citedFigures: Array<{ value: string; source_doc?: string; metric?: string; period?: string }> = [];
-      if (f.evidence && f.evidence.length > 0) {
-        citedFigures = f.evidence.map(e => ({
-          value: e.figure,
-          source_doc: e.source_doc,
-          // Evidence entries may carry structured metric/period coordinates (cast to access optional fields)
-          metric: (e as Record<string, unknown>).metric as string | undefined,
-          period: (e as Record<string, unknown>).period as string | undefined,
-        }));
-      } else {
-        // Fallback: extract figures from title + detail text
-        const allText = `${f.title} ${f.detail}`;
-        citedFigures = extractNumericFigures(allText).map(v => ({ value: v }));
-      }
-
-      if (citedFigures.length === 0) return f; // No figures to validate — pass through
-
-      // Resolve each cited figure against the verified-figure lookup
-      let resolvedCount = 0;
-      let unresolvedCount = 0;
-      const resolvedPeriods: string[] = [];
-      const resolvedMetrics: string[] = [];
-
-      for (const cited of citedFigures) {
-        let matched = false;
-
-        // Priority 1: Coordinate-based resolution — if evidence carries metric+period, resolve directly
-        if (cited.metric && cited.period) {
-          const coordKey = `${cited.metric.toLowerCase().trim()}|||${cited.period.toLowerCase().trim()}`;
-          if (verifiedFigureLookup.has(coordKey)) {
-            const [metric, period] = coordKey.split("|||");
-            resolvedMetrics.push(metric);
-            resolvedPeriods.push(period);
-            matched = true;
-            resolvedCount++;
-          }
-          // If coordinate present but not found in lookup → unresolved (don't fall through to value match)
-          if (!matched) { unresolvedCount++; }
-          continue;
-        }
-
-        // Priority 2: Value-based fallback — scan lookup for matching numeric value
-        const normalizedCited = normalizeNumericForLookup(cited.value);
-        if (!normalizedCited) { unresolvedCount++; continue; }
-
-        for (const [key, verifiedValue] of verifiedFigureLookup.entries()) {
-          const normalizedVerified = normalizeNumericForLookup(verifiedValue);
-          if (!normalizedVerified) continue;
-
-          // Check if the cited figure matches this verified figure's value
-          if (normalizedCited === normalizedVerified ||
-              normalizedCited.replace(/[MmBb]$/, "000000").replace(/[Kk]$/, "000") ===
-              normalizedVerified.replace(/[MmBb]$/, "000000").replace(/[Kk]$/, "000")) {
-            const [metric, period] = key.split("|||");
-            resolvedMetrics.push(metric);
-            resolvedPeriods.push(period);
-            matched = true;
-            resolvedCount++;
-            break;
-          }
-        }
-        if (!matched) unresolvedCount++;
-      }
-
-      // Apply demotion rules:
-      // Rule 1: ZERO resolved → untraceable → demote
-      if (resolvedCount === 0) {
-        numDivDemotedCount++;
-        return {
-          ...f,
-          numeric_unverified: true,
-          severity: "info" as const,
-          category: "housekeeping" as const,
-          full_analysis: `[UNVERIFIED_DIVERGENCE] ${f.full_analysis}`,
-        };
-      }
-
-      // Rule 2: 2+ resolved to same metric at DIFFERENT periods → period-collision → demote
-      if (resolvedCount >= 2) {
-        const uniqueMetrics = [...new Set(resolvedMetrics)];
-        const uniquePeriods = [...new Set(resolvedPeriods)];
-        // Period collision: same metric name appears but with different periods
-        if (uniqueMetrics.length === 1 && uniquePeriods.length > 1) {
-          numDivDemotedCount++;
-          return {
-            ...f,
-            numeric_unverified: true,
-            severity: "info" as const,
-            category: "housekeeping" as const,
-            full_analysis: `[PERIOD_MISMATCH] ${f.full_analysis}`,
-          };
-        }
-      }
-
-      // Rule 3: 1 resolved + 1 unresolved → valid narrative-vs-model → PASS THROUGH
-      // (Also pass through any other configuration not caught above)
-      return f;
-    });
-
-    if (numDivDemotedCount > 0) {
-      console.log(`[pipeline] Numeric divergence validation: demoted ${numDivDemotedCount} finding(s)`);
-    }
-  }
-
-  // --- Defect 1: Global Semantic Consolidation (zero-LLM code pass) ---
-  // Clusters findings by (1) claim_id overlap and (2) shared issue_key, then
-  // collapses each cluster into one representative finding. Runs BEFORE
-  // reconciliation append so reconciliation findings remain distinct.
-  {
-    const preConsolidationCount = finalFindings.length;
-
-    // Build union-find structure for transitive clustering
-    const parent: number[] = finalFindings.map((_, i) => i);
-    function find(x: number): number {
-      while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
-      return x;
-    }
-    function union(a: number, b: number): void {
-      const ra = find(a), rb = find(b);
-      if (ra !== rb) parent[ra] = rb;
-    }
-
-    // Signal 1: claim_id overlap — build inverted index
-    const claimToIndices = new Map<string, number[]>();
-    for (let i = 0; i < finalFindings.length; i++) {
-      const cids = finalFindings[i].claim_ids ?? [];
-      for (const cid of cids) {
-        const normalized = cid.toLowerCase().trim();
-        if (!normalized) continue;
-        const existing = claimToIndices.get(normalized);
-        if (existing) {
-          existing.push(i);
-        } else {
-          claimToIndices.set(normalized, [i]);
-        }
-      }
-    }
-    // Union findings sharing any claim_id
-    for (const indices of claimToIndices.values()) {
-      for (let k = 1; k < indices.length; k++) {
-        union(indices[0], indices[k]);
-      }
-    }
-
-    // Signal 2: issue_key overlap — union findings sharing a normalized issue_key
-    const issueKeyToIndices = new Map<string, number[]>();
-    for (let i = 0; i < finalFindings.length; i++) {
-      const ik = (finalFindings[i] as any).issue_key;
-      if (!ik || typeof ik !== "string") continue;
-      const normalized = ik.toLowerCase().trim().replace(/[\s-]+/g, "_");
-      if (!normalized) continue;
-      const existing = issueKeyToIndices.get(normalized);
-      if (existing) {
-        existing.push(i);
-      } else {
-        issueKeyToIndices.set(normalized, [i]);
-      }
-    }
-    for (const indices of issueKeyToIndices.values()) {
-      for (let k = 1; k < indices.length; k++) {
-        union(indices[0], indices[k]);
-      }
-    }
-
-    // Group findings by cluster root
-    const clusters = new Map<number, number[]>();
-    for (let i = 0; i < finalFindings.length; i++) {
-      const root = find(i);
-      const existing = clusters.get(root);
-      if (existing) {
-        existing.push(i);
-      } else {
-        clusters.set(root, [i]);
-      }
-    }
-
-    // Collapse each cluster into one representative finding
-    const severityRank = { critical: 3, warning: 2, info: 1 } as const;
-    const consolidated: typeof finalFindings = [];
-
-    for (const members of clusters.values()) {
-      if (members.length === 1) {
-        consolidated.push(finalFindings[members[0]]);
-        continue;
-      }
-
-      // Sort members by severity (highest first), then by full_analysis length (longest first)
-      members.sort((a, b) => {
-        const sa = severityRank[finalFindings[a].severity] ?? 0;
-        const sb = severityRank[finalFindings[b].severity] ?? 0;
-        if (sb !== sa) return sb - sa;
-        return (finalFindings[b].full_analysis?.length ?? 0) - (finalFindings[a].full_analysis?.length ?? 0);
-      });
-
-      const representative = finalFindings[members[0]];
-
-      // Union all provenance across cluster members
-      const allClaimIds = new Set<string>();
-      const allSourceDocs = new Set<string>();
-      const allEvidenceDocs = new Set<string>();
-      const allEvidence: Array<{ figure: string; source_doc: string; verbatim_snippet: string; verified: boolean }> = [];
-      const seenEvidenceKeys = new Set<string>();
-
-      for (const idx of members) {
-        const f = finalFindings[idx];
-        for (const cid of f.claim_ids ?? []) allClaimIds.add(cid);
-        for (const sd of f.source_docs ?? []) allSourceDocs.add(sd);
-        for (const ed of f.evidence_docs ?? []) allEvidenceDocs.add(ed);
-        for (const ev of f.evidence ?? []) {
-          const key = `${ev.figure}|${ev.source_doc}`;
-          if (!seenEvidenceKeys.has(key)) {
-            seenEvidenceKeys.add(key);
-            allEvidence.push(ev);
-          }
-        }
-      }
-
-      const merged: typeof representative = {
-        ...representative,
-        severity: representative.severity, // already highest from sort
-        claim_ids: [...allClaimIds],
-        source_docs: [...allSourceDocs],
-        evidence_docs: allEvidenceDocs.size > 0 ? [...allEvidenceDocs] : representative.evidence_docs,
-        evidence: allEvidence.length > 0 ? allEvidence : representative.evidence,
-      };
-
-      consolidated.push(merged);
-    }
-
-    finalFindings = consolidated;
-    const consolidatedCount = preConsolidationCount - finalFindings.length;
-    if (consolidatedCount > 0) {
-      console.log(`[pipeline] Global consolidation: ${preConsolidationCount} → ${finalFindings.length} findings (collapsed ${consolidatedCount} duplicates)`);
-    }
-  }
-
-  // --- Mode-B Fix: Append code-verified reconciliation findings AFTER suppression ---
-  // Uses the shared helper so main-path and fast-path can never drift.
-  const mainPathReconResult = appendReconciliationFindings(finalFindings, finalHousekeepingFindings, claimsReconciliation);
-  finalFindings = mainPathReconResult.finalFindings;
-  finalHousekeepingFindings = mainPathReconResult.housekeepingFindings;
+  finalFindings = postMergeMainResult.findings;
+  finalHousekeepingFindings = postMergeMainResult.housekeepingFindings;
 
   // === CANCEL GATE: pre-absence-verification ===
   if (await checkCancelled(ctx, runId, "pre_absence_verification")) return cancelledResult(runId, "pre_absence_verification");
@@ -3346,38 +3347,6 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
         firstError,
       };
     }
-  }
-
-  // --- Step 5.7: Deterministic `independent` flag override ---
-  // The model may emit `independent` based on filename heuristics. This code pass
-  // overrides it authoritatively using the actual document_tag for each evidence_doc.
-  // Rule: independent = evidence_docs.some(filename => tagOf(filename) !== 'ic_memo')
-  //        i.e. false only when ALL evidence_docs have tag ic_memo.
-  // Only applies to findings with non-empty evidence_docs (gap_type = "memo_omission").
-  // Lookup source: `fileTagMap` loaded from DB at Step 0.3.5 (filename→document_tag).
-  let independentOverrides = 0;
-  for (const f of finalFindings) {
-    if (f.evidence_docs && f.evidence_docs.length > 0) {
-      const hasNonIcMemo = f.evidence_docs.some((docName) => {
-        const tag = fileTagMap.get(docName.toLowerCase());
-        // If tag is unknown (e.g. filename mismatch), treat as independent to avoid
-        // incorrectly marking corroboration as non-independent.
-        return tag !== "ic_memo";
-      });
-      const oldValue = f.independent;
-      f.independent = hasNonIcMemo;
-      if (oldValue !== hasNonIcMemo) independentOverrides++;
-    }
-  }
-  if (independentOverrides > 0) {
-    console.log(`[pipeline] Deterministic independent override: corrected ${independentOverrides} finding(s)`);
-  }
-
-  // --- Defect 2: Materiality Enforcement (code-based, shared helper) ---
-  {
-    const matResult = enforceMaterialityGate(finalFindings, finalHousekeepingFindings);
-    finalFindings = matResult.findings;
-    finalHousekeepingFindings = matResult.housekeepingFindings;
   }
 
   // === CANCEL GATE: pre-formatting ===
