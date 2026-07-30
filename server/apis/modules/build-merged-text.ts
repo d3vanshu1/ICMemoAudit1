@@ -37,6 +37,8 @@ export interface MergedFinding {
   severity_anchor?: string;
   /** Finding kind: data_divergence (numeric/cross-version), source_stated_risk, absence_claim, process_observation */
   finding_kind?: "data_divergence" | "source_stated_risk" | "absence_claim" | "process_observation";
+  /** Normalized issue key for global consolidation clustering (snake_case, e.g. "fca_authorisation_risk") */
+  issue_key?: string;
   verification?: {
     status: "revised" | "upheld";
     evidenceQuoted?: string;

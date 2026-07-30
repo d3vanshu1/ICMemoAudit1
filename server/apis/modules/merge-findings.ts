@@ -148,6 +148,7 @@ A JSON array of PRINCIPAL findings only (category = "principal_finding"). Each o
 - "full_analysis": full paragraph with complete reasoning and evidence
 - "source_docs": array of filename strings
 - "claim_ids": array of claim ID strings (e.g. ["c0-3", "c2-7"]) — these are the stable IDs from the extraction step. Preserve them exactly. Every finding must trace back to at least one source claim.
+- "issue_key": (REQUIRED) normalized snake_case identifier for the specific issue this finding describes (e.g. "fca_authorisation_risk", "one_park_lane_lease", "revenue_growth_mismatch"). Preserve exactly from extraction — when consolidating duplicate findings, keep the issue_key unchanged. Findings about the same underlying issue MUST share the same issue_key.
 - "absence_confidence": (REQUIRED for omission/gap findings) "verified_absent" | "likely_absent" | "unverified" — classification of whether the claimed absence has been cross-checked against all available extractions. Omit only for findings that do not assert something is missing.
 - "gap_type": (REQUIRED for omission/gap findings) "diligence_gap" | "memo_omission" | "open_item_acknowledged". Use "memo_omission" when the information IS present in evidence/reference documents but absent from the subject memo. Use "diligence_gap" when the information is absent from BOTH the subject memo AND all evidence documents. Use "open_item_acknowledged" when the deal record itself discloses the item as open/pending (e.g., results TBD, workstream staged post-IC) — this is distinct from omission. Omit for non-omission findings.
 - "evidence_docs": (REQUIRED when gap_type = "memo_omission") array of filenames of the evidence documents where the information WAS found. Omit when gap_type = "diligence_gap".
@@ -195,17 +196,15 @@ Also include any "human_review_flag" items here (emphasis-judgment findings demo
 
 Before outputting findings, perform a final normalization pass:
 
-1. **Cluster by issue identity, not title string**: Two findings describe the same underlying issue if they reference the same factual gap, the same document deficiency, or the same risk — regardless of how the title is worded.
+1. **Cluster by issue identity, not title string**: Two findings describe the same underlying issue if they share the same issue_key, reference the same factual gap, the same document deficiency, or the same risk — regardless of how the title is worded.
 2. **Merge duplicates**: When multiple findings describe the same underlying issue, consolidate into ONE finding with:
    - The highest severity from the cluster
    - Combined source_docs from all duplicates
+   - Combined claim_ids from all duplicates (union, not replace)
    - Combined evidence arrays
    - The most complete full_analysis
-3. **Known dedup targets** (from corpus analysis):
-   - Tax-documentation findings appearing verbatim multiple times → consolidate to one
-   - Stale-legal-DD and no-reliance findings that describe the same issue from different angles → consolidate
-   - Multi-way clusters around the same contractual feature (e.g., dealer buyout mechanics) → consolidate to one finding with full evidence
-4. **Size guideline**: The DiagMergeFunnel shows collapse stops at level 3 (95 leaves → 6 nodes). Target output should be single digits to low teens of principal findings. If you have >15 principal findings, you likely have unresolved duplicates.
+   - The issue_key preserved unchanged
+3. **Size guideline**: Target output should be single digits to low teens of principal findings. If you have >15 principal findings, you likely have unresolved duplicates.
 
 ## ADVERSARIAL NUMERIC TRACE-BACK — Mandatory Pre-Output Pass
 

@@ -2955,6 +2955,138 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
     }
   }
 
+  // --- Defect 1: Global Semantic Consolidation (zero-LLM code pass) ---
+  // Clusters findings by (1) claim_id overlap and (2) shared issue_key, then
+  // collapses each cluster into one representative finding. Runs BEFORE
+  // reconciliation append so reconciliation findings remain distinct.
+  {
+    const preConsolidationCount = finalFindings.length;
+
+    // Build union-find structure for transitive clustering
+    const parent: number[] = finalFindings.map((_, i) => i);
+    function find(x: number): number {
+      while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+      return x;
+    }
+    function union(a: number, b: number): void {
+      const ra = find(a), rb = find(b);
+      if (ra !== rb) parent[ra] = rb;
+    }
+
+    // Signal 1: claim_id overlap — build inverted index
+    const claimToIndices = new Map<string, number[]>();
+    for (let i = 0; i < finalFindings.length; i++) {
+      const cids = finalFindings[i].claim_ids ?? [];
+      for (const cid of cids) {
+        const normalized = cid.toLowerCase().trim();
+        if (!normalized) continue;
+        const existing = claimToIndices.get(normalized);
+        if (existing) {
+          existing.push(i);
+        } else {
+          claimToIndices.set(normalized, [i]);
+        }
+      }
+    }
+    // Union findings sharing any claim_id
+    for (const indices of claimToIndices.values()) {
+      for (let k = 1; k < indices.length; k++) {
+        union(indices[0], indices[k]);
+      }
+    }
+
+    // Signal 2: issue_key overlap — union findings sharing a normalized issue_key
+    const issueKeyToIndices = new Map<string, number[]>();
+    for (let i = 0; i < finalFindings.length; i++) {
+      const ik = (finalFindings[i] as any).issue_key;
+      if (!ik || typeof ik !== "string") continue;
+      const normalized = ik.toLowerCase().trim().replace(/[\s-]+/g, "_");
+      if (!normalized) continue;
+      const existing = issueKeyToIndices.get(normalized);
+      if (existing) {
+        existing.push(i);
+      } else {
+        issueKeyToIndices.set(normalized, [i]);
+      }
+    }
+    for (const indices of issueKeyToIndices.values()) {
+      for (let k = 1; k < indices.length; k++) {
+        union(indices[0], indices[k]);
+      }
+    }
+
+    // Group findings by cluster root
+    const clusters = new Map<number, number[]>();
+    for (let i = 0; i < finalFindings.length; i++) {
+      const root = find(i);
+      const existing = clusters.get(root);
+      if (existing) {
+        existing.push(i);
+      } else {
+        clusters.set(root, [i]);
+      }
+    }
+
+    // Collapse each cluster into one representative finding
+    const severityRank = { critical: 3, warning: 2, info: 1 } as const;
+    const consolidated: typeof finalFindings = [];
+
+    for (const members of clusters.values()) {
+      if (members.length === 1) {
+        consolidated.push(finalFindings[members[0]]);
+        continue;
+      }
+
+      // Sort members by severity (highest first), then by full_analysis length (longest first)
+      members.sort((a, b) => {
+        const sa = severityRank[finalFindings[a].severity] ?? 0;
+        const sb = severityRank[finalFindings[b].severity] ?? 0;
+        if (sb !== sa) return sb - sa;
+        return (finalFindings[b].full_analysis?.length ?? 0) - (finalFindings[a].full_analysis?.length ?? 0);
+      });
+
+      const representative = finalFindings[members[0]];
+
+      // Union all provenance across cluster members
+      const allClaimIds = new Set<string>();
+      const allSourceDocs = new Set<string>();
+      const allEvidenceDocs = new Set<string>();
+      const allEvidence: Array<{ figure: string; source_doc: string; verbatim_snippet: string; verified: boolean }> = [];
+      const seenEvidenceKeys = new Set<string>();
+
+      for (const idx of members) {
+        const f = finalFindings[idx];
+        for (const cid of f.claim_ids ?? []) allClaimIds.add(cid);
+        for (const sd of f.source_docs ?? []) allSourceDocs.add(sd);
+        for (const ed of f.evidence_docs ?? []) allEvidenceDocs.add(ed);
+        for (const ev of f.evidence ?? []) {
+          const key = `${ev.figure}|${ev.source_doc}`;
+          if (!seenEvidenceKeys.has(key)) {
+            seenEvidenceKeys.add(key);
+            allEvidence.push(ev);
+          }
+        }
+      }
+
+      const merged: typeof representative = {
+        ...representative,
+        severity: representative.severity, // already highest from sort
+        claim_ids: [...allClaimIds],
+        source_docs: [...allSourceDocs],
+        evidence_docs: allEvidenceDocs.size > 0 ? [...allEvidenceDocs] : representative.evidence_docs,
+        evidence: allEvidence.length > 0 ? allEvidence : representative.evidence,
+      };
+
+      consolidated.push(merged);
+    }
+
+    finalFindings = consolidated;
+    const consolidatedCount = preConsolidationCount - finalFindings.length;
+    if (consolidatedCount > 0) {
+      console.log(`[pipeline] Global consolidation: ${preConsolidationCount} → ${finalFindings.length} findings (collapsed ${consolidatedCount} duplicates)`);
+    }
+  }
+
   // --- Mode-B Fix: Append code-verified reconciliation findings AFTER suppression ---
   // Uses the shared helper so main-path and fast-path can never drift.
   const mainPathReconResult = appendReconciliationFindings(finalFindings, finalHousekeepingFindings, claimsReconciliation);

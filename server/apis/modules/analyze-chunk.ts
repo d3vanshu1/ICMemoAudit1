@@ -145,7 +145,7 @@ Required keys:
 - "document_type" (string): CIM, IC_MEMO, CUSTOMER_DATA, CONSULTANT_REPORT, FINANCIAL_MODEL, LEGAL, or OTHER
 - "key_claims" (array): each with "claim" (string), "location" (string), "confidence" ("high"|"medium"|"low")
 - "data_points" (array): each with "metric" (string), "value" (string), "context" (string)
-- "flags" (array): each with "type" ("risk"|"gap"|"contradiction"|"assumption"), "description" (string), "severity" ("critical"|"moderate"|"low"), "verification" (string — REQUIRED for gap/risk flags that assert absence)
+- "flags" (array): each with "type" ("risk"|"gap"|"contradiction"|"assumption"), "description" (string), "severity" ("critical"|"moderate"|"low"), "issue_key" (string, snake_case identifier for the specific issue, e.g. "fca_authorisation_risk", "customer_concentration"), "verification" (string — REQUIRED for gap/risk flags that assert absence)
 - "raw_summary" (string)`,
 
   // ---- Contradiction Check ----
@@ -169,7 +169,7 @@ Required keys:
 - "document_type" (string): CIM | IC_MEMO | CUSTOMER_DATA | CONSULTANT_REPORT | FINANCIAL_MODEL | LEGAL | OTHER
 - "key_claims" (array): each with "claim" (string), "source_type" ("narrative"|"data"), "location" (string), "confidence" ("high"|"medium"|"low")
 - "data_points" (array): each with "metric" (string), "value" (string), "period" (string, e.g. "FY2024", "Q3 2023", "LTM Jun-24"), "verbatim_snippet" (string, ≤80 chars from source text containing the value), "context" (string)
-- "flags" (array): each with "type" ("contradiction"|"assumption"|"risk"|"gap"), "description" (string), "severity" ("critical"|"moderate"|"low")
+- "flags" (array): each with "type" ("contradiction"|"assumption"|"risk"|"gap"), "description" (string), "severity" ("critical"|"moderate"|"low"), "issue_key" (string, snake_case identifier for the specific issue, e.g. "revenue_growth_mismatch", "margin_claim_vs_actual")
 - "raw_summary" (string)`,
 
   // ---- Blind Spot Scanner ----
@@ -192,7 +192,7 @@ Required keys:
 - "document_type" (string): CIM | IC_MEMO | CUSTOMER_DATA | CONSULTANT_REPORT | FINANCIAL_MODEL | LEGAL | OTHER
 - "key_claims" (array): each with "claim" (string), "claim_type" ("thesis"|"explicit_assumption"|"implicit_assumption"), "location" (string), "confidence" ("high"|"medium"|"low")
 - "data_points" (array): each with "metric" (string), "value" (string), "context" (string)
-- "flags" (array): each with "type" ("assumption"|"risk"|"gap"), "description" (string), "severity" ("critical"|"moderate"|"low"), "verification" (string — REQUIRED for gap/risk flags that assert absence)
+- "flags" (array): each with "type" ("assumption"|"risk"|"gap"), "description" (string), "severity" ("critical"|"moderate"|"low"), "issue_key" (string, snake_case identifier for the specific issue, e.g. "implicit_churn_assumption", "market_size_unaddressed"), "verification" (string — REQUIRED for gap/risk flags that assert absence)
 - "raw_summary" (string)`,
 
   // ---- External Risk Overlay (sub-agent extracts deal material) ----
@@ -276,7 +276,7 @@ Required keys:
 - "document_type" (string): CIM | IC_MEMO | CUSTOMER_DATA | CONSULTANT_REPORT | FINANCIAL_MODEL | LEGAL | OTHER
 - "key_claims" (array): each with "claim" (string), "claim_type" ("thesis"|"risk_mitigant"|"assumption"|"weak_point"), "location" (string), "confidence" ("high"|"medium"|"low")
 - "data_points" (array): each with "metric" (string), "value" (string), "context" (string)
-- "flags" (array): each with "type" ("risk"|"gap"|"contradiction"|"assumption"), "description" (string), "severity" ("critical"|"moderate"|"low")
+- "flags" (array): each with "type" ("risk"|"gap"|"contradiction"|"assumption"), "description" (string), "severity" ("critical"|"moderate"|"low"), "issue_key" (string, snake_case identifier for the specific issue, e.g. "thesis_drift_pricing", "single_customer_dependency")
 - "raw_summary" (string)`,
 
   // ---- Model Assumptions Stress Test ----
@@ -309,7 +309,7 @@ Required keys:
 - "source_perspective" ("deal_team"|"management"|"unclear")
 - "key_claims" (array): each with "claim" (string), "claim_type" ("stated"|"derived"), "perspective" ("deal_team"|"management"|"unclear"), "category" ("revenue"|"margin"|"customer"|"cost"|"capital"|"financing"|"entry_exit"|"returns"), "location" (string), "confidence" ("high"|"medium"|"low")
 - "data_points" (array): each with "metric" (string), "value" (string), "context" (string)
-- "flags" (array): each with "type" ("assumption"|"risk"|"contradiction"|"gap"), "description" (string), "severity" ("critical"|"moderate"|"low")
+- "flags" (array): each with "type" ("assumption"|"risk"|"contradiction"|"gap"), "description" (string), "severity" ("critical"|"moderate"|"low"), "issue_key" (string, snake_case identifier for the specific issue, e.g. "exit_multiple_sensitivity", "revenue_growth_assumption")
 - "raw_summary" (string)`,
 
   // ---- Diligence Completeness ----
@@ -340,7 +340,7 @@ Required keys:
 - "document_type" (string): CIM | IC_MEMO | CUSTOMER_DATA | CONSULTANT_REPORT | FINANCIAL_MODEL | LEGAL | OTHER
 - "key_claims" (array): each with "claim" (string), "dimension" ("commercial"|"financial"|"management"|"technology"|"legal"|"competitive"|"customer"|"operational"|"exit"|"esg"), "location" (string), "confidence" ("high"|"medium"|"low")
 - "data_points" (array): each with "metric" (string), "value" (string), "context" (string)
-- "flags" (array): each with "type" ("gap"|"risk"), "description" (string), "severity" ("critical"|"moderate"|"low"), "verification" (string — REQUIRED for gap flags that assert absence)
+- "flags" (array): each with "type" ("gap"|"risk"), "description" (string), "severity" ("critical"|"moderate"|"low"), "issue_key" (string, snake_case identifier for the specific issue, e.g. "missing_churn_data", "no_regulatory_assessment"), "verification" (string — REQUIRED for gap flags that assert absence)
 - "raw_summary" (string)`,
 
   // ---- Executive Summary (processes prior module outputs, not documents) ----
@@ -360,7 +360,7 @@ Required keys:
 - "document_type" ("OTHER")
 - "key_claims" (array): each with "claim" (string), "location" (string — module name), "confidence" ("high"|"medium"|"low")
 - "data_points" (array): each with "metric" (string), "value" (string), "context" (string)
-- "flags" (array): each with "type" ("risk"|"gap"|"contradiction"|"assumption"), "description" (string), "severity" ("critical"|"moderate"|"low")
+- "flags" (array): each with "type" ("risk"|"gap"|"contradiction"|"assumption"), "description" (string), "severity" ("critical"|"moderate"|"low"), "issue_key" (string, snake_case identifier for the specific issue, e.g. "key_finding_revenue", "action_item_legal_dd")
 - "raw_summary" (string)`,
 };
 
