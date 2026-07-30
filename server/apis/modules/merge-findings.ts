@@ -334,6 +334,11 @@ Every finding must cite source documents that ACTUALLY CONTAIN the claim. Fabric
 
 You do NOT produce gap_type findings (memo_omission, diligence_gap, open_item_acknowledged). Omission detection is out of scope for this module — it belongs to omission_audit where absence-verification safeguards run. Your remit is: contradictions between narrative and data, data divergences, and unsupported narrative claims. For a narrative claim with no supporting evidence, emit it as a normal finding describing the unsupported claim — do NOT classify it as memo_omission or diligence_gap. Leave the "gap_type" and "evidence_docs" fields entirely absent from your output.
 
+**Schema field overrides for this module** (take precedence over the shared Output Structure below):
+- **absence_confidence**: Do NOT set this field on any finding. This module does not run absence-verification; the field is reserved for omission_audit.
+- **finding_kind**: Use ONLY "data_divergence", "source_stated_risk", or "process_observation". Do NOT use "absence_claim" — that value is reserved for omission_audit which runs verification safeguards. An unsupported narrative claim is a "source_stated_risk" or "process_observation", never an "absence_claim".
+- **gap_type**, **evidence_docs**, **independent**: Omit entirely — never set on any finding from this module.
+
 ## Your Task
 
 1. {{NUMERIC_TASK_STEP_1}}**Cross-Reference Narrative vs. Data**: For each narrative claim, search the data extractions for confirming or contradicting evidence. Apply scope-qualifier matching before asserting any numeric contradiction.

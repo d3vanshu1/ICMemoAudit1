@@ -2851,11 +2851,14 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
       if (f.numeric_unverified === false) return f; // already verified by prior pass
 
       // Extract cited figures — prefer structured evidence[] coordinates
-      let citedFigures: Array<{ value: string; source_doc?: string }> = [];
+      let citedFigures: Array<{ value: string; source_doc?: string; metric?: string; period?: string }> = [];
       if (f.evidence && f.evidence.length > 0) {
         citedFigures = f.evidence.map(e => ({
           value: e.figure,
           source_doc: e.source_doc,
+          // Evidence entries may carry structured metric/period coordinates (cast to access optional fields)
+          metric: (e as Record<string, unknown>).metric as string | undefined,
+          period: (e as Record<string, unknown>).period as string | undefined,
         }));
       } else {
         // Fallback: extract figures from title + detail text
@@ -2872,10 +2875,27 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
       const resolvedMetrics: string[] = [];
 
       for (const cited of citedFigures) {
+        let matched = false;
+
+        // Priority 1: Coordinate-based resolution — if evidence carries metric+period, resolve directly
+        if (cited.metric && cited.period) {
+          const coordKey = `${cited.metric.toLowerCase().trim()}|||${cited.period.toLowerCase().trim()}`;
+          if (verifiedFigureLookup.has(coordKey)) {
+            const [metric, period] = coordKey.split("|||");
+            resolvedMetrics.push(metric);
+            resolvedPeriods.push(period);
+            matched = true;
+            resolvedCount++;
+          }
+          // If coordinate present but not found in lookup → unresolved (don't fall through to value match)
+          if (!matched) { unresolvedCount++; }
+          continue;
+        }
+
+        // Priority 2: Value-based fallback — scan lookup for matching numeric value
         const normalizedCited = normalizeNumericForLookup(cited.value);
         if (!normalizedCited) { unresolvedCount++; continue; }
 
-        let matched = false;
         for (const [key, verifiedValue] of verifiedFigureLookup.entries()) {
           const normalizedVerified = normalizeNumericForLookup(verifiedValue);
           if (!normalizedVerified) continue;
