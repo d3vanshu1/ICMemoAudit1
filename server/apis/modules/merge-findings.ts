@@ -158,6 +158,8 @@ A JSON array of PRINCIPAL findings only (category = "principal_finding"). Each o
 - "numeric_unverified": boolean. Set to true when the finding's core quantitative claim could NOT be traced to verbatim source text (e.g., chart-derived or vision-inferred figures). Such findings MUST be severity "info" maximum.
 - "severity_anchor": (REQUIRED for all findings) One sentence stating the £ figure or explicit source statement that justifies the assigned severity. Format: "[£X = Y% of EV, exceeds Z threshold]" for quantified anchors, or "[Source document states: verbatim risk language]" for source-stated anchors. If no anchor can be articulated, severity MUST be "info" and category MUST be "housekeeping".
 - "finding_kind": (REQUIRED) "data_divergence" | "source_stated_risk" | "absence_claim" | "process_observation". Use "data_divergence" for findings derived from the Numeric Verification Report (cross-version divergences, model-vs-narrative gaps, reconciliation deltas where two values are compared). Use "source_stated_risk" for risks explicitly stated in DD source documents. Use "absence_claim" for findings asserting something is missing or not disclosed. Use "process_observation" for workflow/admin observations.
+
+Note: The gap_type-dependent fields (absence_confidence, gap_type, evidence_docs, independent) apply only to findings that carry a gap_type value. Findings without gap_type omit these fields entirely.
 </findings_json>
 
 ## MITIGATION-CARRY RULE — Graded DD Item Attribution
@@ -333,11 +335,6 @@ Every finding must cite source documents that ACTUALLY CONTAIN the claim. Fabric
 ## SCOPE RESTRICTION — No Omission Findings
 
 You do NOT produce gap_type findings (memo_omission, diligence_gap, open_item_acknowledged). Omission detection is out of scope for this module — it belongs to omission_audit where absence-verification safeguards run. Your remit is: contradictions between narrative and data, data divergences, and unsupported narrative claims. For a narrative claim with no supporting evidence, emit it as a normal finding describing the unsupported claim — do NOT classify it as memo_omission or diligence_gap. Leave the "gap_type" and "evidence_docs" fields entirely absent from your output.
-
-**Schema field overrides for this module** (take precedence over the shared Output Structure below):
-- **absence_confidence**: Do NOT set this field on any finding. This module does not run absence-verification; the field is reserved for omission_audit.
-- **finding_kind**: Use ONLY "data_divergence", "source_stated_risk", or "process_observation". Do NOT use "absence_claim" — that value is reserved for omission_audit which runs verification safeguards. An unsupported narrative claim is a "source_stated_risk" or "process_observation", never an "absence_claim".
-- **gap_type**, **evidence_docs**, **independent**: Omit entirely — never set on any finding from this module.
 
 ## Your Task
 
