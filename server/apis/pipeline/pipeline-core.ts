@@ -116,6 +116,178 @@ interface AppendReconResult {
   housekeepingFindings: MergedFinding[];
 }
 
+// ---------------------------------------------------------------------------
+// Defect 2: Materiality Enforcement (shared helper — used in main + fast path)
+// ---------------------------------------------------------------------------
+// Code-based enforcement of the IC-chair materiality standard. The LLM proposes
+// severity; this pass verifies against the 1%-of-EV floor.
+//
+// Rules:
+//   - critical keeps ONLY if: (a) parseable £ anchor ≥ MATERIALITY_FLOOR_M, OR
+//     (b) source-stated material-risk marker, OR (c) data_divergence (cross-version).
+//   - If critical has £ anchor BELOW floor AND no marker → demote to "warning".
+//   - If quantified anchor provably below floor → category = "housekeeping".
+//   - Qualitative findings with NO £ figure and a risk marker survive unchanged.
+// ---------------------------------------------------------------------------
+
+const DEAL_EV_MILLIONS = 655;
+const MATERIALITY_FLOOR_M = DEAL_EV_MILLIONS * 0.01; // £6.55m
+
+/** Extract £-figures from text, returning values in millions */
+function parsePoundFiguresMillions(text: string): number[] {
+  if (!text) return [];
+  const results: number[] = [];
+  // Match patterns like £6.5m, £19k, £1.8m, £655m, £118,000, £19,000
+  const patterns = [
+    /£([\d,.]+)\s*m(?:illion|n)?/gi,        // £6.5m, £1.8million
+    /£([\d,.]+)\s*bn?/gi,                    // £1.2bn
+    /£([\d,.]+)\s*k/gi,                      // £19k → divide by 1000
+    /£([\d,]+(?:\.\d+)?)\b(?!\s*[mkb])/gi,   // £118,000 (raw number, no suffix)
+  ];
+
+  // Millions
+  for (const m of text.matchAll(patterns[0])) {
+    const val = parseFloat(m[1].replace(/,/g, ""));
+    if (!isNaN(val)) results.push(val);
+  }
+  // Billions
+  for (const m of text.matchAll(patterns[1])) {
+    const val = parseFloat(m[1].replace(/,/g, "")) * 1000;
+    if (!isNaN(val)) results.push(val);
+  }
+  // Thousands
+  for (const m of text.matchAll(patterns[2])) {
+    const val = parseFloat(m[1].replace(/,/g, "")) / 1000;
+    if (!isNaN(val)) results.push(val);
+  }
+  // Raw numbers (assume in £ — convert to millions)
+  for (const m of text.matchAll(patterns[3])) {
+    const val = parseFloat(m[1].replace(/,/g, ""));
+    if (!isNaN(val) && val >= 1000) results.push(val / 1_000_000);
+  }
+  return results;
+}
+
+/** Detect source-stated material-risk markers in finding text */
+const MATERIAL_RISK_MARKERS = [
+  /criminal\s+offen[cs]e/i,
+  /regulatory\s+breach/i,
+  /going\s+concern/i,
+  /unlimited[\s/]+uncapped\s+liabilit/i,
+  /uncapped\s+(material\s+)?liabilit/i,
+  /unlimited\s+liabilit/i,
+];
+
+function hasMaterialRiskMarker(f: MergedFinding): boolean {
+  // Source-stated risk with critical severity (explicit risk in DD docs)
+  if (f.finding_kind === "source_stated_risk" && f.severity === "critical") return true;
+  // Scan text for explicit material-risk language
+  const text = `${f.title} ${f.detail} ${f.full_analysis} ${f.severity_anchor ?? ""}`;
+  return MATERIAL_RISK_MARKERS.some(pat => pat.test(text));
+}
+
+/** Check if finding is a cross-version data_divergence (material regardless of £ floor) */
+function isCrossVersionDivergence(f: MergedFinding): boolean {
+  if (f.finding_kind !== "data_divergence") return false;
+  // Cross-version findings compare two versions of the same metric from different documents
+  // They're material because the concern is which-version-underwrites-valuation, not £ magnitude
+  const text = `${f.title} ${f.detail} ${f.full_analysis}`;
+  return /cross.?version|version.?mismatch|model.?vs.?narrative|narrative.?vs.?data/i.test(text)
+    || (f.source_docs?.length ?? 0) >= 2; // Two+ source docs for a data_divergence implies cross-source
+}
+
+interface MaterialityResult {
+  findings: MergedFinding[];
+  housekeepingFindings: MergedFinding[];
+  demotedCount: number;
+}
+
+function enforceMaterialityGate(
+  findings: MergedFinding[],
+  housekeepingFindings: MergedFinding[]
+): MaterialityResult {
+  let demotedCount = 0;
+  const survivingFindings: MergedFinding[] = [];
+
+  for (const f of findings) {
+    // Parse £ figures from severity_anchor (primary) and evidence/detail (fallback)
+    const anchorText = f.severity_anchor ?? "";
+    const evidenceText = (f.evidence ?? []).map(e => e.verbatim_snippet).join(" ");
+    const allText = `${anchorText} ${f.detail} ${f.full_analysis}`;
+
+    const anchorFigures = parsePoundFiguresMillions(anchorText);
+    const allFigures = anchorFigures.length > 0 ? anchorFigures : parsePoundFiguresMillions(allText);
+
+    const maxFigure = allFigures.length > 0 ? Math.max(...allFigures) : null;
+    const hasRiskMarker = hasMaterialRiskMarker(f);
+    const isCrossVersion = isCrossVersionDivergence(f);
+
+    if (f.severity === "critical") {
+      // Critical keeps only if: (a) £ anchor ≥ floor, (b) risk marker, or (c) cross-version
+      const hasAdequateAnchor = maxFigure !== null && maxFigure >= MATERIALITY_FLOOR_M;
+
+      if (hasAdequateAnchor || hasRiskMarker || isCrossVersion) {
+        // Survives as critical
+        survivingFindings.push(f);
+      } else if (maxFigure !== null && maxFigure < MATERIALITY_FLOOR_M) {
+        // Has a £ figure but it's below threshold → demote
+        demotedCount++;
+        if (maxFigure < 0.5) {
+          // Trivially sub-threshold (< £500k) → housekeeping
+          housekeepingFindings.push({
+            ...f,
+            severity: "info",
+            category: "housekeeping",
+            materiality_rationale: `[CODE_ENFORCED] £${maxFigure < 0.01 ? (maxFigure * 1000).toFixed(0) + "k" : maxFigure.toFixed(1) + "m"} is ${((maxFigure / DEAL_EV_MILLIONS) * 100).toFixed(2)}% of EV — below 1% materiality threshold (£${MATERIALITY_FLOOR_M.toFixed(1)}m).`,
+          });
+        } else {
+          // Below critical floor but not trivial → warning
+          survivingFindings.push({
+            ...f,
+            severity: "warning",
+            materiality_rationale: `[CODE_ENFORCED] £${maxFigure.toFixed(1)}m anchor (${((maxFigure / DEAL_EV_MILLIONS) * 100).toFixed(2)}% of EV) below critical threshold of £${MATERIALITY_FLOOR_M.toFixed(1)}m. Demoted from critical.`,
+          });
+        }
+      } else {
+        // No £ figure at all — qualitative finding:
+        // If no risk marker AND not cross-version → demote to warning (unanchored critical)
+        // But DON'T demote to housekeeping — it's still potentially material, just unquantified
+        if (!hasRiskMarker && !isCrossVersion) {
+          demotedCount++;
+          survivingFindings.push({
+            ...f,
+            severity: "warning",
+            materiality_rationale: `[CODE_ENFORCED] No quantifiable £ anchor and no source-stated material-risk marker. Demoted from critical to warning.`,
+          });
+        } else {
+          // Qualitative with risk marker → survives unchanged
+          survivingFindings.push(f);
+        }
+      }
+    } else {
+      // Non-critical: check if provably sub-threshold → housekeeping
+      if (maxFigure !== null && maxFigure < 0.5 && f.category !== "housekeeping") {
+        // £ figure is trivially sub-threshold and not already housekeeping
+        demotedCount++;
+        housekeepingFindings.push({
+          ...f,
+          severity: "info",
+          category: "housekeeping",
+          materiality_rationale: `[CODE_ENFORCED] £${maxFigure < 0.01 ? (maxFigure * 1000).toFixed(0) + "k" : maxFigure.toFixed(1) + "m"} is ${((maxFigure / DEAL_EV_MILLIONS) * 100).toFixed(3)}% of EV — sub-materiality for £${DEAL_EV_MILLIONS}m transaction.`,
+        });
+      } else {
+        survivingFindings.push(f);
+      }
+    }
+  }
+
+  if (demotedCount > 0) {
+    console.log(`[pipeline] Materiality gate: demoted ${demotedCount} finding(s)`);
+  }
+
+  return { findings: survivingFindings, housekeepingFindings, demotedCount };
+}
+
 function appendReconciliationFindings(
   finalFindings: MergedFinding[],
   housekeepingFindings: MergedFinding[],
@@ -1154,6 +1326,13 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
                   return tag !== "ic_memo";
                 });
               }
+            }
+
+            // --- Defect 2: Materiality Enforcement (fast-path) ---
+            {
+              const matResult = enforceMaterialityGate(finalFindings, fastPathHousekeeping);
+              finalFindings = matResult.findings;
+              fastPathHousekeeping = matResult.housekeepingFindings;
             }
 
             // Fast-path format budget: derived from PLATFORM cap, not TIME_BUDGET.
@@ -3192,6 +3371,13 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
   }
   if (independentOverrides > 0) {
     console.log(`[pipeline] Deterministic independent override: corrected ${independentOverrides} finding(s)`);
+  }
+
+  // --- Defect 2: Materiality Enforcement (code-based, shared helper) ---
+  {
+    const matResult = enforceMaterialityGate(finalFindings, finalHousekeepingFindings);
+    finalFindings = matResult.findings;
+    finalHousekeepingFindings = matResult.housekeepingFindings;
   }
 
   // === CANCEL GATE: pre-formatting ===
