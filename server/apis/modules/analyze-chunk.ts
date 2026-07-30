@@ -168,7 +168,7 @@ Required keys:
 - "document_name" (string)
 - "document_type" (string): CIM | IC_MEMO | CUSTOMER_DATA | CONSULTANT_REPORT | FINANCIAL_MODEL | LEGAL | OTHER
 - "key_claims" (array): each with "claim" (string), "source_type" ("narrative"|"data"), "location" (string), "confidence" ("high"|"medium"|"low")
-- "data_points" (array): each with "metric" (string), "value" (string), "context" (string)
+- "data_points" (array): each with "metric" (string), "value" (string), "period" (string, e.g. "FY2024", "Q3 2023", "LTM Jun-24"), "verbatim_snippet" (string, ≤80 chars from source text containing the value), "context" (string)
 - "flags" (array): each with "type" ("contradiction"|"assumption"|"risk"|"gap"), "description" (string), "severity" ("critical"|"moderate"|"low")
 - "raw_summary" (string)`,
 

@@ -121,6 +121,7 @@ import GetExtractionStatus from './checkpoints/get-extraction-status.js';
 import PurgeExtractions from './checkpoints/purge-extractions.js';
 import PurgeDocumentExtractions from './checkpoints/purge-document-extractions.js';
 import PurgeDealHistory from './checkpoints/purge-deal-history.js';
+import PurgePipelineCheckpoints from './checkpoints/purge-pipeline-checkpoints.js';
 import ResumeCompletedRun from './checkpoints/resume-completed-run.js';
 import DiagFailedExtractions from './checkpoints/diag-failed-extractions.js';
 
@@ -148,7 +149,7 @@ const apis = {
   // Checkpoints
   SaveExtractions, LoadExtractions, SaveMergeCheckpoint, LoadMergeCheckpoints,
   UpdateRunStatus, GetRunProgress, SaveRunCoverage, LoadRunCoverage,
-  CancelModuleRun, CheckRunCancelled, PurgeStaleRuns, ResurrectModuleRun, ReconcileFindings, GetExtractionStatus, PurgeExtractions, PurgeDocumentExtractions, PurgeDealHistory, DiagFailedExtractions, ResumeCompletedRun,
+  CancelModuleRun, CheckRunCancelled, PurgeStaleRuns, ResurrectModuleRun, ReconcileFindings, GetExtractionStatus, PurgeExtractions, PurgeDocumentExtractions, PurgeDealHistory, PurgePipelineCheckpoints, DiagFailedExtractions, ResumeCompletedRun,
   // Audit
   ExtractReportSnippets, FramingPatternAudit,
 } as const;

@@ -2815,6 +2815,126 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
     console.log(`[pipeline] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
   }
 
+  // --- Defect 5, Layer 1: Numeric Divergence Validation (zero-LLM code pass) ---
+  // Demotes data_divergence findings that are period-collisions or untraceable.
+  // Preserves valid narrative-vs-model comparisons (1 verified + 1 unresolved = pass-through).
+  // Runs AFTER fabricated-arithmetic suppression, BEFORE reconciliation append.
+  if (numericReport && numericReport.figures.length > 0) {
+    // Build verified-figure lookup keyed on (metric_name_lower, period_lower) → value
+    const verifiedFigureLookup = new Map<string, string>();
+    for (const fig of numericReport.figures as Array<Record<string, unknown>>) {
+      const name = String(fig.name ?? "").toLowerCase().trim();
+      const period = String(fig.period ?? "").toLowerCase().trim();
+      if (name && period) {
+        verifiedFigureLookup.set(`${name}|||${period}`, String(fig.value ?? ""));
+      }
+    }
+
+    // Helper: normalize a numeric string for comparison (strip $, £, %, commas, whitespace)
+    const normalizeNumericForLookup = (val: unknown): string | null => {
+      if (val == null) return null;
+      const s = String(val).replace(/[$£€%,\s]/g, "").trim();
+      return s.length > 0 ? s : null;
+    };
+
+    // Helper: extract numeric figure strings from text via regex
+    const extractNumericFigures = (text: string): string[] => {
+      // Matches currency/number patterns like £194m, $12.5M, 15.3%, 1,234, etc.
+      const patterns = text.match(/[$£€]?\d[\d,]*\.?\d*[MmBbKk%]?/g);
+      return patterns ? [...new Set(patterns)] : [];
+    };
+
+    let numDivDemotedCount = 0;
+    finalFindings = finalFindings.map(f => {
+      // Only process data_divergence findings that are NOT already code-verified
+      if (f.finding_kind !== "data_divergence") return f;
+      if (f.numeric_unverified === false) return f; // already verified by prior pass
+
+      // Extract cited figures — prefer structured evidence[] coordinates
+      let citedFigures: Array<{ value: string; source_doc?: string }> = [];
+      if (f.evidence && f.evidence.length > 0) {
+        citedFigures = f.evidence.map(e => ({
+          value: e.figure,
+          source_doc: e.source_doc,
+        }));
+      } else {
+        // Fallback: extract figures from title + detail text
+        const allText = `${f.title} ${f.detail}`;
+        citedFigures = extractNumericFigures(allText).map(v => ({ value: v }));
+      }
+
+      if (citedFigures.length === 0) return f; // No figures to validate — pass through
+
+      // Resolve each cited figure against the verified-figure lookup
+      let resolvedCount = 0;
+      let unresolvedCount = 0;
+      const resolvedPeriods: string[] = [];
+      const resolvedMetrics: string[] = [];
+
+      for (const cited of citedFigures) {
+        const normalizedCited = normalizeNumericForLookup(cited.value);
+        if (!normalizedCited) { unresolvedCount++; continue; }
+
+        let matched = false;
+        for (const [key, verifiedValue] of verifiedFigureLookup.entries()) {
+          const normalizedVerified = normalizeNumericForLookup(verifiedValue);
+          if (!normalizedVerified) continue;
+
+          // Check if the cited figure matches this verified figure's value
+          if (normalizedCited === normalizedVerified ||
+              normalizedCited.replace(/[MmBb]$/, "000000").replace(/[Kk]$/, "000") ===
+              normalizedVerified.replace(/[MmBb]$/, "000000").replace(/[Kk]$/, "000")) {
+            const [metric, period] = key.split("|||");
+            resolvedMetrics.push(metric);
+            resolvedPeriods.push(period);
+            matched = true;
+            resolvedCount++;
+            break;
+          }
+        }
+        if (!matched) unresolvedCount++;
+      }
+
+      // Apply demotion rules:
+      // Rule 1: ZERO resolved → untraceable → demote
+      if (resolvedCount === 0) {
+        numDivDemotedCount++;
+        return {
+          ...f,
+          numeric_unverified: true,
+          severity: "info" as const,
+          category: "housekeeping" as const,
+          full_analysis: `[UNVERIFIED_DIVERGENCE] ${f.full_analysis}`,
+        };
+      }
+
+      // Rule 2: 2+ resolved to same metric at DIFFERENT periods → period-collision → demote
+      if (resolvedCount >= 2) {
+        const uniqueMetrics = [...new Set(resolvedMetrics)];
+        const uniquePeriods = [...new Set(resolvedPeriods)];
+        // Period collision: same metric name appears but with different periods
+        if (uniqueMetrics.length === 1 && uniquePeriods.length > 1) {
+          numDivDemotedCount++;
+          return {
+            ...f,
+            numeric_unverified: true,
+            severity: "info" as const,
+            category: "housekeeping" as const,
+            full_analysis: `[PERIOD_MISMATCH] ${f.full_analysis}`,
+          };
+        }
+      }
+
+      // Rule 3: 1 resolved + 1 unresolved → valid narrative-vs-model → PASS THROUGH
+      // (Also pass through any other configuration not caught above)
+      return f;
+    });
+
+    if (numDivDemotedCount > 0) {
+      console.log(`[pipeline] Numeric divergence validation: demoted ${numDivDemotedCount} finding(s)`);
+    }
+  }
+
   // --- Mode-B Fix: Append code-verified reconciliation findings AFTER suppression ---
   // Uses the shared helper so main-path and fast-path can never drift.
   const mainPathReconResult = appendReconciliationFindings(finalFindings, finalHousekeepingFindings, claimsReconciliation);
