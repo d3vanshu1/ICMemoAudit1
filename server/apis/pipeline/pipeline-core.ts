@@ -1332,92 +1332,295 @@ export async function runPipelineCore(ctx: PipelineContext, input: PipelineInput
   // guaranteed populated — and use the fresh result regardless of what the
   // client may have passed in. This closes the two-run bug where client-side
   // NumericVerify ran before backfill and found nothing.
+  //
+  // CHECKPOINT-RESUME: If a complete numeric report is already persisted for this
+  // run (from a prior invocation), reload it and skip re-running the engine.
+  // If the engine returns partial=true (budget exhaustion), return in_progress.
   if (NUMERIC_MODULES.has(moduleId)) {
-    // Time budget for numeric: give it up to 60s from whatever remains,
-    // but never less than 15s (at which point it's not worth starting).
-    const numericTimeBudget = Math.min(60_000, Math.max(0, timeRemaining() - 60_000));
-    if (numericTimeBudget >= 15_000) {
-      try {
-        const inlineResult: NumericVerifyResult = await runNumericVerifyInline(
-          ctx.integrations.db,
-          dealId,
-          numericTimeBudget
-        );
-
-        // Replace the input-provided report with the fresh server-side result
-        if (inlineResult.figures.length > 0 || inlineResult.discrepancies.length > 0) {
-          numericReport = {
-            figures: inlineResult.figures,
-            discrepancies: inlineResult.discrepancies,
-          };
-          numericPartial = inlineResult.partial;
+    // Check for persisted complete numeric report from prior invocation
+    let numericCheckpointLoaded = false;
+    try {
+      const cpRows = await ctx.integrations.db.query(
+        `SELECT payload FROM pipeline_checkpoints
+         WHERE module_run_id = $1 AND checkpoint_key = 'numeric_report'`,
+        z.object({ payload: z.any() }),
+        [runId],
+        { label: "Load numeric report checkpoint" }
+      );
+      if (cpRows.length > 0 && cpRows[0].payload) {
+        const saved = cpRows[0].payload as { figures: unknown[]; discrepancies: unknown[] };
+        if (saved.figures && saved.discrepancies) {
+          numericReport = { figures: saved.figures as any[], discrepancies: saved.discrepancies as any[] };
+          numericPartial = false; // Checkpointed means it completed
+          numericCheckpointLoaded = true;
           console.log(
-            `[NumericInline] Replaced client report: ${inlineResult.figures.length} figures, ` +
-            `${inlineResult.discrepancies.length} discrepancies, partial=${inlineResult.partial}`
+            `[NumericInline] Loaded checkpoint: ${saved.figures.length} figures, ` +
+            `${saved.discrepancies.length} discrepancies (complete)`
           );
-        } else if (!numericReport) {
-          // No data from inline either — ensure downstream knows
-          numericReport = null;
-          numericPartial = null;
-          console.log(`[NumericInline] No numeric data found for this deal.`);
         }
-        // If inline returned nothing but client had data, keep client data
-        // (edge case: doc_tables exist but are all oversized/unparseable)
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[NumericInline] Failed (non-fatal, keeping client report if any): ${msg}`);
-        // Keep whatever numericReport the client provided as fallback
       }
-    } else {
-      console.log(`[NumericInline] Skipped — insufficient time budget (${numericTimeBudget}ms remaining)`);
+    } catch {
+      // pipeline_checkpoints may not exist yet — proceed to run fresh
+    }
+
+    if (!numericCheckpointLoaded) {
+      // Time budget for numeric: give it up to 60s from whatever remains,
+      // but never less than 15s (at which point it's not worth starting).
+      const numericTimeBudget = Math.min(60_000, Math.max(0, timeRemaining() - 60_000));
+      if (numericTimeBudget >= 15_000) {
+        try {
+          const inlineResult: NumericVerifyResult = await runNumericVerifyInline(
+            ctx.integrations.db,
+            dealId,
+            numericTimeBudget
+          );
+
+          // Replace the input-provided report with the fresh server-side result
+          if (inlineResult.figures.length > 0 || inlineResult.discrepancies.length > 0) {
+            numericReport = {
+              figures: inlineResult.figures,
+              discrepancies: inlineResult.discrepancies,
+            };
+            numericPartial = inlineResult.partial;
+            console.log(
+              `[NumericInline] Replaced client report: ${inlineResult.figures.length} figures, ` +
+              `${inlineResult.discrepancies.length} discrepancies, partial=${inlineResult.partial}`
+            );
+
+            // If COMPLETE, persist to checkpoint so resume skips re-running
+            if (!inlineResult.partial) {
+              try {
+                await ctx.integrations.db.execute(
+                  `INSERT INTO pipeline_checkpoints (module_run_id, checkpoint_key, payload)
+                   VALUES ($1, 'numeric_report', $2::jsonb)
+                   ON CONFLICT (module_run_id, checkpoint_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()`,
+                  [runId, JSON.stringify({ figures: inlineResult.figures, discrepancies: inlineResult.discrepancies })],
+                  { label: "Persist numeric report checkpoint" }
+                );
+              } catch {
+                // pipeline_checkpoints table may not exist yet — non-fatal
+              }
+            }
+          } else if (!numericReport) {
+            // No data from inline either — ensure downstream knows
+            numericReport = null;
+            numericPartial = null;
+            console.log(`[NumericInline] No numeric data found for this deal.`);
+            // Persist empty result so resume knows numeric is done (no data = complete)
+            try {
+              await ctx.integrations.db.execute(
+                `INSERT INTO pipeline_checkpoints (module_run_id, checkpoint_key, payload)
+                 VALUES ($1, 'numeric_report', $2::jsonb)
+                 ON CONFLICT (module_run_id, checkpoint_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()`,
+                [runId, JSON.stringify({ figures: [], discrepancies: [] })],
+                { label: "Persist empty numeric report checkpoint" }
+              );
+            } catch { /* non-fatal */ }
+          }
+
+          // COMPLETION GATE: if numeric is partial, return in_progress — do NOT proceed to merge
+          if (inlineResult.partial) {
+            console.log(`[NumericInline] Partial result — returning in_progress for resume`);
+            return {
+              status: "in_progress",
+              runId: runId!,
+              phase: "numeric_verify",
+              progress: {
+                analysisTotal: 0,
+                analysisCompleted: 0,
+                mergeRound: 0,
+                mergeTotal: 0,
+              },
+              result: null,
+              failedChunks: 0,
+              truncatedChunks: 0,
+              truncatedMerges: 0,
+              firstError: null,
+            };
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[NumericInline] Failed (non-fatal, keeping client report if any): ${msg}`);
+          // Keep whatever numericReport the client provided as fallback
+        }
+      } else {
+        // Insufficient budget to even start numeric — return in_progress for resume
+        console.log(`[NumericInline] Insufficient time budget (${numericTimeBudget}ms) — returning in_progress for resume`);
+        return {
+          status: "in_progress",
+          runId: runId!,
+          phase: "numeric_verify",
+          progress: {
+            analysisTotal: 0,
+            analysisCompleted: 0,
+            mergeRound: 0,
+            mergeTotal: 0,
+          },
+          result: null,
+          failedChunks: 0,
+          truncatedChunks: 0,
+          truncatedMerges: 0,
+          firstError: null,
+        };
+      }
     }
   }
 
   // --- Step 0.8: Claims-Reconciliation (contradiction_check only) ---
   // Extracts structured claims from IC memos and reconciles against verified figures.
   // Architecture: LLM classifies scope; CODE computes delta. No LLM-computed numbers.
+  //
+  // CHECKPOINT-RESUME: Persists the claims ledger after extraction and the
+  // reconciliation result after completion. On resume, loads both and skips
+  // already-finished work. On budget exhaustion, returns in_progress.
   let claimsReconciliation: ReconciliationResult | null = null;
   if (moduleId === "contradiction_check") {
-    const claimsTimeBudget = Math.min(120_000, Math.max(0, timeRemaining() - 120_000));
-    if (claimsTimeBudget >= 60_000) {
-      try {
-        // Step 0.8a: Extract structured claims from IC memos
-        const claimsLedger: ClaimsLedger = await runClaimsExtraction(
-          ctx, dealId, startTime, claimsTimeBudget * 0.5
+    // Check for persisted reconciliation result from prior invocation
+    let reconCheckpointLoaded = false;
+    try {
+      const reconCpRows = await ctx.integrations.db.query(
+        `SELECT payload FROM pipeline_checkpoints
+         WHERE module_run_id = $1 AND checkpoint_key = 'reconciliation'`,
+        z.object({ payload: z.any() }),
+        [runId],
+        { label: "Load reconciliation checkpoint" }
+      );
+      if (reconCpRows.length > 0 && reconCpRows[0].payload) {
+        claimsReconciliation = reconCpRows[0].payload as ReconciliationResult;
+        reconCheckpointLoaded = true;
+        console.log(
+          `[ClaimsReconciliation] Loaded checkpoint: ${claimsReconciliation.findings.length} findings ` +
+          `(${claimsReconciliation.reconciled_count} reconciled, ` +
+          `${claimsReconciliation.unreconcilable_count} unreconcilable)`
         );
-
-        // Step 0.8b: Reconcile claims against verified figures
-        if (claimsLedger.claims.length > 0 && numericReport) {
-          const reconTimeBudget = Math.min(90_000, Math.max(0, timeRemaining() - 90_000));
-          if (reconTimeBudget >= 45_000) {
-            claimsReconciliation = await runReconciliation(
-              ctx,
-              claimsLedger,
-              numericReport.figures ?? [],
-              numericReport.discrepancies ?? [],
-              startTime,
-              reconTimeBudget,
-            );
-            console.log(
-              `[ClaimsReconciliation] ${claimsReconciliation.findings.length} findings ` +
-              `(${claimsReconciliation.reconciled_count} reconciled, ` +
-              `${claimsReconciliation.within_tolerance_count} within tolerance, ` +
-              `${claimsReconciliation.unreconcilable_count} unreconcilable)`
-            );
-          } else {
-            console.log(`[ClaimsReconciliation] Skipped reconciliation — insufficient time budget`);
-          }
-        } else if (claimsLedger.claims.length === 0) {
-          console.log(`[ClaimsReconciliation] No claims extracted — skipping reconciliation`);
-        } else {
-          console.log(`[ClaimsReconciliation] No numeric report available — skipping reconciliation`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[ClaimsReconciliation] Failed (non-fatal): ${msg}`);
       }
-    } else {
-      console.log(`[ClaimsReconciliation] Skipped — insufficient time budget (${claimsTimeBudget}ms)`);
+    } catch {
+      // pipeline_checkpoints may not exist yet
+    }
+
+    if (!reconCheckpointLoaded) {
+      const claimsTimeBudget = Math.min(120_000, Math.max(0, timeRemaining() - 120_000));
+      if (claimsTimeBudget >= 60_000) {
+        try {
+          // Check for persisted claims ledger from prior invocation
+          let claimsLedger: ClaimsLedger | null = null;
+          try {
+            const ledgerCpRows = await ctx.integrations.db.query(
+              `SELECT payload FROM pipeline_checkpoints
+               WHERE module_run_id = $1 AND checkpoint_key = 'claims_ledger'`,
+              z.object({ payload: z.any() }),
+              [runId],
+              { label: "Load claims ledger checkpoint" }
+            );
+            if (ledgerCpRows.length > 0 && ledgerCpRows[0].payload) {
+              claimsLedger = ledgerCpRows[0].payload as ClaimsLedger;
+              console.log(
+                `[ClaimsExtraction] Loaded checkpoint: ${claimsLedger.claims.length} claims ` +
+                `(${claimsLedger.extraction_metadata.operating_metric_claims} operating_metric)`
+              );
+            }
+          } catch {
+            // pipeline_checkpoints may not exist yet
+          }
+
+          // Step 0.8a: Extract structured claims from IC memos (if not checkpointed)
+          if (!claimsLedger) {
+            claimsLedger = await runClaimsExtraction(
+              ctx, dealId, startTime, claimsTimeBudget * 0.5
+            );
+            // Persist ledger so resume never re-runs LLM extraction
+            try {
+              await ctx.integrations.db.execute(
+                `INSERT INTO pipeline_checkpoints (module_run_id, checkpoint_key, payload)
+                 VALUES ($1, 'claims_ledger', $2::jsonb)
+                 ON CONFLICT (module_run_id, checkpoint_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()`,
+                [runId, JSON.stringify(claimsLedger)],
+                { label: "Persist claims ledger checkpoint" }
+              );
+            } catch {
+              // pipeline_checkpoints table may not exist yet — non-fatal
+            }
+          }
+
+          // Step 0.8b: Reconcile claims against verified figures
+          if (claimsLedger.claims.length > 0 && numericReport) {
+            const reconTimeBudget = Math.min(90_000, Math.max(0, timeRemaining() - 90_000));
+            if (reconTimeBudget >= 45_000) {
+              claimsReconciliation = await runReconciliation(
+                ctx,
+                claimsLedger,
+                numericReport.figures ?? [],
+                numericReport.discrepancies ?? [],
+                startTime,
+                reconTimeBudget,
+              );
+              console.log(
+                `[ClaimsReconciliation] ${claimsReconciliation.findings.length} findings ` +
+                `(${claimsReconciliation.reconciled_count} reconciled, ` +
+                `${claimsReconciliation.within_tolerance_count} within tolerance, ` +
+                `${claimsReconciliation.unreconcilable_count} unreconcilable)`
+              );
+              // Persist reconciliation result so resume skips re-running
+              try {
+                await ctx.integrations.db.execute(
+                  `INSERT INTO pipeline_checkpoints (module_run_id, checkpoint_key, payload)
+                   VALUES ($1, 'reconciliation', $2::jsonb)
+                   ON CONFLICT (module_run_id, checkpoint_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()`,
+                  [runId, JSON.stringify(claimsReconciliation)],
+                  { label: "Persist reconciliation checkpoint" }
+                );
+              } catch {
+                // pipeline_checkpoints table may not exist yet — non-fatal
+              }
+            } else {
+              // Budget exhausted before reconciliation could start — return in_progress
+              console.log(`[ClaimsReconciliation] Insufficient time for reconciliation (${reconTimeBudget}ms) — returning in_progress`);
+              return {
+                status: "in_progress",
+                runId: runId!,
+                phase: "reconciliation",
+                progress: {
+                  analysisTotal: 0,
+                  analysisCompleted: 0,
+                  mergeRound: 0,
+                  mergeTotal: 0,
+                },
+                result: null,
+                failedChunks: 0,
+                truncatedChunks: 0,
+                truncatedMerges: 0,
+                firstError: null,
+              };
+            }
+          } else if (claimsLedger.claims.length === 0) {
+            console.log(`[ClaimsReconciliation] No claims extracted — skipping reconciliation`);
+          } else {
+            console.log(`[ClaimsReconciliation] No numeric report available — skipping reconciliation`);
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[ClaimsReconciliation] Failed (non-fatal): ${msg}`);
+        }
+      } else {
+        // Budget exhausted before claims extraction could start — return in_progress
+        console.log(`[ClaimsReconciliation] Insufficient time budget (${claimsTimeBudget}ms) — returning in_progress`);
+        return {
+          status: "in_progress",
+          runId: runId!,
+          phase: "reconciliation",
+          progress: {
+            analysisTotal: 0,
+            analysisCompleted: 0,
+            mergeRound: 0,
+            mergeTotal: 0,
+          },
+          result: null,
+          failedChunks: 0,
+          truncatedChunks: 0,
+          truncatedMerges: 0,
+          firstError: null,
+        };
+      }
     }
   }
 
@@ -2491,11 +2694,27 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
     finalFindings = deduped;
   }
 
-  // Housekeeping findings: from final node or accumulated across rounds
-  const finalHousekeepingFindings: MergedFinding[] = finalNode.housekeepingFindings ?? accumulatedHousekeeping;
+  // Housekeeping findings: concatenate LLM output + accumulated (includes reconciliation)
+  // then dedup. The old `?? accumulatedHousekeeping` dropped reconciliation housekeeping
+  // (scope_mismatch, unreconcilable) whenever the merge LLM returned any housekeeping.
+  let finalHousekeepingFindings: MergedFinding[] = [
+    ...(finalNode.housekeepingFindings ?? []),
+    ...accumulatedHousekeeping,
+  ];
+  {
+    const seen = new Set<string>();
+    finalHousekeepingFindings = finalHousekeepingFindings.filter(f => {
+      const key = (f.title || "").toLowerCase().trim().replace(/\s+/g, " ");
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
 
   // --- Post-processing: suppress fabricated arithmetic/reconciliation findings ---
   // Only findings grounded in NumericVerify's deterministic output are trustworthy.
+  // NOTE: Code-verified reconciliation findings are appended AFTER this filter —
+  // they bypass FABRICATED_ARITHMETIC_PATTERNS entirely (they ARE code-verified).
   const { FABRICATED_ARITHMETIC_PATTERNS } = await import("./fabricated-arithmetic-patterns.js");
 
   const preSuppressCount = finalFindings.length;
@@ -2506,6 +2725,65 @@ The LATEST memo is authoritative for the team's CURRENT claims and thesis. Earli
   const suppressedCount = preSuppressCount - finalFindings.length;
   if (suppressedCount > 0) {
     console.log(`[pipeline] Suppressed ${suppressedCount} fabricated arithmetic finding(s)`);
+  }
+
+  // --- Mode-B Fix: Append code-verified reconciliation findings AFTER suppression ---
+  // These findings are produced by Step 0.8's deterministic pipeline (LLM classifies
+  // scope → code computes delta). They must never be dropped by the merge LLM's output
+  // overwriting accumulatedFindings, and must never be suppressed by FABRICATED_ARITHMETIC_PATTERNS.
+  // Dedup: if the merge LLM also emitted a finding for the same (metric, period, scope),
+  // keep the code-verified version (from reconciliation), drop the LLM paraphrase.
+  if (claimsReconciliation && claimsReconciliation.findings.length > 0) {
+    // Build a key set of what's already in finalFindings for dedup
+    const existingKeys = new Set<string>();
+    for (const f of finalFindings) {
+      const key = (f.title || "").toLowerCase().trim().replace(/\s+/g, " ");
+      if (key) existingKeys.add(key);
+    }
+
+    // Collect code-verified findings that the merge LLM might have paraphrased
+    const codeVerifiedFindings: MergedFinding[] = claimsReconciliation.findings
+      .filter(rf => rf.finding_kind === "data_divergence" || rf.finding_kind === "cross_version")
+      .map(rf => ({
+        title: rf.title,
+        severity: rf.severity,
+        detail: rf.detail,
+        full_analysis: rf.full_analysis,
+        source_docs: rf.source_docs,
+        category: "principal_finding" as const,
+        numeric_unverified: false,
+        finding_kind: (rf.finding_kind === "cross_version" ? "data_divergence" : rf.finding_kind) as MergedFinding["finding_kind"],
+        severity_anchor: rf.severity_anchor != null ? `£${(rf.severity_anchor / 1_000_000).toFixed(1)}m` : undefined,
+      }));
+
+    // Remove any LLM-emitted finding that overlaps with a code-verified one
+    // (by checking if the code-verified title or key metric/period appears in the LLM version)
+    let llmDropped = 0;
+    for (const cvf of codeVerifiedFindings) {
+      const cvKey = (cvf.title || "").toLowerCase().trim().replace(/\s+/g, " ");
+      // Check for LLM paraphrases: same metric amounts or same period references
+      const cvAmounts = cvf.detail.match(/£[\d,.]+m/g) ?? [];
+      if (cvAmounts.length >= 2) {
+        // Remove any existing finding that mentions the same pair of amounts (LLM paraphrase)
+        const beforeLen = finalFindings.length;
+        finalFindings = finalFindings.filter(f => {
+          const fText = `${f.title} ${f.detail}`;
+          const matchesAll = cvAmounts.every(amt => fText.includes(amt));
+          return !matchesAll;
+        });
+        llmDropped += beforeLen - finalFindings.length;
+      }
+      // Exact title dedup
+      if (!existingKeys.has(cvKey)) {
+        finalFindings.push(cvf);
+        existingKeys.add(cvKey);
+      }
+    }
+
+    if (llmDropped > 0) {
+      console.log(`[pipeline] Replaced ${llmDropped} LLM-paraphrased finding(s) with code-verified versions`);
+    }
+    console.log(`[pipeline] Appended ${codeVerifiedFindings.length} code-verified reconciliation finding(s) to final report`);
   }
 
   // === CANCEL GATE: pre-absence-verification ===
